@@ -28,6 +28,24 @@ Use `/agent-wayfinder` to index a workspace, query code relationships, trace a
 path, or explain a graph node. The skill queries the local graph first and then
 requires source inspection and focused validation before code changes.
 
+## MCP Server
+
+Start the read-only Model Context Protocol server over standard input and output:
+
+```bash
+agent-wayfinder mcp
+```
+
+The server provides `query`, `path`, `explain`, and `export` tools. Each tool
+returns the same graph version, publication time, result data, and errors as its
+JSON CLI command.
+
+The VS Code provider in
+[npm/vscode-mcp-provider](npm/vscode-mcp-provider) registers this server as
+`Agent Wayfinder`. It runs `agent-wayfinder mcp` in the first workspace folder
+by default. Use `agentWayfinder.mcp.command` and `agentWayfinder.mcp.args` to
+override the executable or arguments.
+
 ## Publish A Release
 
 The release workflow runs when a signed-off version tag is pushed. It builds
@@ -125,28 +143,56 @@ Target timings:
 Queries should use indexed node lookup followed by bounded graph traversal:
 
 ```text
-question terms
-  -> full-text node search
-  -> ranked start nodes
-  -> indexed incoming and outgoing edge traversal
-  -> evidence with paths, locations, and confidence
+architecture question
+  -> deterministic query plan
+  -> exact and full-text node search
+  -> ranked start nodes by entity role
+  -> bounded graph execution
+  -> answer-ready evidence with source spans, scores, limits, and warnings
 ```
 
-Support commands such as:
+Pass one quoted sentence to question mode. JSON output includes the interpreted
+plan, confidence, ranked evidence, stage limits, warnings, suggestions, graph
+version, and publication time:
 
-```text
-agent-wayfinder index
-agent-wayfinder watch
-agent-wayfinder query "How does X reach Y?"
-agent-wayfinder path X Y
-agent-wayfinder explain X
-agent-wayfinder report
-agent-wayfinder export
+```bash
+agent-wayfinder query . "What is the shared contract between postgres and sqlite?" --format json
+```
+
+One sentence enters question mode automatically. Use `--question` to require
+question mode or `--show-plan` to show the plan in text output. Low-confidence
+and weak results include candidates and follow-up commands instead of an answer
+claim.
+
+Pass separate terms for legacy literal lookup. Use `--terms` when one literal
+term contains spaces or punctuation:
+
+```bash
+agent-wayfinder query . AuthService token src/auth --format json
+agent-wayfinder query . "Auth Service" --terms --format json
+```
+
+Use `path` when both endpoints are known. Directed traversal is the default;
+`--undirected` is only an explicit structural fallback:
+
+```bash
+agent-wayfinder path . AuthService TokenStore --format json
+```
+
+Use `explain` for one exact or unambiguous node. If the result is ambiguous,
+rerun it with one returned node ID:
+
+```bash
+agent-wayfinder explain . AuthService --format json
 ```
 
 ## Relationship To AI Workflows
 
-An AI agent should use `agent-wayfinder` to find relevant code areas and relationships for architecture, dependency, call-flow, and impact questions. It must inspect the current source before edits and use tests and Git diff for verification.
+An AI agent should run deterministic question mode before it plans exact
+follow-up queries. It must read the plan, confidence, warnings, graph version,
+limits, truncation, and ranked evidence. It must separate graph-supported facts
+from inference and inspect current source before a technical claim. Tests and
+Git remain the validation sources for code changes.
 
 The graph can be stale between index updates. Query results must identify the graph version and source evidence.
 

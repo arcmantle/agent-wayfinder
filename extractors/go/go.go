@@ -135,6 +135,17 @@ func Extract(source extractor.Source) (extractor.Contribution, error) {
 				declaration := appendDeclaration(source, &facts, packageID, packageQualifiedName, TypeNodeKind, name.Utf8Text(source.Contents), specification, name)
 				declarations = append(declarations, declaration)
 				if typeNode := specification.ChildByFieldName("type"); typeNode != nil && typeNode.Kind() == "interface_type" {
+					for methodIndex := uint(0); methodIndex < typeNode.NamedChildCount(); methodIndex++ {
+						method := typeNode.NamedChild(methodIndex)
+						if method.Kind() != "method_elem" {
+							continue
+						}
+						methodName := method.ChildByFieldName("name")
+						if methodName == nil {
+							continue
+						}
+						declarations = append(declarations, appendDeclaration(source, &facts, declaration.id, declaration.qualifiedName, MethodNodeKind, methodName.Utf8Text(source.Contents), method, methodName))
+					}
 					symbolReferences = append(symbolReferences, interfaceMethodReferences(source, declaration, typeNode)...)
 				}
 			}
@@ -421,11 +432,27 @@ func appendReferencesFromNode(source extractor.Source, node *sitter.Node, source
 						Relation: "references",
 						Evidence: evidenceFor(source, child),
 					})
+					if isLocalCallTarget(node, child, target) {
+						facts.Edges = append(facts.Edges, graph.Edge{
+							SourceID: sourceID,
+							TargetID: target.id,
+							Relation: CallsRelation,
+							Evidence: evidenceFor(source, child),
+						})
+					}
 				}
 			}
 		}
 		appendReferencesFromNode(source, child, sourceID, byName, declarationNames, facts)
 	}
+}
+
+func isLocalCallTarget(parent, child *sitter.Node, target declaration) bool {
+	if parent.Kind() != "call_expression" || target.node.Kind() != "function_declaration" && target.node.Kind() != "method_declaration" {
+		return false
+	}
+	function := parent.ChildByFieldName("function")
+	return function != nil && function.Kind() == "identifier" && function.StartByte() == child.StartByte() && function.EndByte() == child.EndByte()
 }
 
 func receiverTypeName(source extractor.Source, receiver *sitter.Node) (string, bool) {

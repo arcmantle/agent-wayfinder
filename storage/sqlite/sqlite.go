@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"agent-wayfinder/extractor"
 	"agent-wayfinder/graph"
@@ -20,7 +21,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion                         = 10
+	CurrentSchemaVersion                         = 11
 	retainedGraphVersions                        = 25
 	defaultMaxDatabaseBytes                int64 = 4 << 30
 	defaultMaxResolverProjectionCacheBytes int64 = 64 << 20
@@ -98,6 +99,8 @@ var _ storage.ResolverPackagePageReader = (*Store)(nil)
 var _ storage.SnapshotOpener = (*Store)(nil)
 var _ storage.NodeLookup = (*Store)(nil)
 var _ storage.ExactNodeLookup = (*Store)(nil)
+var _ storage.LexicalSearcher = (*Store)(nil)
+var _ storage.LexicalIndexRebuilder = (*Store)(nil)
 var _ storage.Traverser = (*Store)(nil)
 var _ storage.Explainer = (*Store)(nil)
 var _ storage.Exporter = (*Store)(nil)
@@ -302,6 +305,9 @@ func (store *Store) publish(ctx context.Context, request storage.PublishRequest,
 		if _, err := pruneVersions(ctx, transaction, request.Workspace, version-retainedGraphVersions+1); err != nil {
 			return storage.Snapshot{}, err
 		}
+	}
+	if err := rebuildLexicalSnapshot(ctx, transaction, request.Workspace, version); err != nil {
+		return storage.Snapshot{}, err
 	}
 	if err := ensureDatabaseBudget(ctx, transaction, store.maxDatabaseBytes); err != nil {
 		return storage.Snapshot{}, err
@@ -618,6 +624,9 @@ func (session *contributionSession) Commit(ctx context.Context, request storage.
 			return storage.Snapshot{}, session.fail(err)
 		}
 	}
+	if err := rebuildLexicalSnapshot(ctx, session.transaction, session.workspace, session.pendingVersion); err != nil {
+		return storage.Snapshot{}, session.fail(err)
+	}
 	if err := ensureDatabaseBudget(ctx, session.transaction, session.store.maxDatabaseBytes); err != nil {
 		return storage.Snapshot{}, session.fail(err)
 	}
@@ -711,6 +720,10 @@ func (session *contributionSession) ResolverProjectionPage(ctx context.Context, 
 			return nil, err
 		}
 		projection.Nodes = facts.Nodes
+		if err := appendEdges(ctx, session.transaction, &facts, `SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_edges WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY source_id, target_id, relation`, session.workspace, projection.SourcePath, session.pendingVersion, session.pendingVersion); err != nil {
+			return nil, err
+		}
+		projection.Edges = facts.Edges
 		if err := projection.Metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("read contribution session resolver projection %q: metadata: %w", projection.SourcePath, err)
 		}
@@ -923,6 +936,10 @@ func (stager *resolverStager) ResolverProjectionPage(ctx context.Context, snapsh
 			return nil, err
 		}
 		projection.Nodes = facts.Nodes
+		if err := appendEdges(ctx, stager.transaction, &facts, `SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_edges WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY source_id, target_id, relation`, stager.workspace, projection.SourcePath, stager.snapshot.Version, stager.snapshot.Version); err != nil {
+			return nil, err
+		}
+		projection.Edges = facts.Edges
 		projection.UnresolvedReferences = data.UnresolvedReferences
 		projection.SymbolReferences = data.SymbolReferences
 		projection.ExportedSurfaces = data.ExportedSurfaces
@@ -1637,6 +1654,10 @@ func (store *Store) ResolverProjections(ctx context.Context, snapshot storage.Sn
 			return nil, err
 		}
 		projection.Nodes = facts.Nodes
+		if err := appendEdges(ctx, store.database, &facts, `SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_edges WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY source_id, target_id, relation`, snapshot.Workspace, projection.SourcePath, snapshot.Version, snapshot.Version); err != nil {
+			return nil, err
+		}
+		projection.Edges = facts.Edges
 		if err := projection.Metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("read resolver projection %q: metadata: %w", projection.SourcePath, err)
 		}
@@ -1704,6 +1725,10 @@ func (store *Store) ResolverProjectionPage(ctx context.Context, snapshot storage
 			return nil, err
 		}
 		projection.Nodes = facts.Nodes
+		if err := appendEdges(ctx, store.database, &facts, `SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_edges WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY source_id, target_id, relation`, snapshot.Workspace, projection.SourcePath, snapshot.Version, snapshot.Version); err != nil {
+			return nil, err
+		}
+		projection.Edges = facts.Edges
 		if err := projection.Metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("read resolver projection %q: metadata: %w", projection.SourcePath, err)
 		}
@@ -1905,6 +1930,9 @@ func resolverProjectionBytes(projections []storage.ResolverProjection) int64 {
 		for _, node := range projection.Nodes {
 			bytes += int64(len(node.ID)+len(node.Kind)+len(node.Label)+len(node.QualifiedName)) + evidenceBytes(node.Evidence)
 		}
+		for _, edge := range projection.Edges {
+			bytes += int64(len(edge.SourceID)+len(edge.TargetID)+len(edge.Relation)) + evidenceBytes(edge.Evidence)
+		}
 		for _, extension := range projection.Metadata.Extensions {
 			bytes += int64(len(extension))
 		}
@@ -1943,6 +1971,7 @@ func copyResolverProjections(projections []storage.ResolverProjection) []storage
 			SourcePath:           projection.SourcePath,
 			Metadata:             extractor.Metadata{Name: projection.Metadata.Name, Version: projection.Metadata.Version, Extensions: append([]string(nil), projection.Metadata.Extensions...)},
 			Nodes:                append([]graph.Node(nil), projection.Nodes...),
+			Edges:                append([]graph.Edge(nil), projection.Edges...),
 			UnresolvedReferences: copyUnresolvedReferences(projection.UnresolvedReferences),
 			SymbolReferences:     append([]extractor.SymbolReference(nil), projection.SymbolReferences...),
 			ExportedSurfaces:     append([]extractor.ExportedSurface(nil), projection.ExportedSurfaces...),
@@ -2061,6 +2090,264 @@ func (store *Store) LookupExactNodes(ctx context.Context, snapshot storage.Snaps
 		return nil, fmt.Errorf("iterate exact graph node matches: %w", err)
 	}
 	return matches, nil
+}
+
+func (store *Store) SearchNodes(ctx context.Context, snapshot storage.Snapshot, request storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || request.Limit <= 0 {
+		return nil, fmt.Errorf("search graph nodes: %w: snapshot and positive limit are required", storage.ErrInvalidRequest)
+	}
+	matchExpression := lexicalMatchExpression(request)
+	if matchExpression == "" {
+		return nil, fmt.Errorf("search graph nodes: %w: search text, phrase, or token group is required", storage.ErrInvalidRequest)
+	}
+	var scopedNodeIDs []string
+	if len(request.ProjectIDs) > 0 {
+		scoped, err := store.readScopedNodeIDs(ctx, snapshot, request.ProjectIDs)
+		if err != nil {
+			return nil, fmt.Errorf("search graph nodes: %w", err)
+		}
+		if len(scoped) == 0 {
+			return []storage.LexicalMatch{}, nil
+		}
+		scopedNodeIDs = make([]string, 0, len(scoped))
+		for nodeID := range scoped {
+			scopedNodeIDs = append(scopedNodeIDs, nodeID)
+		}
+		sort.Strings(scopedNodeIDs)
+	}
+
+	query, arguments := lexicalSearchQuery(snapshot, request, matchExpression, scopedNodeIDs)
+	rows, err := store.database.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("search graph nodes: %w", err)
+	}
+	defer rows.Close()
+
+	matches := make([]storage.LexicalMatch, 0)
+	for rows.Next() {
+		var match storage.LexicalMatch
+		var label, qualifiedName, spanPath, kind, identifierTokens string
+		targets := append([]any{&match.Score, &label, &qualifiedName, &spanPath, &kind, &identifierTokens, &match.Node.ID, &match.Node.Kind, &match.Node.Label, &match.Node.QualifiedName}, evidenceScanTargets(&match.Node.Evidence)...)
+		if err := rows.Scan(targets...); err != nil {
+			return nil, fmt.Errorf("read lexical graph node match: %w", err)
+		}
+		match.MatchedFields = lexicalMatchedFields(request, label, qualifiedName, spanPath, kind, identifierTokens)
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate lexical graph node matches: %w", err)
+	}
+	return matches, nil
+}
+
+func (store *Store) RebuildLexicalIndex(ctx context.Context, workspace string) error {
+	if workspace == "" {
+		return fmt.Errorf("rebuild lexical index: %w: workspace is required", storage.ErrInvalidRequest)
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start lexical index rebuild: %w", err)
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM node_search WHERE workspace = ?", workspace); err != nil {
+		return fmt.Errorf("clear lexical index: %w", err)
+	}
+	rows, err := transaction.QueryContext(ctx, "SELECT version FROM graph_versions WHERE workspace = ? ORDER BY version", workspace)
+	if err != nil {
+		return fmt.Errorf("read lexical rebuild snapshots: %w", err)
+	}
+	versions := make([]storage.GraphVersion, 0)
+	for rows.Next() {
+		var version storage.GraphVersion
+		if err := rows.Scan(&version); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read lexical rebuild snapshot: %w", err)
+		}
+		versions = append(versions, version)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close lexical rebuild snapshots: %w", err)
+	}
+	for _, version := range versions {
+		if err := rebuildLexicalSnapshot(ctx, transaction, workspace, version); err != nil {
+			return err
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit lexical index rebuild: %w", err)
+	}
+	return nil
+}
+
+func lexicalMatchExpression(request storage.LexicalSearchRequest) string {
+	groups := make([]string, 0, len(request.TokenGroups)+len(request.Phrases)+1)
+	for _, group := range request.TokenGroups {
+		terms := lexicalTerms(strings.Join(group, " "))
+		if len(terms) > 0 {
+			groups = append(groups, "("+strings.Join(quotedLexicalTerms(terms, true), " AND ")+")")
+		}
+	}
+	for _, phrase := range request.Phrases {
+		if terms := lexicalTerms(phrase); len(terms) > 0 {
+			groups = append(groups, quoteFTS(strings.Join(terms, " ")))
+		}
+	}
+	if len(groups) == 0 {
+		terms := lexicalTerms(request.Text)
+		groups = append(groups, quotedLexicalTerms(terms, true)...)
+	}
+	return strings.Join(groups, " OR ")
+}
+
+func quotedLexicalTerms(terms []string, prefix bool) []string {
+	quoted := make([]string, len(terms))
+	for index, term := range terms {
+		quoted[index] = quoteFTS(term)
+		if prefix {
+			quoted[index] += "*"
+		}
+	}
+	return quoted
+}
+
+func quoteFTS(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func lexicalTerms(value string) []string {
+	return strings.Fields(identifierTokens(value))
+}
+
+func identifierTokens(value string) string {
+	var builder strings.Builder
+	var prior rune
+	for index, character := range []rune(value) {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			if index > 0 && unicode.IsUpper(character) && (unicode.IsLower(prior) || unicode.IsDigit(prior)) {
+				builder.WriteByte(' ')
+			}
+			builder.WriteRune(unicode.ToLower(character))
+		} else if builder.Len() > 0 {
+			builder.WriteByte(' ')
+		}
+		prior = character
+	}
+	return strings.Join(strings.Fields(builder.String()), " ")
+}
+
+func lexicalMatchedFields(request storage.LexicalSearchRequest, label, qualifiedName, spanPath, kind, tokens string) []string {
+	terms := lexicalTerms(request.Text)
+	for _, phrase := range request.Phrases {
+		terms = append(terms, lexicalTerms(phrase)...)
+	}
+	for _, group := range request.TokenGroups {
+		terms = append(terms, lexicalTerms(strings.Join(group, " "))...)
+	}
+	fields := []struct{ name, value string }{
+		{"label", label}, {"qualifiedName", qualifiedName}, {"path", spanPath}, {"kind", kind}, {"identifierTokens", tokens},
+	}
+	matched := make([]string, 0, len(fields))
+	for _, field := range fields {
+		fieldValue := field.value
+		if field.name != "identifierTokens" {
+			fieldValue = identifierTokens(fieldValue)
+		}
+		fieldTokens := " " + fieldValue + " "
+		for _, term := range terms {
+			if strings.Contains(fieldTokens, " "+term+" ") {
+				matched = append(matched, field.name)
+				break
+			}
+		}
+	}
+	return matched
+}
+
+func lexicalSearchQuery(snapshot storage.Snapshot, request storage.LexicalSearchRequest, expression string, scopedNodeIDs []string) (string, []any) {
+	kindFilter := ""
+	scopeFilter := ""
+	arguments := []any{
+		snapshot.Workspace, snapshot.Version, snapshot.Version,
+		snapshot.Workspace, snapshot.Version,
+		snapshot.Workspace, snapshot.Version, expression,
+	}
+	if len(request.Kinds) > 0 {
+		placeholders := make([]string, len(request.Kinds))
+		for index, kind := range request.Kinds {
+			placeholders[index] = "?"
+			arguments = append(arguments, kind)
+		}
+		kindFilter = " AND visible_nodes.kind IN (" + strings.Join(placeholders, ", ") + ")"
+	}
+	if len(scopedNodeIDs) > 0 {
+		placeholders := make([]string, len(scopedNodeIDs))
+		for index, nodeID := range scopedNodeIDs {
+			placeholders[index] = "?"
+			arguments = append(arguments, nodeID)
+		}
+		scopeFilter = " AND visible_nodes.node_id IN (" + strings.Join(placeholders, ", ") + ")"
+	}
+	arguments = append(arguments, request.Text, request.Limit)
+	return `
+		WITH visible_nodes AS (
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+			FROM contribution_nodes WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+			FROM workspace_nodes WHERE workspace = ? AND version = ?
+		)
+		SELECT -bm25(node_search, 0, 0, 0, 10, 6, 3, 1, 5), node_search.label, node_search.qualified_name,
+			node_search.span_path, node_search.kind, node_search.identifier_tokens,
+			visible_nodes.node_id, visible_nodes.kind, visible_nodes.label, visible_nodes.qualified_name,
+			visible_nodes.span_path, visible_nodes.start_line, visible_nodes.start_column, visible_nodes.end_line, visible_nodes.end_column,
+			visible_nodes.file_hash, visible_nodes.extractor, visible_nodes.provenance, visible_nodes.confidence
+		FROM node_search JOIN visible_nodes ON visible_nodes.node_id = node_search.node_id
+		WHERE node_search.workspace = ? AND node_search.version = ? AND node_search MATCH ?` + kindFilter + scopeFilter + `
+		ORDER BY CASE WHEN replace(replace(replace(lower(node_search.label), '_', ''), '-', ''), ' ', '') = replace(replace(replace(lower(?), '_', ''), '-', ''), ' ', '') THEN 0 ELSE 1 END,
+			bm25(node_search, 0, 0, 0, 10, 6, 3, 1, 5), visible_nodes.qualified_name, visible_nodes.node_id
+		LIMIT ?`, arguments
+}
+
+func rebuildLexicalSnapshot(ctx context.Context, transaction *sql.Tx, workspace string, version storage.GraphVersion) error {
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM node_search WHERE workspace = ? AND version = ?", workspace, version); err != nil {
+		return fmt.Errorf("clear lexical snapshot: %w", err)
+	}
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT node_id, label, qualified_name, span_path, kind
+		FROM contribution_nodes
+		WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+		UNION
+		SELECT node_id, label, qualified_name, span_path, kind
+		FROM workspace_nodes
+		WHERE workspace = ? AND version = ?
+		ORDER BY node_id`, workspace, version, version, workspace, version)
+	if err != nil {
+		return fmt.Errorf("read lexical snapshot nodes: %w", err)
+	}
+	type lexicalRow struct{ nodeID, label, qualifiedName, spanPath, kind string }
+	indexed := make([]lexicalRow, 0)
+	for rows.Next() {
+		var row lexicalRow
+		if err := rows.Scan(&row.nodeID, &row.label, &row.qualifiedName, &row.spanPath, &row.kind); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read lexical snapshot node: %w", err)
+		}
+		indexed = append(indexed, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate lexical snapshot nodes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close lexical snapshot nodes: %w", err)
+	}
+	for _, row := range indexed {
+		tokens := identifierTokens(strings.Join([]string{row.nodeID, row.label, row.qualifiedName, row.spanPath, row.kind}, " "))
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO node_search (workspace, version, node_id, label, qualified_name, span_path, kind, identifier_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, workspace, version, row.nodeID, row.label, row.qualifiedName, row.spanPath, row.kind, tokens); err != nil {
+			return fmt.Errorf("index lexical snapshot node: %w", err)
+		}
+	}
+	return nil
 }
 
 const exactNodeLookupSQL = `
@@ -2682,6 +2969,13 @@ func (store *Store) Rollback(ctx context.Context, request storage.RollbackReques
 	); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("remove rolled back workspace edges: %w", err)
 	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM node_search WHERE workspace = ? AND version > ?",
+		request.Workspace,
+		request.Version,
+	); err != nil {
+		return storage.Snapshot{}, fmt.Errorf("remove rolled back lexical snapshots: %w", err)
+	}
 	if err := reopenContributionRecords(ctx, transaction, request.Workspace, request.Version); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("reopen rolled back contributions: %w", err)
 	}
@@ -2767,6 +3061,13 @@ func pruneVersions(ctx context.Context, transaction *sql.Tx, workspace string, r
 		retainedVersion,
 	); err != nil {
 		return storage.PruneResult{}, fmt.Errorf("remove pruned workspace edges: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM node_search WHERE workspace = ? AND version < ?",
+		workspace,
+		retainedVersion,
+	); err != nil {
+		return storage.PruneResult{}, fmt.Errorf("remove pruned lexical snapshots: %w", err)
 	}
 	if _, err := transaction.ExecContext(ctx,
 		"DELETE FROM graph_versions WHERE workspace = ? AND version < ?",
@@ -3373,7 +3674,7 @@ func migrate(ctx context.Context, database *sql.DB) error {
 	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&version); err != nil {
 		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
-	if version != 0 && version != CurrentSchemaVersion {
+	if version != 0 && version != 10 && version != CurrentSchemaVersion {
 		return fmt.Errorf("%w: found version %d, need version %d", errSchemaMismatch, version, CurrentSchemaVersion)
 	}
 
@@ -3392,12 +3693,53 @@ func migrate(ctx context.Context, database *sql.DB) error {
 			CREATE TABLE contribution_symbol_references (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, source_id TEXT NOT NULL, target TEXT NOT NULL, relation TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, source_id, target, relation));
 			CREATE TABLE workspace_nodes (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, qualified_name TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, PRIMARY KEY (workspace, version, node_id));
 			CREATE TABLE workspace_edges (workspace TEXT NOT NULL, version INTEGER NOT NULL, source_id TEXT NOT NULL, target_id TEXT NOT NULL, relation TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, resolved_fact_owner TEXT NOT NULL, PRIMARY KEY (workspace, version, source_id, target_id, relation));
+			CREATE VIRTUAL TABLE node_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, label, qualified_name, span_path, kind, identifier_tokens, tokenize = 'unicode61 remove_diacritics 2');
 			CREATE INDEX contribution_dependencies_visible ON contribution_dependencies (workspace, target_path, valid_from_version, valid_to_version);
 		`); err != nil {
 			return fmt.Errorf("create SQLite normalized graph tables: %w", err)
 		}
 		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", CurrentSchemaVersion, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("record SQLite schema version: %w", err)
+		}
+	}
+	if version == 10 {
+		var graphVersionsTable string
+		if err := transaction.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'graph_versions'").Scan(&graphVersionsTable); err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("%w: version 10 database has no graph tables", errSchemaMismatch)
+			}
+			return fmt.Errorf("inspect version 10 SQLite schema: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `CREATE VIRTUAL TABLE node_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, label, qualified_name, span_path, kind, identifier_tokens, tokenize = 'unicode61 remove_diacritics 2')`); err != nil {
+			return fmt.Errorf("create SQLite lexical index: %w", err)
+		}
+		rows, err := transaction.QueryContext(ctx, "SELECT workspace, version FROM graph_versions ORDER BY workspace, version")
+		if err != nil {
+			return fmt.Errorf("read snapshots for lexical index rebuild: %w", err)
+		}
+		type snapshotKey struct {
+			workspace string
+			version   storage.GraphVersion
+		}
+		snapshots := make([]snapshotKey, 0)
+		for rows.Next() {
+			var snapshot snapshotKey
+			if err := rows.Scan(&snapshot.workspace, &snapshot.version); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("read snapshot for lexical index rebuild: %w", err)
+			}
+			snapshots = append(snapshots, snapshot)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close snapshots for lexical index rebuild: %w", err)
+		}
+		for _, snapshot := range snapshots {
+			if err := rebuildLexicalSnapshot(ctx, transaction, snapshot.workspace, snapshot.version); err != nil {
+				return err
+			}
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", CurrentSchemaVersion, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record SQLite lexical migration: %w", err)
 		}
 	}
 

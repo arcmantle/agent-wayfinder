@@ -21,8 +21,8 @@ jobs:
       - name: Install C toolchain
         run: sudo apt-get update && sudo apt-get install --yes build-essential
       - name: Test
-        run: go test ./...
+        run: go test -tags sqlite_fts5 ./...
       - name: Vet
         run: go vet ./...
       - name: Build
-        run: go build ./cmd/agent-wayfinder
+        run: go build -tags sqlite_fts5 ./cmd/agent-wayfinder

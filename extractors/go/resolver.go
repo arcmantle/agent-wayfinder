@@ -94,6 +94,7 @@ func ResolveWithFileView(contributions []extractor.Contribution, view extractor.
 	for _, node := range nodes {
 		resolution.facts.Nodes = append(resolution.facts.Nodes, node)
 	}
+	appendLocalCallFacts(contributions, &resolution)
 	for _, sourcePath := range paths {
 		contribution := contributionForPath(contributions, sourcePath)
 		for _, reference := range contribution.UnresolvedReferences() {
@@ -113,6 +114,7 @@ func ResolveWithFileView(contributions []extractor.Contribution, view extractor.
 		}
 	}
 	appendPackageCallFacts(contributions, modulePath, files, packages, surfaces, &resolution)
+	appendLocalMethodCallFacts(contributions, &resolution)
 	appendImplementationFacts(contributions, &resolution)
 
 	sort.Slice(resolution.facts.Edges, func(left, right int) bool {
@@ -159,6 +161,7 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 	}
 	sort.Strings(paths)
 	resolution := Resolution{}
+	appendLocalCallFacts(contributions, &resolution)
 	for _, sourcePath := range paths {
 		contribution := byPath[sourcePath]
 		for _, reference := range contribution.UnresolvedReferences() {
@@ -234,7 +237,10 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 			resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{SourceID: reference.SourceID, TargetID: matches[0], Relation: CallsRelation, Evidence: reference.Evidence})
 		}
 	}
-	if err := appendPageImplementationFacts(ctx, index, projectID, contributions, nodes, &resolution); err != nil {
+	if err := appendImportedMethodCallFacts(ctx, index, projectID, modulePath, contributions, &resolution); err != nil {
+		return Resolution{}, err
+	}
+	if err := appendPageImplementationFacts(ctx, index, projectID, modulePath, contributions, nodes, &resolution); err != nil {
 		return Resolution{}, err
 	}
 	resolution.facts.Nodes = make([]graph.Node, 0, len(nodes))
@@ -258,6 +264,102 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 		return Resolution{}, fmt.Errorf("validate Go page resolution: %w", err)
 	}
 	return resolution, nil
+}
+
+func appendLocalCallFacts(contributions []extractor.Contribution, resolution *Resolution) {
+	for _, contribution := range contributions {
+		for _, edge := range contribution.Facts().Edges {
+			if edge.Relation == CallsRelation {
+				resolution.facts.Edges = append(resolution.facts.Edges, edge)
+			}
+		}
+	}
+}
+
+func appendLocalMethodCallFacts(contributions []extractor.Contribution, resolution *Resolution) {
+	methodsByName := make(map[string][]string)
+	for _, contribution := range contributions {
+		for _, node := range contribution.Facts().Nodes {
+			if node.Kind == MethodNodeKind {
+				methodsByName[node.Label] = append(methodsByName[node.Label], node.ID)
+			}
+		}
+	}
+	for _, contribution := range contributions {
+		importedPackages := make(map[string]struct{})
+		for _, imported := range contribution.UnresolvedReferences() {
+			importedPackages[path.Base(imported.Target)] = struct{}{}
+		}
+		for _, reference := range contribution.SymbolReferences() {
+			if reference.Relation != CallsRelation {
+				continue
+			}
+			receiver, method, found := strings.Cut(reference.Target, ".")
+			if !found {
+				continue
+			}
+			if _, imported := importedPackages[receiver]; imported {
+				continue
+			}
+			for _, targetID := range methodsByName[method] {
+				resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
+					SourceID: reference.SourceID,
+					TargetID: targetID,
+					Relation: CallsRelation,
+					Evidence: reference.Evidence,
+				})
+			}
+		}
+	}
+}
+
+func appendImportedMethodCallFacts(ctx context.Context, index extractor.ResolverIndex, projectID, modulePath string, contributions []extractor.Contribution, resolution *Resolution) error {
+	for _, contribution := range contributions {
+		importedPackages := make(map[string]struct{})
+		for _, imported := range contribution.UnresolvedReferences() {
+			importedPackages[path.Base(imported.Target)] = struct{}{}
+		}
+		for _, reference := range contribution.SymbolReferences() {
+			if reference.Relation != CallsRelation {
+				continue
+			}
+			receiver, method, found := strings.Cut(reference.Target, ".")
+			if !found {
+				continue
+			}
+			if _, imported := importedPackages[receiver]; imported {
+				continue
+			}
+			seen := make(map[string]struct{})
+			for _, imported := range contribution.UnresolvedReferences() {
+				packagePath, inModule := modulePackagePath(imported.Target, modulePath)
+				if !inModule {
+					continue
+				}
+				if err := visitPackageTargets(ctx, index, projectID, packagePath, func(target extractor.ResolverTarget) error {
+					for _, node := range target.Nodes {
+						if node.Kind != MethodNodeKind || node.Label != method {
+							continue
+						}
+						if _, duplicate := seen[node.ID]; duplicate {
+							continue
+						}
+						seen[node.ID] = struct{}{}
+						resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
+							SourceID: reference.SourceID,
+							TargetID: node.ID,
+							Relation: CallsRelation,
+							Evidence: reference.Evidence,
+						})
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 const resolverPackagePageSize = 128
@@ -306,7 +408,7 @@ func callableTargetSurface(nodeID string, nodes []graph.Node) bool {
 	return false
 }
 
-func appendPageImplementationFacts(ctx context.Context, index extractor.ResolverIndex, projectID string, contributions []extractor.Contribution, nodes map[string]graph.Node, resolution *Resolution) error {
+func appendPageImplementationFacts(ctx context.Context, index extractor.ResolverIndex, projectID, modulePath string, contributions []extractor.Contribution, nodes map[string]graph.Node, resolution *Resolution) error {
 	for _, contribution := range contributions {
 		packageName := packageName(contribution.Facts().Nodes)
 		if packageName == "" {
@@ -327,6 +429,49 @@ func appendPageImplementationFacts(ctx context.Context, index extractor.Resolver
 			if err := appendEmbeddedInterfaces(ctx, index, projectID, packagePath, packageName, current, contribution.SymbolReferences(), nodes, resolution); err != nil {
 				return err
 			}
+			if err := appendImportedInterfaceImplementations(ctx, index, projectID, modulePath, contribution, current, methods, nodes, resolution); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func appendImportedInterfaceImplementations(ctx context.Context, index extractor.ResolverIndex, projectID, modulePath string, contribution extractor.Contribution, current graph.Node, methods map[string]struct{}, nodes map[string]graph.Node, resolution *Resolution) error {
+	seen := make(map[string]struct{})
+	for _, imported := range contribution.UnresolvedReferences() {
+		packagePath, found := modulePackagePath(imported.Target, modulePath)
+		if !found {
+			continue
+		}
+		if err := visitPackageTargets(ctx, index, projectID, packagePath, func(target extractor.ResolverTarget) error {
+			for _, node := range target.Nodes {
+				if isResolverNodeKind(node.Kind) {
+					nodes[node.ID] = node
+				}
+			}
+			for _, node := range target.Nodes {
+				if node.Kind != TypeNodeKind || node.ID == current.ID {
+					continue
+				}
+				requirements := relationReferencesForSource(target.SymbolReferences, node.ID, ImplementsRelation)
+				if len(requirements) == 0 || !implementsAll(methods, requirements) {
+					continue
+				}
+				if _, duplicate := seen[node.ID]; duplicate {
+					continue
+				}
+				seen[node.ID] = struct{}{}
+				resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
+					SourceID: current.ID,
+					TargetID: node.ID,
+					Relation: ImplementsRelation,
+					Evidence: current.Evidence,
+				})
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

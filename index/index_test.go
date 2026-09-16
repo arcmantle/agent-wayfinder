@@ -223,6 +223,30 @@ func TestIndexPublishesInitialWorkspaceThroughContributionSession(t *testing.T) 
 	}
 }
 
+func TestIndexPublishesLocalGoCallFactsFromProjectionPages(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":      "module example.com/fixture\n",
+		"cmd/main.go": "package main\n\nfunc run() {}\n\nfunc main() { run() }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	result, err := index.Index(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish Go workspace: %v", err)
+	}
+	facts := &factCollector{}
+	if err := store.Export(context.Background(), result.Snapshot, storage.ExportRequest{}, facts); err != nil {
+		t.Fatalf("export Go workspace: %v", err)
+	}
+	if !hasRelationBetweenQualifiedNames(facts, "cmd/main.go::main.main", "cmd/main.go::main.run", "go:calls") {
+		t.Errorf("published facts omit local Go call edge: %+v", facts.edges)
+	}
+}
+
 func TestIndexTypeScriptProjectionPagesResolveAcrossBoundary(t *testing.T) {
 	files := map[string]string{
 		"package.json":    `{"name":"fixture"}`,

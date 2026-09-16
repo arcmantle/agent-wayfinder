@@ -14,12 +14,12 @@ func TestRunGraphifyComparisonCorpusComparesCLIAndExportedFacts(t *testing.T) {
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
 
-	command := exec.Command("go", "run", "../cmd/agent-wayfinder", "index", "--database", database, "--format", "json", workspace.Root)
+	command := exec.Command("go", "run", "-tags", "sqlite_fts5", "../cmd/agent-wayfinder", "index", "--database", database, "--format", "json", workspace.Root)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("index comparison corpus workspace: %v\n%s", err, output)
 	}
 
-	command = exec.Command("go", "run", "../cmd/agent-wayfinder", "export", "--database", database, "--format", "json", workspace.Root)
+	command = exec.Command("go", "run", "-tags", "sqlite_fts5", "../cmd/agent-wayfinder", "export", "--database", database, "--format", "json", workspace.Root)
 	candidate, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("export comparison corpus workspace: %v\n%s", err, candidate)
@@ -37,7 +37,7 @@ func TestRunGraphifyComparisonCorpusComparesIndexDiagnostics(t *testing.T) {
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
 
-	command := exec.Command("go", "run", "../cmd/agent-wayfinder", "index", "--database", database, "--format", "json", workspace.Root)
+	command := exec.Command("go", "run", "-tags", "sqlite_fts5", "../cmd/agent-wayfinder", "index", "--database", database, "--format", "json", workspace.Root)
 	candidate, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("index diagnostic comparison corpus workspace: %v\n%s", err, candidate)

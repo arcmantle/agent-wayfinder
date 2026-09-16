@@ -56,6 +56,13 @@ func TestContributionSessionCommitPublishesOneCompleteSnapshot(t *testing.T) {
 	if current != snapshot {
 		t.Errorf("current snapshot after commit = %+v, want %+v", current, snapshot)
 	}
+	matches, err := store.SearchNodes(context.Background(), current, storage.LexicalSearchRequest{Text: "main", Limit: 10})
+	if err != nil {
+		t.Fatalf("search committed lexical snapshot: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Node.ID != "function:main" {
+		t.Errorf("committed lexical matches = %+v, want function:main", matches)
+	}
 
 	target, found, err := store.ResolverTarget(context.Background(), current, extractor.ResolverTargetRequest{
 		ProjectID:  "project:fixture",
@@ -706,6 +713,56 @@ func TestContributionSessionResolverOperationsRequireSeal(t *testing.T) {
 	}
 	if err := session.ReplaceContributionDependencies(context.Background(), []extractor.Contribution{contribution}); !errors.Is(err, storage.ErrInvalidRequest) {
 		t.Errorf("replace contribution dependencies before seal = %v, want invalid request", err)
+	}
+}
+
+func TestContributionSessionResolverProjectionPreservesContributionEdges(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	vocabulary, err := graph.NewVocabulary(graph.VocabularyDefinition{
+		NodeKinds: []graph.NodeKind{"function"},
+		Relations: []graph.RelationDefinition{{Kind: "calls", Endpoints: []graph.EndpointRule{{Source: "function", Target: "function"}}}},
+	})
+	if err != nil {
+		t.Fatalf("create vocabulary: %v", err)
+	}
+	evidence := graph.FactEvidence{Span: graph.SourceSpan{Path: "src/main.ts", StartLine: 1, StartColumn: 1, EndLine: 1, EndColumn: 5}, FileHash: "content-hash", Extractor: "typescript@1", Provenance: "syntax", Confidence: graph.ConfidenceExtracted}
+	contribution, err := extractor.NewContribution(vocabulary, extractor.ContributionInput{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/main.ts",
+		Metadata:   extractor.Metadata{Name: "typescript", Version: "1", Extensions: []string{".ts"}},
+		Facts: graph.Facts{
+			Nodes: []graph.Node{{ID: "function:main", Kind: "function", Label: "main", Evidence: evidence}, {ID: "function:helper", Kind: "function", Label: "helper", Evidence: evidence}},
+			Edges: []graph.Edge{{SourceID: "function:main", TargetID: "function:helper", Relation: "calls", Evidence: evidence}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create contribution: %v", err)
+	}
+
+	session, err := store.BeginContributionSession(context.Background(), "workspace")
+	if err != nil {
+		t.Fatalf("begin contribution session: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Rollback(context.Background()) })
+	stageSessionSource(t, session, contribution.SourcePath())
+	if err := session.WriteContribution(context.Background(), contribution); err != nil {
+		t.Fatalf("write contribution: %v", err)
+	}
+	if err := session.SealContributions(context.Background()); err != nil {
+		t.Fatalf("seal contributions: %v", err)
+	}
+
+	projections, err := session.ResolverProjectionPage(context.Background(), storage.Snapshot{Workspace: "workspace"}, storage.ResolverProjectionPageRequest{ProjectID: "project:fixture", Language: "typescript", Limit: 1})
+	if err != nil {
+		t.Fatalf("read resolver projection: %v", err)
+	}
+	if len(projections) != 1 || len(projections[0].Edges) != 1 || projections[0].Edges[0].Relation != "calls" {
+		t.Fatalf("projection edges = %+v, want one calls edge", projections)
 	}
 }
 

@@ -125,8 +125,55 @@ func TestExtractProducesVariableAndLocalReferenceFacts(t *testing.T) {
 	if !hasFactEdge(contribution.Facts(), mainID, helperID, "references") {
 		t.Errorf("facts = %+v, want main reference to helper", contribution.Facts())
 	}
+	if !hasFactEdge(contribution.Facts(), mainID, helperID, CallsRelation) {
+		t.Errorf("facts = %+v, want main call to helper", contribution.Facts())
+	}
 	if !hasReferenceEvidence(contribution.Facts(), mainID, helperID, graph.SourceSpan{Path: "src/main.go", StartLine: 6, StartColumn: 11, EndLine: 6, EndColumn: 17}) {
 		t.Errorf("facts = %+v, want helper reference evidence at the call site", contribution.Facts())
+	}
+}
+
+func TestResolvePagePreservesLocalCallFacts(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/main.go",
+		Contents:   []byte("package fixture\n\nfunc helper() int { return 1 }\n\nfunc main() int {\n\treturn helper()\n}\n"),
+	})
+	if err != nil {
+		t.Fatalf("extract Go facts: %v", err)
+	}
+
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{contribution}, "project:fixture", pageResolverIndex{}, extractor.ResolverFileView{})
+	if err != nil {
+		t.Fatalf("resolve Go page: %v", err)
+	}
+
+	helperID := findNodeID(t, contribution.Facts(), FunctionNodeKind, "helper")
+	mainID := findNodeID(t, contribution.Facts(), FunctionNodeKind, "main")
+	if !hasFactEdge(resolution.Facts(), mainID, helperID, CallsRelation) {
+		t.Errorf("resolved facts = %+v, want local call fact", resolution.Facts())
+	}
+}
+
+func TestResolveWithFileViewResolvesLocalMethodSelectorCalls(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/store.go",
+		Contents:   []byte("package fixture\n\ntype Store struct{}\n\nfunc (Store) LookupNodes() {}\n\nfunc run(store Store) { store.LookupNodes() }\n"),
+	})
+	if err != nil {
+		t.Fatalf("extract Go facts: %v", err)
+	}
+
+	resolution, err := ResolveWithFileView([]extractor.Contribution{contribution}, extractor.ResolverFileView{})
+	if err != nil {
+		t.Fatalf("resolve Go facts: %v", err)
+	}
+
+	runID := findNodeID(t, contribution.Facts(), FunctionNodeKind, "run")
+	methodID := findNodeID(t, contribution.Facts(), MethodNodeKind, "LookupNodes")
+	if !hasFactEdge(resolution.Facts(), runID, methodID, CallsRelation) {
+		t.Errorf("resolved facts = %+v, want method call fact", resolution.Facts())
 	}
 }
 

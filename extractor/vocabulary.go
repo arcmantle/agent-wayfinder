@@ -45,6 +45,10 @@ func NewLanguageVocabulary(name string, declarationKinds []graph.NodeKind) (grap
 				Kind:      "references",
 				Endpoints: declarationEndpoints,
 			},
+			{
+				Kind:      graph.RelationKind(name + ":calls"),
+				Endpoints: declarationEndpoints,
+			},
 		},
 	})
 }

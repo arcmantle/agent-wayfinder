@@ -178,6 +178,29 @@ type NodeMatch struct {
 	Score float64
 }
 
+type LexicalSearchRequest struct {
+	Text        string           `json:"text"`
+	Phrases     []string         `json:"phrases,omitempty"`
+	TokenGroups [][]string       `json:"tokenGroups,omitempty"`
+	Kinds       []graph.NodeKind `json:"kinds,omitempty"`
+	ProjectIDs  []string         `json:"projectIds,omitempty"`
+	Limit       int              `json:"limit"`
+}
+
+type LexicalMatch struct {
+	Node          graph.Node `json:"node"`
+	Score         float64    `json:"score"`
+	MatchedFields []string   `json:"matchedFields"`
+}
+
+type LexicalSearcher interface {
+	SearchNodes(context.Context, Snapshot, LexicalSearchRequest) ([]LexicalMatch, error)
+}
+
+type LexicalIndexRebuilder interface {
+	RebuildLexicalIndex(context.Context, string) error
+}
+
 type NodeLookup interface {
 	LookupNodes(context.Context, Snapshot, NodeLookupRequest) ([]NodeMatch, error)
 }
@@ -297,6 +320,7 @@ type Store interface {
 	ResolverTargetReader
 	ResolverPackagePageReader
 	NodeLookup
+	LexicalSearcher
 	Traverser
 	Explainer
 	Exporter

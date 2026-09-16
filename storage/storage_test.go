@@ -347,6 +347,10 @@ type contractStore struct {
 	prunerFunc
 }
 
+func (contractStore) SearchNodes(context.Context, storage.Snapshot, storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+	panic("unimplemented")
+}
+
 // SourceContributions implements [storage.Store].
 func (c contractStore) SourceContributions(context.Context, storage.Snapshot) ([]storage.SourceContribution, error) {
 	panic("unimplemented")

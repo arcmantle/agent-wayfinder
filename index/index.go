@@ -999,7 +999,7 @@ func projectionContribution(projection extractor.ResolverProjection) (extractor.
 		ProjectID:            projection.ProjectID,
 		SourcePath:           projection.SourcePath,
 		Metadata:             projection.Metadata,
-		Facts:                graph.Facts{Nodes: projection.Nodes},
+		Facts:                graph.Facts{Nodes: projection.Nodes, Edges: projection.Edges},
 		UnresolvedReferences: projection.UnresolvedReferences,
 		SymbolReferences:     projection.SymbolReferences,
 		ExportedSurfaces:     projection.ExportedSurfaces,

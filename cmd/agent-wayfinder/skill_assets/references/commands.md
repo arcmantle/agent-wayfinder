@@ -28,6 +28,20 @@ go run ./cmd/agent-wayfinder --help
 
 Use one launcher consistently in a command sequence.
 
+## MCP
+
+When an Agent Wayfinder MCP server is available, use its `query`, `path`,
+`explain`, and `export` tools instead of the matching CLI commands. Tool input
+uses the same workspace, database, traversal limit, project, and relation
+values described below. Tool results use the same JSON result envelope.
+
+The MCP server is read-only. Use the CLI for `install`, `index`, and `indexer`.
+To start the stdio server directly, run:
+
+```bash
+agent-wayfinder mcp
+```
+
 ## Database
 
 The default database is:
@@ -50,10 +64,12 @@ agent-wayfinder index WORKSPACE [--database PATH] [--format text|json]
 
 ## Query
 
-Find seed nodes for one or more terms, then traverse outgoing relationships:
+Question mode interprets one architecture question and returns a deterministic query plan with ranked evidence:
 
 ```bash
-agent-wayfinder query WORKSPACE TERM... \
+agent-wayfinder query WORKSPACE QUESTION \
+  [--question] \
+  [--show-plan] \
   [--database PATH] \
   [--format text|json] \
   [--max-depth 2] \
@@ -62,9 +78,26 @@ agent-wayfinder query WORKSPACE TERM... \
   [--relation RELATION]...
 ```
 
-Pass terms separately. Lookup prefers exact node IDs, qualified names, and labels. It then uses token prefixes and source-path or text containment. Each term can select up to three seed nodes.
+Quote a question so that the shell passes it as one argument. One argument with sentence signals enters question mode automatically. Use `--question` to require question mode. Question-mode JSON includes `schemaVersion`, `interpretation`, `evidence`, `limits`, `warnings`, and `suggestions` in the result envelope. Use `--show-plan` to include the interpreted plan in text output.
 
-Use `--project` and `--relation` only with IDs or relation names found in the graph output. Repeating either flag adds allowed values.
+When confidence is low or retrieval is weak, inspect the ranked candidates and follow the returned suggestions. Use exact identifiers, separate terms, `path`, or `explain` for the next check. Do not treat weak evidence as an answer claim.
+
+Explicit TERM mode keeps literal lookup behavior:
+
+```bash
+agent-wayfinder query WORKSPACE TERM... \
+  [--terms] \
+  [--database PATH] \
+  [--format text|json] \
+  [--max-depth 2] \
+  [--max-nodes 100] \
+  [--project PROJECT_ID]... \
+  [--relation RELATION]...
+```
+
+Pass literal terms separately. Multiple terms enter TERM mode automatically. Use `--terms` when one literal term contains sentence signals. Exact lookup keeps precedence, and each term can select up to three seed nodes.
+
+`--question` and `--terms` cannot be used together. Use `--project` and `--relation` only with IDs or relation names found in graph output. Repeating either filter adds allowed values.
 
 ## Path
 

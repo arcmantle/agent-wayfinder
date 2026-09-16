@@ -1,0 +1,386 @@
+package query
+
+import (
+	"regexp"
+	"strings"
+	"unicode"
+
+	"agent-wayfinder/graph"
+	"agent-wayfinder/storage"
+)
+
+const QueryPlanSchemaVersion = 1
+
+type Intent string
+
+const (
+	IntentUnknown              Intent = "unknown"
+	IntentLookup               Intent = "lookup"
+	IntentExplain              Intent = "explain"
+	IntentCalls                Intent = "calls"
+	IntentCalledBy             Intent = "called_by"
+	IntentDependencies         Intent = "dependencies"
+	IntentDependents           Intent = "dependents"
+	IntentPath                 Intent = "path"
+	IntentReachability         Intent = "reachability"
+	IntentSharedContract       Intent = "shared_contract"
+	IntentImpact               Intent = "impact"
+	IntentDependencyComparison Intent = "dependency_comparison"
+)
+
+type ExecutionOperator string
+
+const (
+	OperatorLookup       ExecutionOperator = "lookup"
+	OperatorExplain      ExecutionOperator = "explain"
+	OperatorNeighbors    ExecutionOperator = "neighbors"
+	OperatorPath         ExecutionOperator = "path"
+	OperatorIntersection ExecutionOperator = "intersection"
+	OperatorImpact       ExecutionOperator = "impact"
+)
+
+type RetrievalRequest = storage.LexicalSearchRequest
+
+type EntitySlot struct {
+	Role      string           `json:"role"`
+	Text      string           `json:"text"`
+	Retrieval RetrievalRequest `json:"retrieval"`
+}
+
+type PlanWarning struct {
+	Code        string   `json:"code"`
+	Message     string   `json:"message"`
+	Suggestions []string `json:"suggestions,omitempty"`
+}
+
+type QueryPlan struct {
+	SchemaVersion    int                        `json:"schemaVersion"`
+	Question         string                     `json:"question"`
+	Tokens           []string                   `json:"tokens"`
+	NormalizedTerms  []string                   `json:"normalizedTerms"`
+	QuotedPhrases    []string                   `json:"quotedPhrases,omitempty"`
+	IgnoredStopWords []string                   `json:"ignoredStopWords,omitempty"`
+	RelationHints    []string                   `json:"relationHints,omitempty"`
+	DirectionHints   []string                   `json:"directionHints,omitempty"`
+	Intent           Intent                     `json:"intent"`
+	Confidence       float64                    `json:"confidence"`
+	EntitySlots      []EntitySlot               `json:"entitySlots"`
+	AllowedRelations []graph.RelationKind       `json:"allowedRelations,omitempty"`
+	Direction        storage.TraversalDirection `json:"direction"`
+	Operator         ExecutionOperator          `json:"operator"`
+	MaxDepth         int                        `json:"maxDepth"`
+	MaxNodes         int                        `json:"maxNodes"`
+	Warnings         []PlanWarning              `json:"warnings"`
+}
+
+type questionRule struct {
+	pattern        *regexp.Regexp
+	intent         Intent
+	operator       ExecutionOperator
+	direction      storage.TraversalDirection
+	roles          []string
+	captureIndexes []int
+	relations      []graph.RelationKind
+	maximumDepth   int
+}
+
+var questionRules = []questionRule{
+	rule(`^what is the (?:shared|common) contracts? between (.+?) and (.+?)$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
+	rule(`^which interfaces are common to (.+?) and (?:a )?(.+?)$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
+	rule(`^show the common storage contracts for (.+?) and (.+?)$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
+	rule(`^what is affected if (.+?) changes$`, IntentImpact, OperatorImpact, storage.TraverseIncoming, []string{"changed"}, nil, []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}),
+	rule(`^impact of changing (.+?)$`, IntentImpact, OperatorImpact, storage.TraverseIncoming, []string{"changed"}, nil, []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}),
+	rule(`^find a path from (.+?) to (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^how does (.+?) reach (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^trace (.+?) from (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, []int{2, 1}, []graph.RelationKind{"calls"}),
+	rule(`^can (.+?) reach (.+?)$`, IntentReachability, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^does (.+?) flow to (.+?)$`, IntentReachability, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^is (.+?) connected to (.+?) through calls$`, IntentReachability, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^who calls (.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^show callers of (.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^where is (.+?) called by other code$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^what calls (?:the )?(.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^what does (.+?) call$`, IntentCalls, OperatorNeighbors, storage.TraverseOutgoing, []string{"caller"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^which functions does (.+?) invoke$`, IntentCalls, OperatorNeighbors, storage.TraverseOutgoing, []string{"caller"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^show calls from (.+?)$`, IntentCalls, OperatorNeighbors, storage.TraverseOutgoing, []string{"caller"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^what does the (.+?) package import$`, IntentDependencies, OperatorNeighbors, storage.TraverseOutgoing, []string{"dependent"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
+	rule(`^which packages does (.+?) depend on$`, IntentDependencies, OperatorNeighbors, storage.TraverseOutgoing, []string{"dependent"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
+	rule(`^what modules are required by (.+?)$`, IntentDependencies, OperatorNeighbors, storage.TraverseOutgoing, []string{"dependent"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
+	rule(`^what depends on the (.+?) package$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
+	rule(`^find users of (.+?)$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"references", "imports_from"}),
+	rule(`^which packages use (.+?)$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
+	rule(`^explain (.+?)$`, IntentExplain, OperatorExplain, storage.TraverseBoth, []string{"entity"}, nil, nil),
+	rule(`^what does (.+?) do$`, IntentExplain, OperatorExplain, storage.TraverseBoth, []string{"entity"}, nil, nil),
+	rule(`^describe the (.+?) package$`, IntentExplain, OperatorExplain, storage.TraverseBoth, []string{"entity"}, nil, nil),
+	rule(`^where is (.+?)$`, IntentLookup, OperatorLookup, storage.TraverseBoth, []string{"entity"}, nil, nil),
+	rule(`^find (.+?)$`, IntentLookup, OperatorLookup, storage.TraverseBoth, []string{"entity"}, nil, nil),
+	rule(`^show me (.+?)$`, IntentLookup, OperatorLookup, storage.TraverseBoth, []string{"entity"}, nil, nil),
+}
+
+var architecturalMoveComparisonPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^should (.+?) move out of (.+?) into (?:a )?(.+?)(?: package)?, or should (.+?) move into (?:a )?(.+?)(?: package)?\?? compare dependenc(?:y|ies)(?: direction| directions)? and consumers?$`),
+	regexp.MustCompile(`(?i)^should (.+?) move out of (.+?) into (?:a )?(.+?)(?: package)?, or should (.+?) move into (?:a )?(.+?)(?: package)?\?? compare consumers? and dependenc(?:y|ies)(?: direction| directions)?$`),
+}
+
+func rule(pattern string, intent Intent, operator ExecutionOperator, direction storage.TraversalDirection, roles []string, captureIndexes []int, relations []graph.RelationKind) questionRule {
+	if captureIndexes == nil {
+		captureIndexes = make([]int, len(roles))
+		for index := range roles {
+			captureIndexes[index] = index + 1
+		}
+	}
+	maximumDepth := 2
+	if operator == OperatorPath {
+		maximumDepth = 8
+	}
+	return questionRule{
+		pattern:        regexp.MustCompile(`(?i)` + pattern),
+		intent:         intent,
+		operator:       operator,
+		direction:      direction,
+		roles:          roles,
+		captureIndexes: captureIndexes,
+		relations:      relations,
+		maximumDepth:   maximumDepth,
+	}
+}
+
+func AnalyzeQuestion(question string) QueryPlan {
+	tokens := questionTokens(question)
+	normalized, ignored := normalizeQuestionTokens(tokens)
+	plan := QueryPlan{
+		SchemaVersion:    QueryPlanSchemaVersion,
+		Question:         question,
+		Tokens:           tokens,
+		NormalizedTerms:  normalized,
+		QuotedPhrases:    quotedPhrases(question),
+		IgnoredStopWords: ignored,
+		Intent:           IntentUnknown,
+		Direction:        storage.TraverseBoth,
+		Operator:         OperatorLookup,
+		MaxDepth:         2,
+		MaxNodes:         100,
+		Warnings:         []PlanWarning{},
+	}
+
+	normalizedQuestion := strings.TrimRight(strings.TrimSpace(question), "?!. ")
+	if matches := matchArchitecturalMoveComparison(normalizedQuestion); matches != nil {
+		groups := make([][]string, 0, len(matches)-1)
+		concepts := make([]string, 0, len(matches)-1)
+		for _, match := range matches[1:] {
+			concept := cleanEntityText(match)
+			concepts = append(concepts, concept)
+			groups = append(groups, lowercaseTokens(questionTokens(concept)))
+		}
+		relations := []graph.RelationKind{"imports_from", "requires", "depends_on"}
+		plan.Intent = IntentDependencyComparison
+		plan.Confidence = 1
+		plan.Operator = OperatorNeighbors
+		plan.Direction = storage.TraverseBoth
+		plan.AllowedRelations = relations
+		plan.RelationHints = relationHints(relations)
+		plan.DirectionHints = []string{string(storage.TraverseBoth)}
+		plan.EntitySlots = []EntitySlot{{
+			Role: "comparison",
+			Text: strings.Join(concepts, ", "),
+			Retrieval: RetrievalRequest{
+				Text:        strings.Join(concepts, ", "),
+				TokenGroups: groups,
+				Limit:       10,
+			},
+		}}
+		return plan
+	}
+	for _, candidate := range questionRules {
+		matches := candidate.pattern.FindStringSubmatch(normalizedQuestion)
+		if matches == nil {
+			continue
+		}
+		plan.Intent = candidate.intent
+		plan.Confidence = 1
+		plan.Operator = candidate.operator
+		plan.Direction = candidate.direction
+		plan.AllowedRelations = append([]graph.RelationKind(nil), candidate.relations...)
+		plan.RelationHints = relationHints(candidate.relations)
+		plan.DirectionHints = []string{string(candidate.direction)}
+		plan.MaxDepth = candidate.maximumDepth
+		plan.EntitySlots = make([]EntitySlot, len(candidate.roles))
+		for index, role := range candidate.roles {
+			plan.EntitySlots[index] = entitySlot(role, cleanEntityText(matches[candidate.captureIndexes[index]]))
+		}
+		return plan
+	}
+	plan.Confidence = 0.1
+	plan.EntitySlots = []EntitySlot{{
+		Role: "entity",
+		Text: question,
+		Retrieval: RetrievalRequest{
+			Text:        question,
+			TokenGroups: [][]string{append([]string(nil), plan.NormalizedTerms...)},
+			Limit:       10,
+		},
+	}}
+	plan.Warnings = []PlanWarning{{
+		Code:        "unknown_intent",
+		Message:     "The question grammar is not in the supported intent set.",
+		Suggestions: []string{"Use --terms with the normalized terms for literal lookup."},
+	}}
+	return plan
+}
+
+func matchArchitecturalMoveComparison(question string) []string {
+	for _, pattern := range architecturalMoveComparisonPatterns {
+		if matches := pattern.FindStringSubmatch(question); len(matches) == 6 {
+			return matches
+		}
+	}
+	return nil
+}
+
+func entitySlot(role, text string) EntitySlot {
+	tokens := questionTokens(text)
+	tokenGroups := [][]string{lowercaseTokens(tokens)}
+	var kinds []graph.NodeKind
+	normalizedText := strings.ToLower(strings.TrimSpace(text))
+	switch strings.ToLower(strings.Join(tokens, "")) {
+	case "postgres", "postgresql":
+		tokenGroups = append(tokenGroups, []string{"pg"})
+	}
+	if normalizedText == "sqlite" {
+		if len(tokenGroups[0]) != 1 || tokenGroups[0][0] != "sqlite" {
+			tokenGroups = append(tokenGroups, []string{"sqlite"})
+		}
+	}
+	if strings.Contains(normalizedText, "postgresql adapter") || strings.Contains(normalizedText, "postgres adapter") {
+		tokenGroups = [][]string{{"postgres"}, {"pg"}, {"adapter"}}
+		kinds = []graph.NodeKind{"typescript:class", "typescript:interface", "typescript:type_alias", "go:type"}
+	}
+	if normalizedText == "store" {
+		tokenGroups = [][]string{{"store"}, {"storage", "driver"}, {"storage"}, {"driver"}}
+		kinds = []graph.NodeKind{"typescript:class", "typescript:interface", "typescript:type_alias", "go:type"}
+	}
+	if (role == "left" || role == "right") && len(kinds) == 0 {
+		kinds = []graph.NodeKind{"typescript:class", "typescript:interface", "typescript:type_alias", "go:type"}
+	}
+	return EntitySlot{
+		Role: role,
+		Text: text,
+		Retrieval: RetrievalRequest{
+			Text:        text,
+			TokenGroups: tokenGroups,
+			Kinds:       kinds,
+			Limit:       10,
+		},
+	}
+}
+
+func cleanEntityText(text string) string {
+	return strings.Trim(strings.TrimSpace(text), `"'`)
+}
+
+func questionTokens(text string) []string {
+	characters := []rune(text)
+	tokens := make([]string, 0)
+	start := -1
+	flush := func(end int) {
+		if start >= 0 {
+			tokens = append(tokens, string(characters[start:end]))
+			start = -1
+		}
+	}
+	for index, character := range characters {
+		if !unicode.IsLetter(character) && !unicode.IsDigit(character) {
+			flush(index)
+			continue
+		}
+		if start < 0 {
+			start = index
+			continue
+		}
+		previous := characters[index-1]
+		nextIsLower := index+1 < len(characters) && unicode.IsLower(characters[index+1])
+		if unicode.IsUpper(character) && (unicode.IsLower(previous) || unicode.IsDigit(previous) || unicode.IsUpper(previous) && nextIsLower) {
+			flush(index)
+			start = index
+		}
+	}
+	flush(len(characters))
+	return tokens
+}
+
+func lowercaseTokens(tokens []string) []string {
+	terms := make([]string, len(tokens))
+	for index, token := range tokens {
+		terms[index] = strings.ToLower(token)
+	}
+	return terms
+}
+
+var questionStopWords = map[string]struct{}{
+	"a": {}, "an": {}, "are": {}, "by": {}, "describe": {}, "do": {}, "does": {},
+	"explain": {}, "find": {}, "for": {}, "from": {}, "functions": {}, "how": {},
+	"is": {}, "me": {}, "modules": {}, "of": {}, "package": {}, "packages": {},
+	"show": {}, "the": {}, "to": {}, "what": {}, "where": {}, "which": {}, "who": {},
+}
+
+var controlledSynonyms = map[string]string{
+	"affected": "impact",
+	"caller":   "called_by",
+	"callers":  "called_by",
+	"common":   "shared",
+	"depends":  "dependencies",
+	"flow":     "path",
+	"flows":    "path",
+	"import":   "dependencies",
+	"imports":  "dependencies",
+	"invoke":   "calls",
+	"invokes":  "calls",
+	"reaches":  "path",
+	"required": "dependencies",
+	"uses":     "dependencies",
+}
+
+func normalizeQuestionTokens(tokens []string) ([]string, []string) {
+	terms := make([]string, 0, len(tokens))
+	ignored := make([]string, 0)
+	for _, token := range tokens {
+		normalized := strings.ToLower(token)
+		if _, stopWord := questionStopWords[normalized]; stopWord {
+			ignored = append(ignored, normalized)
+			continue
+		}
+		if synonym, found := controlledSynonyms[normalized]; found {
+			normalized = synonym
+		}
+		terms = append(terms, normalized)
+	}
+	if len(ignored) == 0 {
+		ignored = nil
+	}
+	return terms, ignored
+}
+
+func relationHints(relations []graph.RelationKind) []string {
+	if len(relations) == 0 {
+		return nil
+	}
+	hints := make([]string, len(relations))
+	for index, relation := range relations {
+		hints[index] = string(relation)
+	}
+	return hints
+}
+
+var quotedPhrasePattern = regexp.MustCompile(`"([^"]+)"`)
+
+func quotedPhrases(question string) []string {
+	matches := quotedPhrasePattern.FindAllStringSubmatch(question, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	phrases := make([]string, len(matches))
+	for index, match := range matches {
+		phrases[index] = match[1]
+	}
+	return phrases
+}

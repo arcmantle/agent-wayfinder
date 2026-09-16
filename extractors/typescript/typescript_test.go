@@ -578,8 +578,9 @@ func TestResolvePageUsesResolverIndexForCrossPageReExport(t *testing.T) {
 }
 
 type resolverIndex struct {
-	targets     map[string]extractor.ResolverTarget
-	targetReads *int
+	targets        map[string]extractor.ResolverTarget
+	packageTargets map[string][]extractor.ResolverTarget
+	targetReads    *int
 }
 
 func (index resolverIndex) ResolverTarget(_ context.Context, request extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
@@ -590,17 +591,79 @@ func (index resolverIndex) ResolverTarget(_ context.Context, request extractor.R
 	return target, found, nil
 }
 
-func (resolverIndex) ResolverPackagePage(context.Context, extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
-	return nil, nil
+func (index resolverIndex) ResolverPackagePage(_ context.Context, request extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
+	return append([]extractor.ResolverTarget(nil), index.packageTargets[request.PackagePath]...), nil
 }
 
 func resolverTargetFromContribution(contribution extractor.Contribution) extractor.ResolverTarget {
 	return extractor.ResolverTarget{
-		ProjectID:        "project:fixture",
-		SourcePath:       contribution.SourcePath(),
-		Metadata:         contribution.Metadata(),
-		Nodes:            contribution.Facts().Nodes,
-		ExportedSurfaces: contribution.ExportedSurfaces(),
+		ProjectID:            "project:fixture",
+		SourcePath:           contribution.SourcePath(),
+		Metadata:             contribution.Metadata(),
+		Nodes:                contribution.Facts().Nodes,
+		UnresolvedReferences: contribution.UnresolvedReferences(),
+		SymbolReferences:     contribution.SymbolReferences(),
+		ExportedSurfaces:     contribution.ExportedSurfaces(),
+	}
+}
+
+func resolverTargetFromProject(contribution extractor.Contribution, projectID string) extractor.ResolverTarget {
+	target := resolverTargetFromContribution(contribution)
+	target.ProjectID = projectID
+	return target
+}
+
+func TestResolvePageUsesWorkspacePackageReexportsForCrossProjectImplementations(t *testing.T) {
+	contract, err := Extract(extractor.Source{
+		ProjectID:  "project:packages/core",
+		SourcePath: "packages/core/src/features/storage-driver/storage-driver.ts",
+		Contents:   []byte("export interface StorageDriver {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract contract: %v", err)
+	}
+	entry, err := Extract(extractor.Source{
+		ProjectID:  "project:packages/core",
+		SourcePath: "packages/core/src/index.ts",
+		Contents:   []byte("export * from './features/storage-driver/storage-driver.js';"),
+	})
+	if err != nil {
+		t.Fatalf("extract package entry: %v", err)
+	}
+	implementation, err := Extract(extractor.Source{
+		ProjectID:  "project:packages/api-pg",
+		SourcePath: "packages/api-pg/src/pg-store.ts",
+		Contents:   []byte("import { StorageDriver } from '@agent-issues/core';\nexport class PgStore implements StorageDriver {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract implementation: %v", err)
+	}
+
+	index := resolverIndex{
+		targets: map[string]extractor.ResolverTarget{
+			entry.SourcePath():    resolverTargetFromProject(entry, "project:packages/core"),
+			contract.SourcePath(): resolverTargetFromProject(contract, "project:packages/core"),
+		},
+		packageTargets: map[string][]extractor.ResolverTarget{
+			"packages/core/src": {resolverTargetFromProject(entry, "project:packages/core")},
+		},
+	}
+	packageTarget, _, packageErr := resolverPageTarget(context.Background(), implementation.SourcePath(), "@agent-issues/core", implementation.Metadata().Name, index)
+	if packageErr != nil {
+		t.Fatalf("resolve package target: %v", packageErr)
+	}
+	_, surfaceErr := resolverPageExportedSurfaces(context.Background(), packageTarget, index, make(map[string]struct{}), make(map[string]graph.Node))
+	if surfaceErr != nil {
+		t.Fatalf("resolve package surfaces: %v", surfaceErr)
+	}
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{implementation}, "project:packages/api-pg", index)
+	if err != nil {
+		t.Fatalf("resolve cross-project implementation: %v", err)
+	}
+	implementationID := implementation.ExportedSurfaces()[0].NodeID
+	contractID := contract.ExportedSurfaces()[0].NodeID
+	if !hasResolvedEdge(resolution.Facts().Edges, implementationID, contractID, ImplementsRelation) {
+		t.Errorf("resolved facts = %+v, want cross-project StorageDriver implementation", resolution.Facts())
 	}
 }
 

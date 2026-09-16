@@ -80,6 +80,54 @@ func Run(t *testing.T, open StoreFactory) {
 		}
 	})
 
+	t.Run("searches structured lexical requests safely within snapshots", func(t *testing.T) {
+		store := open(t)
+		first, err := store.Publish(context.Background(), storage.PublishRequest{
+			Workspace: "workspace",
+			Update:    graphUpdate(t, "src/LegacyHandler.ts", "function:LegacyHandler"),
+		})
+		if err != nil {
+			t.Fatalf("publish lexical snapshot: %v", err)
+		}
+		matches, err := store.SearchNodes(context.Background(), first, storage.LexicalSearchRequest{
+			Text:        `legacy OR AND NOT NEAR ( ) + - * "unterminated`,
+			Phrases:     []string{"legacy handler"},
+			TokenGroups: [][]string{{"legacy", "handler"}},
+			Kinds:       []graph.NodeKind{"function"},
+			Limit:       10,
+		})
+		if err != nil {
+			t.Fatalf("search lexical snapshot: %v", err)
+		}
+		if len(matches) != 1 || matches[0].Node.ID != "function:LegacyHandler" || matches[0].Score <= 0 || len(matches[0].MatchedFields) == 0 {
+			t.Errorf("lexical matches = %+v, want scored legacy handler with matched fields", matches)
+		}
+		prefixMatches, err := store.SearchNodes(context.Background(), first, storage.LexicalSearchRequest{Text: "lega", Limit: 10})
+		if err != nil {
+			t.Fatalf("search lexical prefix: %v", err)
+		}
+		if len(prefixMatches) != 1 || prefixMatches[0].Node.ID != "function:LegacyHandler" {
+			t.Errorf("lexical prefix matches = %+v, want legacy handler", prefixMatches)
+		}
+
+		current, err := store.Publish(context.Background(), storage.PublishRequest{
+			Workspace: "workspace",
+			Update:    graphUpdate(t, "src/LegacyHandler.ts", "function:ReplacementHandler"),
+		})
+		if err != nil {
+			t.Fatalf("publish lexical replacement: %v", err)
+		}
+		currentMatches, err := store.SearchNodes(context.Background(), current, storage.LexicalSearchRequest{Text: "legacy", Limit: 10})
+		if err != nil {
+			t.Fatalf("search lexical replacement: %v", err)
+		}
+		for _, match := range currentMatches {
+			if match.Node.ID == "function:LegacyHandler" {
+				t.Errorf("replacement lexical matches include stale node: %+v", currentMatches)
+			}
+		}
+	})
+
 	t.Run("traverses outgoing facts within the requested boundary", func(t *testing.T) {
 		store := open(t)
 		snapshot, err := store.Publish(context.Background(), storage.PublishRequest{

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -9,8 +10,19 @@ import (
 	"strings"
 	"testing"
 
+	"agent-wayfinder/graph"
+	"agent-wayfinder/query"
 	"agent-wayfinder/testkit"
 )
+
+func TestMain(testMain *testing.M) {
+	previous := os.Getenv("GOFLAGS")
+	flags := strings.TrimSpace(previous + " -tags=sqlite_fts5")
+	if err := os.Setenv("GOFLAGS", flags); err != nil {
+		panic(err)
+	}
+	os.Exit(testMain.Run())
+}
 
 func TestCommandRuns(t *testing.T) {
 	command := exec.Command("go", "run", ".")
@@ -29,7 +41,7 @@ func TestCommandHelpListsPublicCommands(t *testing.T) {
 	}
 
 	output := standardOutput.String()
-	for _, command := range []string{"install", "index", "query", "path", "explain", "export", "indexer", "benchmark"} {
+	for _, command := range []string{"install", "index", "query", "path", "explain", "export", "indexer", "benchmark", "mcp"} {
 		if !strings.Contains(output, command) {
 			t.Errorf("help output = %q, want public command %q", output, command)
 		}
@@ -85,6 +97,91 @@ func TestInstallCommandWritesProjectSkill(t *testing.T) {
 	}
 }
 
+func TestInstalledSkillStartsArchitectureQuestionsWithDeterministicQuestionMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	if exitCode := run([]string{"install"}, &strings.Builder{}, &strings.Builder{}); exitCode != 0 {
+		t.Fatalf("run install command: exit code %d", exitCode)
+	}
+
+	skillPath := filepath.Join(home, ".agents", "skills", "agent-wayfinder", "SKILL.md")
+	contents, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read installed skill: %v", err)
+	}
+	skill := string(contents)
+	for _, required := range []string{
+		"one question-mode JSON query",
+		"query plan, confidence, warnings, graph version, truncation, and ranked evidence",
+		"Do not invent a query plan",
+	} {
+		if !strings.Contains(skill, required) {
+			t.Errorf("installed skill does not contain %q", required)
+		}
+	}
+}
+
+func TestInstalledCommandReferenceDescribesQuestionMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	if exitCode := run([]string{"install"}, &strings.Builder{}, &strings.Builder{}); exitCode != 0 {
+		t.Fatalf("run install command: exit code %d", exitCode)
+	}
+
+	referencePath := filepath.Join(home, ".agents", "skills", "agent-wayfinder", "references", "commands.md")
+	contents, err := os.ReadFile(referencePath)
+	if err != nil {
+		t.Fatalf("read installed command reference: %v", err)
+	}
+	reference := string(contents)
+	for _, required := range []string{
+		"agent-wayfinder query WORKSPACE QUESTION",
+		"--question",
+		"--terms",
+		"--show-plan",
+		"schemaVersion`, `interpretation`, `evidence`, `limits`, `warnings`, and `suggestions",
+	} {
+		if !strings.Contains(reference, required) {
+			t.Errorf("installed command reference does not contain %q", required)
+		}
+	}
+}
+
+func TestInstalledSkillAssetsMatchBundledAssets(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	if exitCode := run([]string{"install"}, &strings.Builder{}, &strings.Builder{}); exitCode != 0 {
+		t.Fatalf("run install command: exit code %d", exitCode)
+	}
+
+	for _, asset := range []struct {
+		bundled   string
+		installed string
+	}{
+		{bundled: "skill_assets/SKILL.md", installed: filepath.Join("SKILL.md")},
+		{bundled: "skill_assets/references/commands.md", installed: filepath.Join("references", "commands.md")},
+	} {
+		want, err := bundledSkill.ReadFile(asset.bundled)
+		if err != nil {
+			t.Fatalf("read bundled asset %s: %v", asset.bundled, err)
+		}
+		path := filepath.Join(home, ".agents", "skills", "agent-wayfinder", asset.installed)
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read installed asset %s: %v", path, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("installed asset %s does not match bundled asset %s", path, asset.bundled)
+		}
+	}
+}
+
 func TestBundledSkillIncludesCommandReference(t *testing.T) {
 	skill, err := bundledSkill.ReadFile("skill_assets/SKILL.md")
 	if err != nil {
@@ -92,6 +189,9 @@ func TestBundledSkillIncludesCommandReference(t *testing.T) {
 	}
 	if !strings.Contains(string(skill), "./references/commands.md") {
 		t.Errorf("bundled skill does not link to its command reference")
+	}
+	if !strings.Contains(string(skill), "MCP tools") {
+		t.Errorf("bundled skill does not describe MCP tool use")
 	}
 	if _, err := bundledSkill.ReadFile("skill_assets/references/commands.md"); err != nil {
 		t.Fatalf("read bundled command reference: %v", err)
@@ -119,6 +219,22 @@ func TestIndexCommandHelpListsItsFlags(t *testing.T) {
 
 	if output := standardOutput.String(); !strings.Contains(output, "--database") {
 		t.Errorf("index help output = %q, want database flag", output)
+	}
+}
+
+func TestQueryCommandHelpDescribesQuestionAndTermModes(t *testing.T) {
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"query", "--help"}, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run query help command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	output := standardOutput.String()
+	for _, expected := range []string{"QUESTION", "TERM...", "--question", "--terms", "--show-plan"} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("query help output = %q, want %q", output, expected)
+		}
 	}
 }
 
@@ -663,6 +779,297 @@ func TestQueryCommandReturnsRankedSeedsAndBoundedEvidence(t *testing.T) {
 	}
 	if len(result.Result.Nodes) == 0 || !hasCallEdge {
 		t.Errorf("query facts = nodes %+v, edges %+v, want bounded call evidence", result.Result.Nodes, result.Result.Edges)
+	}
+}
+
+func TestQueryCommandSelectsQuestionModeAndReturnsPlan(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "1", "--max-nodes", "25", workspace.Root, "Where is main?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run question query: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			SchemaVersion  int `json:"schemaVersion"`
+			Interpretation struct {
+				SchemaVersion int     `json:"schemaVersion"`
+				Question      string  `json:"question"`
+				Intent        string  `json:"intent"`
+				Confidence    float64 `json:"confidence"`
+				Operator      string  `json:"operator"`
+				MaxDepth      int     `json:"maxDepth"`
+				MaxNodes      int     `json:"maxNodes"`
+				EntitySlots   []struct {
+					Role string `json:"role"`
+					Text string `json:"text"`
+				} `json:"entitySlots"`
+			} `json:"interpretation"`
+			Seeds []struct {
+				Role     string `json:"role"`
+				Term     string `json:"term"`
+				Rankings []struct {
+					NodeID     string  `json:"nodeId"`
+					Score      float64 `json:"score"`
+					Components struct {
+						Exact          float64 `json:"exact"`
+						Lexical        float64 `json:"lexical"`
+						ReciprocalRank float64 `json:"reciprocalRank"`
+					} `json:"components"`
+				} `json:"rankings"`
+			} `json:"seeds"`
+			Evidence    []query.EvidenceGroup `json:"evidence"`
+			Limits      []query.StageLimit    `json:"limits"`
+			Warnings    []query.PlanWarning   `json:"warnings"`
+			Suggestions []string              `json:"suggestions"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode question query: %v\n%s", err, output)
+	}
+	if result.Result.SchemaVersion != 1 {
+		t.Errorf("question result schema version = %d, want 1", result.Result.SchemaVersion)
+	}
+	plan := result.Result.Interpretation
+	if plan.SchemaVersion != 1 || plan.Question != "Where is main?" || plan.Intent != "lookup" || plan.Confidence <= 0 || plan.Operator != "lookup" {
+		t.Errorf("question plan = %+v, want stable lookup plan", plan)
+	}
+	if plan.MaxDepth != 1 || plan.MaxNodes != 25 {
+		t.Errorf("question plan limits = {%d, %d}, want {1, 25}", plan.MaxDepth, plan.MaxNodes)
+	}
+	if len(plan.EntitySlots) != 1 || plan.EntitySlots[0].Role != "entity" || plan.EntitySlots[0].Text != "main" {
+		t.Errorf("question slots = %+v, want main entity slot", plan.EntitySlots)
+	}
+	if len(result.Result.Seeds) != 1 || result.Result.Seeds[0].Term != "main" {
+		t.Errorf("question seeds = %+v, want current lookup for main", result.Result.Seeds)
+	}
+	seed := result.Result.Seeds[0]
+	if seed.Role != "entity" || len(seed.Rankings) == 0 || seed.Rankings[0].NodeID == "" || seed.Rankings[0].Score <= 0 {
+		t.Fatalf("question seed rankings = %+v, want role-bound scored candidates", seed)
+	}
+	components := seed.Rankings[0].Components
+	if components.Exact <= 0 && (components.Lexical <= 0 || components.ReciprocalRank <= 0) {
+		t.Errorf("question seed components = %+v, want exact or fused lexical score", components)
+	}
+	if len(result.Result.Evidence) == 0 || result.Result.Evidence[0].Rank != 1 || result.Result.Evidence[0].SlotRole != "entity" || len(result.Result.Evidence[0].Nodes) != 1 || result.Result.Evidence[0].Nodes[0].Evidence.Span.Path == "" {
+		t.Errorf("question evidence = %+v, want ranked entity evidence", result.Result.Evidence)
+	}
+	if len(result.Result.Limits) != 1 || result.Result.Limits[0].Stage != "retrieval" || result.Result.Limits[0].SlotRole != "entity" {
+		t.Errorf("question limits = %+v, want entity retrieval limit", result.Result.Limits)
+	}
+
+	repeatedOutput, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "1", "--max-nodes", "25", workspace.Root, "Where is main?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("repeat question query: %v\n%s", err, repeatedOutput)
+	}
+	if !bytes.Equal(output, repeatedOutput) {
+		t.Errorf("repeated question JSON differs\nfirst: %s\nsecond: %s", output, repeatedOutput)
+	}
+
+	textOutput, err := exec.Command("go", "run", ".", "query", "--show-plan", "--database", database, workspace.Root, "Where is main?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run text question query: %v\n%s", err, textOutput)
+	}
+	if !strings.Contains(string(textOutput), "Interpreted as: lookup (lookup, confidence 1.00)") {
+		t.Errorf("question text = %q, want interpreted plan", textOutput)
+	}
+}
+
+func TestQueryCommandReportsLowConfidenceEmptyQuestionWithoutAnAnswerClaim(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	question := "Why do lunar widgets shimmer?"
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, question).CombinedOutput()
+	if err != nil {
+		t.Fatalf("run low-confidence question: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			SchemaVersion  int                   `json:"schemaVersion"`
+			Interpretation query.QueryPlan       `json:"interpretation"`
+			Evidence       []query.EvidenceGroup `json:"evidence"`
+			Warnings       []query.PlanWarning   `json:"warnings"`
+			Suggestions    []string              `json:"suggestions"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode low-confidence question: %v\n%s", err, output)
+	}
+	if result.Result.SchemaVersion != 1 || result.Result.Interpretation.Confidence >= 0.5 {
+		t.Errorf("low-confidence result = %+v, want versioned low-confidence interpretation", result.Result)
+	}
+	if len(result.Result.Evidence) != 0 || len(result.Result.Warnings) == 0 || len(result.Result.Suggestions) == 0 {
+		t.Errorf("low-confidence result = %+v, want no evidence plus warnings and suggestions", result.Result)
+	}
+
+	textOutput, err := exec.Command("go", "run", ".", "query", "--database", database, workspace.Root, question).CombinedOutput()
+	if err != nil {
+		t.Fatalf("run low-confidence text question: %v\n%s", err, textOutput)
+	}
+	if !strings.Contains(string(textOutput), "No answer-ready evidence was found.") || !strings.Contains(string(textOutput), "Next:") {
+		t.Errorf("low-confidence text = %q, want empty-result text and next command", textOutput)
+	}
+}
+
+func TestQueryResultDataIncludesImpactEvidence(t *testing.T) {
+	node := graph.Node{ID: "function:dependent", Kind: "function", Label: "dependent"}
+	result := queryResultData(query.Result{Impact: []query.ImpactEvidence{{
+		Node:     node,
+		Relation: "calls",
+		Distance: 1,
+		Score:    1,
+	}}}, nil, 2, 100)
+
+	if len(result.Impact) != 1 || result.Impact[0].Node.ID != node.ID || result.Impact[0].Relation != "calls" || result.Impact[0].Distance != 1 || result.Impact[0].Score != 1 {
+		t.Errorf("impact result = %+v, want visible node, relation, distance, and score", result.Impact)
+	}
+}
+
+func TestQueryCommandReportsAmbiguousExplainWithoutNeighborhoodEvidence(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/first.ts":  "export function helper() { return 1; }",
+		"src/second.ts": "export function helper() { return 2; }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Explain helper").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run explain question: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Warnings []struct {
+				Code        string   `json:"code"`
+				Suggestions []string `json:"suggestions"`
+			} `json:"warnings"`
+			Seeds []struct {
+				Nodes []graph.Node `json:"nodes"`
+			} `json:"seeds"`
+			Nodes []graph.Node `json:"nodes"`
+			Edges []graph.Edge `json:"edges"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode explain question: %v\n%s", err, output)
+	}
+	if len(result.Result.Warnings) != 1 || result.Result.Warnings[0].Code != "ambiguous_entity" || len(result.Result.Warnings[0].Suggestions) < 2 {
+		t.Fatalf("warnings = %+v, want ambiguous_entity with exact follow-up commands", result.Result.Warnings)
+	}
+	if len(result.Result.Seeds) != 1 || len(result.Result.Seeds[0].Nodes) < 2 {
+		t.Errorf("candidates = %+v, want ranked ambiguous candidates", result.Result.Seeds)
+	}
+	if len(result.Result.Nodes) != 0 || len(result.Result.Edges) != 0 {
+		t.Errorf("neighborhood = {%+v, %+v}, want no answer evidence", result.Result.Nodes, result.Result.Edges)
+	}
+}
+
+func TestQueryCommandReturnsDirectedPathEvidenceForAQuestion(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "How does src/main.ts::main reach src/helper.ts::helper?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run path question: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Plan struct {
+				Intent   string `json:"intent"`
+				Operator string `json:"operator"`
+			} `json:"plan"`
+			Nodes []graph.Node `json:"nodes"`
+			Edges []graph.Edge `json:"edges"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode path question: %v\n%s", err, output)
+	}
+	if result.Result.Plan.Intent != "path" || result.Result.Plan.Operator != "path" {
+		t.Errorf("plan = %+v, want path intent and operator", result.Result.Plan)
+	}
+	pathNodeNames := make([]string, len(result.Result.Nodes))
+	for index, node := range result.Result.Nodes {
+		pathNodeNames[index] = node.QualifiedName
+	}
+	if got, want := pathNodeNames, []string{"src/main.ts::main", "src/helper.ts::helper"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("path node names = %v, want %v", got, want)
+	}
+	if len(result.Result.Edges) != 1 || result.Result.Edges[0].Relation != "typescript:calls" {
+		t.Errorf("path edges = %+v, want one TypeScript call edge", result.Result.Edges)
+	}
+}
+
+func TestQueryCommandModeFlagsPreserveTermsAndRejectConflict(t *testing.T) {
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+	if exitCode := run([]string{"query", "--question", "--terms", ".", "main"}, standardOutput, standardError); exitCode != 2 {
+		t.Fatalf("conflicting mode exit code = %d, want 2; error %s", exitCode, standardError.String())
+	}
+	if !strings.Contains(standardError.String(), "--question and --terms cannot be used together") {
+		t.Errorf("conflicting mode error = %q, want mode conflict", standardError.String())
+	}
+	standardOutput.Reset()
+	standardError.Reset()
+	if exitCode := run([]string{"query", "--question", ".", "Where is main?", "Where is helper?"}, standardOutput, standardError); exitCode != 2 {
+		t.Fatalf("multiple questions exit code = %d, want 2; error %s", exitCode, standardError.String())
+	}
+	if !strings.Contains(standardError.String(), "question mode requires exactly one question argument") {
+		t.Errorf("multiple questions error = %q, want argument count error", standardError.String())
+	}
+
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+	output, err := exec.Command("go", "run", ".", "query", "--terms", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run explicit terms query: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Plan  json.RawMessage `json:"plan"`
+			Seeds []struct {
+				Term string `json:"term"`
+			} `json:"seeds"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode explicit terms query: %v\n%s", err, output)
+	}
+	if result.Result.Plan != nil {
+		t.Errorf("legacy terms plan = %s, want no question plan", result.Result.Plan)
+	}
+	if len(result.Result.Seeds) != 1 || result.Result.Seeds[0].Term != "Where is main?" {
+		t.Errorf("legacy terms seeds = %+v, want unchanged literal term", result.Result.Seeds)
 	}
 }
 

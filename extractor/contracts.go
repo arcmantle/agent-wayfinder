@@ -62,6 +62,7 @@ type ResolverProjection struct {
 	SourcePath           string
 	Metadata             Metadata
 	Nodes                []graph.Node
+	Edges                []graph.Edge
 	UnresolvedReferences []UnresolvedReference
 	SymbolReferences     []SymbolReference
 	ExportedSurfaces     []ExportedSurface

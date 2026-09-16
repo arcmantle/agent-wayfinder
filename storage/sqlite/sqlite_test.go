@@ -102,6 +102,48 @@ func TestOpenRecreatesMismatchedSchema(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesVersionTenAndRebuildsLexicalRowsInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "version-ten.db")
+	store, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/LegacyHandler.go", "function:LegacyHandler"),
+	})
+	if err != nil {
+		t.Fatalf("publish pre-migration snapshot: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close pre-migration store: %v", err)
+	}
+
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open version-ten database: %v", err)
+	}
+	if _, err := database.Exec(`DROP TABLE node_search; DELETE FROM schema_migrations WHERE version = 11; INSERT INTO schema_migrations (version, applied_at) VALUES (10, '2026-08-31T00:00:00Z')`); err != nil {
+		t.Fatalf("downgrade schema marker: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close version-ten database: %v", err)
+	}
+
+	store, err = sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("migrate version-ten database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	matches, err := store.SearchNodes(context.Background(), snapshot, storage.LexicalSearchRequest{Text: "legacy handler", Limit: 10})
+	if err != nil {
+		t.Fatalf("search rebuilt lexical index: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Node.ID != "function:LegacyHandler" {
+		t.Errorf("rebuilt lexical matches = %+v, want legacy handler", matches)
+	}
+}
+
 func TestPublishCreatesFirstWorkspaceSnapshot(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
 	if err != nil {
@@ -1271,6 +1313,237 @@ func TestLookupExactNodesMatchesIDQualifiedNameAndFilePath(t *testing.T) {
 		if len(matches) != 1 || matches[0].Node.ID != test.wantID {
 			t.Errorf("exact matches for %q = %+v, want %q", test.identifier, matches, test.wantID)
 		}
+	}
+}
+
+func TestSearchNodesUsesFTSAndReportsMatchedFields(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update: graphUpdateWithFacts(t, "storage/sqlite/lookup.go", graph.Facts{Nodes: []graph.Node{
+			{ID: "go:method:lookup", Kind: "function", Label: "LookupExactNodes", QualifiedName: "storage/sqlite.Store.LookupExactNodes", Evidence: evidence("storage/sqlite/lookup.go")},
+			{ID: "go:type:other", Kind: "class", Label: "Lookup", QualifiedName: "query.Lookup", Evidence: evidence("query/lookup.go")},
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("publish lexical fixture: %v", err)
+	}
+
+	matches, err := store.SearchNodes(context.Background(), snapshot, storage.LexicalSearchRequest{
+		TokenGroups: [][]string{{"lookup", "exact", "nodes"}},
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("search nodes: %v", err)
+	}
+	if len(matches) == 0 || matches[0].Node.ID != "go:method:lookup" {
+		t.Fatalf("lexical matches = %+v, want lookup method first", matches)
+	}
+	if !reflect.DeepEqual(matches[0].MatchedFields, []string{"label", "qualifiedName", "path", "identifierTokens"}) {
+		t.Errorf("matched fields = %v, want label, qualifiedName, path, and identifierTokens", matches[0].MatchedFields)
+	}
+	if matches[0].Score <= 0 {
+		t.Errorf("match score = %f, want positive relevance", matches[0].Score)
+	}
+}
+
+func TestSearchNodesPrioritizesExactSymbolLabel(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update: graphUpdateWithFacts(t, "query/query.go", graph.Facts{Nodes: []graph.Node{
+			{ID: "go:function:query-snapshot", Kind: "function", Label: "QuerySnapshot", QualifiedName: "query.QuerySnapshot", Evidence: evidence("query/query.go")},
+			{ID: "go:variable:snapshot", Kind: "function", Label: "snapshot", QualifiedName: "query.QuerySnapshot::snapshot", Evidence: evidence("query/query_test.go")},
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("publish exact-label fixture: %v", err)
+	}
+
+	matches, err := store.SearchNodes(context.Background(), snapshot, storage.LexicalSearchRequest{
+		Text:        "QuerySnapshot",
+		TokenGroups: [][]string{{"query", "snapshot"}},
+		Limit:       2,
+	})
+	if err != nil {
+		t.Fatalf("search exact-label fixture: %v", err)
+	}
+	if len(matches) != 2 || matches[0].Node.ID != "go:function:query-snapshot" {
+		t.Fatalf("exact-label matches = %+v, want QuerySnapshot first", matches)
+	}
+
+	aliasMatches, err := store.SearchNodes(context.Background(), snapshot, storage.LexicalSearchRequest{
+		Text:        "query_snapshot",
+		TokenGroups: [][]string{{"query", "snapshot"}},
+		Limit:       2,
+	})
+	if err != nil {
+		t.Fatalf("search normalized-label fixture: %v", err)
+	}
+	if len(aliasMatches) != 2 || aliasMatches[0].Node.ID != "go:function:query-snapshot" {
+		t.Fatalf("normalized-label matches = %+v, want QuerySnapshot first", aliasMatches)
+	}
+}
+
+func TestSearchNodesAppliesWeightedBM25Ranking(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update: graphUpdateWithFacts(t, "src/search.ts", graph.Facts{Nodes: []graph.Node{
+			{ID: "function:label", Kind: "function", Label: "Needle", QualifiedName: "search.LabelMatch", Evidence: evidence("src/search.ts")},
+			{ID: "function:path", Kind: "function", Label: "Other", QualifiedName: "search.PathMatch", Evidence: evidence("src/needle.ts")},
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("publish ranking fixture: %v", err)
+	}
+	matches, err := store.SearchNodes(context.Background(), snapshot, storage.LexicalSearchRequest{Phrases: []string{"needle"}, Limit: 10})
+	if err != nil {
+		t.Fatalf("search weighted fields: %v", err)
+	}
+	if len(matches) != 2 || matches[0].Node.ID != "function:label" || matches[0].Score <= matches[1].Score {
+		t.Errorf("weighted matches = %+v, want label match above path match", matches)
+	}
+}
+
+func TestSearchNodesTreatsRawTextAsDataAndTracksSnapshots(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	first, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update: graphUpdateWithFacts(t, "src/main.go", graph.Facts{Nodes: []graph.Node{
+			{ID: "go:function:old", Kind: "function", Label: "OldHandler", QualifiedName: "src.OldHandler", Evidence: evidence("src/main.go")},
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("publish first lexical snapshot: %v", err)
+	}
+	second, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update: graphUpdateWithFacts(t, "src/main.go", graph.Facts{Nodes: []graph.Node{
+			{ID: "go:function:new", Kind: "function", Label: "NewHandler", QualifiedName: "src.NewHandler", Evidence: evidence("src/main.go")},
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("publish replacement lexical snapshot: %v", err)
+	}
+
+	oldMatches, err := store.SearchNodes(context.Background(), first, storage.LexicalSearchRequest{Text: `old OR "unterminated`, Limit: 10})
+	if err != nil {
+		t.Fatalf("search first snapshot with syntax characters: %v", err)
+	}
+	if len(oldMatches) != 1 || oldMatches[0].Node.ID != "go:function:old" {
+		t.Errorf("first snapshot matches = %+v, want old handler", oldMatches)
+	}
+	newMatches, err := store.SearchNodes(context.Background(), second, storage.LexicalSearchRequest{Text: "old", Limit: 10})
+	if err != nil {
+		t.Fatalf("search replacement snapshot: %v", err)
+	}
+	if len(newMatches) != 0 {
+		t.Errorf("replacement snapshot matches = %+v, want no stale old handler", newMatches)
+	}
+}
+
+func TestSearchNodesHonorsProjectAndKindFilters(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update: graphUpdateWithFacts(t, "apps/app/src/main.ts", graph.Facts{
+			Nodes: []graph.Node{
+				{ID: "project:app", Kind: "project", Label: "app", QualifiedName: "apps/app", Evidence: evidence("apps/app/package.json")},
+				{ID: "file:app", Kind: "file", Label: "main.ts", QualifiedName: "apps/app/src/main.ts", Evidence: evidence("apps/app/src/main.ts")},
+				{ID: "function:app-target", Kind: "function", Label: "SharedTarget", QualifiedName: "apps/app.SharedTarget", Evidence: evidence("apps/app/src/main.ts")},
+				{ID: "project:library", Kind: "project", Label: "library", QualifiedName: "packages/library", Evidence: evidence("packages/library/package.json")},
+				{ID: "file:library", Kind: "file", Label: "main.ts", QualifiedName: "packages/library/src/main.ts", Evidence: evidence("packages/library/src/main.ts")},
+				{ID: "function:library-target", Kind: "function", Label: "SharedTarget", QualifiedName: "packages/library.SharedTarget", Evidence: evidence("packages/library/src/main.ts")},
+			},
+			Edges: []graph.Edge{
+				{SourceID: "project:app", TargetID: "file:app", Relation: "contains", Evidence: evidence("apps/app/package.json")},
+				{SourceID: "file:app", TargetID: "function:app-target", Relation: "contains", Evidence: evidence("apps/app/src/main.ts")},
+				{SourceID: "project:library", TargetID: "file:library", Relation: "contains", Evidence: evidence("packages/library/package.json")},
+				{SourceID: "file:library", TargetID: "function:library-target", Relation: "contains", Evidence: evidence("packages/library/src/main.ts")},
+			},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("publish filtered lexical fixture: %v", err)
+	}
+
+	matches, err := store.SearchNodes(context.Background(), snapshot, storage.LexicalSearchRequest{
+		Text:       "shared target",
+		Kinds:      []graph.NodeKind{"function"},
+		ProjectIDs: []string{"project:app"},
+		Limit:      10,
+	})
+	if err != nil {
+		t.Fatalf("search filtered nodes: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Node.ID != "function:app-target" {
+		t.Errorf("filtered lexical matches = %+v, want app target", matches)
+	}
+}
+
+func TestLexicalRowsFollowRebuildRollbackAndPrune(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	first, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/first.ts", "function:first")})
+	if err != nil {
+		t.Fatalf("publish first snapshot: %v", err)
+	}
+	second, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/second.ts", "function:second")})
+	if err != nil {
+		t.Fatalf("publish second snapshot: %v", err)
+	}
+	if err := store.RebuildLexicalIndex(context.Background(), "workspace"); err != nil {
+		t.Fatalf("rebuild lexical index: %v", err)
+	}
+	if matches, err := store.SearchNodes(context.Background(), second, storage.LexicalSearchRequest{Text: "second", Limit: 10}); err != nil || len(matches) != 1 {
+		t.Fatalf("rebuilt lexical matches = %+v, error %v, want second", matches, err)
+	}
+
+	if _, err := store.Rollback(context.Background(), storage.RollbackRequest{Workspace: "workspace", Version: first.Version}); err != nil {
+		t.Fatalf("roll back lexical snapshot: %v", err)
+	}
+	if matches, err := store.SearchNodes(context.Background(), second, storage.LexicalSearchRequest{Text: "second", Limit: 10}); err != nil || len(matches) != 0 {
+		t.Errorf("rolled back lexical matches = %+v, error %v, want none", matches, err)
+	}
+
+	retained, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/retained.ts", "function:retained")})
+	if err != nil {
+		t.Fatalf("publish retained snapshot: %v", err)
+	}
+	if _, err := store.Prune(context.Background(), storage.PruneRequest{Workspace: "workspace", BeforeVersion: retained.Version}); err != nil {
+		t.Fatalf("prune lexical snapshots: %v", err)
+	}
+	if matches, err := store.SearchNodes(context.Background(), first, storage.LexicalSearchRequest{Text: "first", Limit: 10}); err != nil || len(matches) != 0 {
+		t.Errorf("pruned lexical matches = %+v, error %v, want none", matches, err)
 	}
 }
 

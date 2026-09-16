@@ -1,0 +1,194 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/spf13/cobra"
+)
+
+const mcpServerVersion = "0.1.0"
+
+type mcpCommandRunner func([]string, io.Writer, io.Writer) int
+
+func runMCP(_ *cobra.Command, arguments []string, _ io.Writer, standardError io.Writer) int {
+	if len(arguments) != 0 {
+		return writeCommandError(standardError, fmt.Errorf("mcp does not accept arguments"))
+	}
+	if err := server.ServeStdio(newMCPServer(run)); err != nil {
+		return writeCommandError(standardError, fmt.Errorf("serve MCP over stdio: %w", err))
+	}
+	return 0
+}
+
+func newMCPServer(runCommand mcpCommandRunner) *server.MCPServer {
+	mcpServer := server.NewMCPServer("agent-wayfinder", mcpServerVersion, server.WithToolCapabilities(false))
+	mcpServer.AddTool(queryMCPTool(), commandToolHandler(runCommand, queryMCPArguments))
+	mcpServer.AddTool(pathMCPTool(), commandToolHandler(runCommand, pathMCPArguments))
+	mcpServer.AddTool(explainMCPTool(), commandToolHandler(runCommand, explainMCPArguments))
+	mcpServer.AddTool(exportMCPTool(), commandToolHandler(runCommand, exportMCPArguments))
+	return mcpServer
+}
+
+func queryMCPTool() mcp.Tool {
+	return mcp.NewTool("query",
+		mcp.WithDescription("Find relevant code graph nodes and bounded nearby relationships."),
+		workspaceMCPOption(),
+		mcp.WithArray("terms", mcp.Required(), mcp.WithStringItems(mcp.MinLength(1))),
+		mcp.WithNumber("maxDepth", mcp.Description("Maximum relationship traversal depth.")),
+		mcp.WithNumber("maxNodes", mcp.Description("Maximum number of traversed nodes.")),
+		mcp.WithArray("projects", mcp.WithStringItems(mcp.MinLength(1))),
+		mcp.WithArray("relations", mcp.WithStringItems(mcp.MinLength(1))),
+		databaseMCPOption(),
+	)
+}
+
+func pathMCPTool() mcp.Tool {
+	return mcp.NewTool("path",
+		mcp.WithDescription("Find a directed relationship path between two code graph nodes."),
+		workspaceMCPOption(),
+		mcp.WithString("source", mcp.Required(), mcp.MinLength(1)),
+		mcp.WithString("target", mcp.Required(), mcp.MinLength(1)),
+		mcp.WithBoolean("undirected", mcp.Description("Allow an undirected fallback when no directed path exists.")),
+		mcp.WithNumber("maxDepth", mcp.Description("Maximum path depth.")),
+		mcp.WithNumber("maxNodes", mcp.Description("Maximum number of traversed nodes.")),
+		mcp.WithArray("projects", mcp.WithStringItems(mcp.MinLength(1))),
+		mcp.WithArray("relations", mcp.WithStringItems(mcp.MinLength(1))),
+		databaseMCPOption(),
+	)
+}
+
+func explainMCPTool() mcp.Tool {
+	return mcp.NewTool("explain",
+		mcp.WithDescription("Explain one exact or unambiguous code graph node."),
+		workspaceMCPOption(),
+		mcp.WithString("node", mcp.Required(), mcp.MinLength(1)),
+		databaseMCPOption(),
+	)
+}
+
+func exportMCPTool() mcp.Tool {
+	return mcp.NewTool("export",
+		mcp.WithDescription("Export all nodes and edges from a published code graph."),
+		workspaceMCPOption(),
+		databaseMCPOption(),
+	)
+}
+
+func workspaceMCPOption() mcp.ToolOption {
+	return mcp.WithString("workspace", mcp.Required(), mcp.MinLength(1), mcp.Description("Absolute or relative workspace path."))
+}
+
+func databaseMCPOption() mcp.ToolOption {
+	return mcp.WithString("database", mcp.MinLength(1), mcp.Description("Optional SQLite database path."))
+}
+
+func commandToolHandler(runCommand mcpCommandRunner, arguments func(mcp.CallToolRequest) ([]string, error)) server.ToolHandlerFunc {
+	return func(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		commandArguments, err := arguments(request)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		standardOutput := &strings.Builder{}
+		standardError := &strings.Builder{}
+		if exitCode := runCommand(commandArguments, standardOutput, standardError); exitCode != 0 {
+			message := strings.TrimSpace(standardError.String())
+			if message == "" {
+				message = fmt.Sprintf("agent-wayfinder command failed with exit code %d", exitCode)
+			}
+			return mcp.NewToolResultError(message), nil
+		}
+		var structuredContent any
+		if err := json.Unmarshal([]byte(standardOutput.String()), &structuredContent); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("decode agent-wayfinder JSON output: %s", err)), nil
+		}
+		return mcp.NewToolResultStructured(structuredContent, strings.TrimSpace(standardOutput.String())), nil
+	}
+}
+
+func queryMCPArguments(request mcp.CallToolRequest) ([]string, error) {
+	workspace, err := request.RequireString("workspace")
+	if err != nil {
+		return nil, err
+	}
+	terms, err := request.RequireStringSlice("terms")
+	if err != nil {
+		return nil, err
+	}
+	if len(terms) == 0 {
+		return nil, fmt.Errorf("terms must contain at least one value")
+	}
+	arguments := []string{"query", "--format", "json", "--max-depth", strconv.Itoa(request.GetInt("maxDepth", 2)), "--max-nodes", strconv.Itoa(request.GetInt("maxNodes", 100))}
+	arguments = appendMCPFilters(arguments, request)
+	arguments = append(arguments, workspace)
+	arguments = append(arguments, terms...)
+	return arguments, nil
+}
+
+func pathMCPArguments(request mcp.CallToolRequest) ([]string, error) {
+	workspace, err := request.RequireString("workspace")
+	if err != nil {
+		return nil, err
+	}
+	source, err := request.RequireString("source")
+	if err != nil {
+		return nil, err
+	}
+	target, err := request.RequireString("target")
+	if err != nil {
+		return nil, err
+	}
+	arguments := []string{"path", "--format", "json", "--max-depth", strconv.Itoa(request.GetInt("maxDepth", 8)), "--max-nodes", strconv.Itoa(request.GetInt("maxNodes", 100))}
+	if request.GetBool("undirected", false) {
+		arguments = append(arguments, "--undirected")
+	}
+	arguments = appendMCPFilters(arguments, request)
+	arguments = append(arguments, workspace, source, target)
+	return arguments, nil
+}
+
+func explainMCPArguments(request mcp.CallToolRequest) ([]string, error) {
+	workspace, err := request.RequireString("workspace")
+	if err != nil {
+		return nil, err
+	}
+	node, err := request.RequireString("node")
+	if err != nil {
+		return nil, err
+	}
+	arguments := appendMCPDatabase([]string{"explain", "--format", "json"}, request)
+	return append(arguments, workspace, node), nil
+}
+
+func exportMCPArguments(request mcp.CallToolRequest) ([]string, error) {
+	workspace, err := request.RequireString("workspace")
+	if err != nil {
+		return nil, err
+	}
+	arguments := appendMCPDatabase([]string{"export", "--format", "json"}, request)
+	return append(arguments, workspace), nil
+}
+
+func appendMCPFilters(arguments []string, request mcp.CallToolRequest) []string {
+	arguments = appendMCPDatabase(arguments, request)
+	for _, project := range request.GetStringSlice("projects", nil) {
+		arguments = append(arguments, "--project", project)
+	}
+	for _, relation := range request.GetStringSlice("relations", nil) {
+		arguments = append(arguments, "--relation", relation)
+	}
+	return arguments
+}
+
+func appendMCPDatabase(arguments []string, request mcp.CallToolRequest) []string {
+	if database := request.GetString("database", ""); database != "" {
+		arguments = append(arguments, "--database", database)
+	}
+	return arguments
+}

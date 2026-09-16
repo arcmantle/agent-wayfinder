@@ -9,8 +9,41 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Check out release corpus
+        uses: actions/checkout@v4
+        with:
+          repository: arcmantle/agent-issues
+          path: release-corpus/agent-issues
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.0'
+          check-latest: true
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install --yes build-essential
+      - name: Test
+        run: go test -tags sqlite_fts5 ./...
+      - name: Vet
+        run: go vet -tags sqlite_fts5 ./...
+      - name: Build
+        run: go build -tags sqlite_fts5 ./cmd/agent-wayfinder
+      - name: Run natural-language release acceptance
+        env:
+          AGENT_WAYFINDER_RELEASE_ROOT: ${{ github.workspace }}
+          AGENT_WAYFINDER_SHARED_CONTRACT_ROOT: ${{ github.workspace }}/release-corpus/agent-issues
+        run: go test -tags sqlite_fts5 ./acceptance -run '^TestNaturalLanguageReleaseAcceptance$' -count=1
+
   build:
     name: Build ${{ matrix.platform }}-${{ matrix.architecture }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +76,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.architecture == 'x64' && 'amd64' || matrix.architecture }}
           CC: ${{ matrix.platform == 'win32' && 'x86_64-w64-mingw32-gcc' || '' }}
-        run: CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o dist/agent-wayfinder${{ matrix.extension }} ./cmd/agent-wayfinder
+        run: CGO_ENABLED=1 go build -tags sqlite_fts5 -trimpath -ldflags="-s -w" -o dist/agent-wayfinder${{ matrix.extension }} ./cmd/agent-wayfinder
       - name: Create release asset
         env:
           ASSET_NAME: agent-wayfinder-${{ matrix.platform }}-${{ matrix.architecture }}.gz

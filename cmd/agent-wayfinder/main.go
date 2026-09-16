@@ -72,7 +72,8 @@ func newRootCommand(standardOutput, standardError io.Writer) (*cobra.Command, *i
 	addCommand("benchmark [WORKSPACE]", "Measure critical graph operations", benchmarkFlags, runBenchmark)
 	addCommand("install", "Install the Agent Wayfinder skill", installFlags, runInstall)
 	addCommand("index WORKSPACE", "Index a workspace", databaseAndFormatFlags, runIndex)
-	addCommand("query WORKSPACE TERM...", "Query a published graph", queryFlags, runQuery)
+	addCommand("mcp", "Run the Model Context Protocol server", func(*cobra.Command) {}, runMCP)
+	addCommand("query WORKSPACE (QUESTION | TERM...)", "Query a published graph", queryFlags, runQuery)
 	root.AddCommand(newIndexerCommand(standardOutput, standardError, &exitCode))
 	addCommand("export WORKSPACE", "Export a published graph", databaseAndFormatFlags, runExport)
 	addCommand("explain WORKSPACE NODE", "Explain a graph node", databaseAndFormatFlags, runExplain)
@@ -143,6 +144,9 @@ func databaseAndFormatFlags(command *cobra.Command) {
 
 func queryFlags(command *cobra.Command) {
 	databaseAndFormatFlags(command)
+	command.Flags().Bool("question", false, "interpret one argument as an architecture question")
+	command.Flags().Bool("terms", false, "treat all arguments as literal lookup terms")
+	command.Flags().Bool("show-plan", false, "show the interpreted query plan in text output")
 	command.Flags().Int("max-depth", 2, "maximum traversal depth")
 	command.Flags().Int("max-nodes", 100, "maximum traversed nodes")
 	command.Flags().StringArray("project", nil, "project scope ID")
@@ -1309,8 +1313,38 @@ func runQuery(command *cobra.Command, arguments []string, standardOutput, standa
 	if err != nil {
 		return writeCommandError(standardError, err)
 	}
+	forceQuestion, err := command.Flags().GetBool("question")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	forceTerms, err := command.Flags().GetBool("terms")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	showPlan, err := command.Flags().GetBool("show-plan")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	if forceQuestion && forceTerms {
+		return writeCommandError(standardError, cli.NewInvalidArgumentError("--question and --terms cannot be used together"))
+	}
 
 	workspace, terms := arguments[0], arguments[1:]
+	questionMode := forceQuestion || !forceTerms && isQuestionArgument(terms)
+	var plan *query.QueryPlan
+	if questionMode {
+		if len(terms) != 1 {
+			return writeCommandError(standardError, cli.NewInvalidArgumentError("question mode requires exactly one question argument"))
+		}
+		analyzed := query.AnalyzeQuestion(terms[0])
+		analyzed.MaxDepth = maxDepth
+		analyzed.MaxNodes = maxNodes
+		for index := range analyzed.EntitySlots {
+			analyzed.EntitySlots[index].Retrieval.ProjectIDs = append([]string(nil), projectIDs...)
+		}
+		plan = &analyzed
+		terms = nil
+	}
 	workspaceRoot, err := filepath.Abs(workspace)
 	if err != nil {
 		return writeCommandError(standardError, fmt.Errorf("resolve query workspace path: %w", err))
@@ -1333,6 +1367,7 @@ func runQuery(command *cobra.Command, arguments []string, standardOutput, standa
 		return writeCommandError(standardError, err)
 	}
 	result, err := query.QuerySnapshot(context.Background(), store, store, snapshot, query.Request{
+		Plan:       plan,
 		Terms:      terms,
 		ProjectIDs: append([]string(nil), projectIDs...),
 		Relations:  relationKinds(relations),
@@ -1342,17 +1377,16 @@ func runQuery(command *cobra.Command, arguments []string, standardOutput, standa
 	if err != nil {
 		return writeCommandError(standardError, cli.NewInvalidArgumentError(err.Error()))
 	}
-	data := queryResultData(result, maxDepth, maxNodes)
+	data := queryResultData(result, plan, maxDepth, maxNodes)
 	if err := cli.Render(standardOutput, cli.Result{
 		Snapshot: snapshot,
-		Text:     renderQueryText(data),
+		Text:     renderQueryText(data, showPlan),
 		Data:     data,
 	}, format); err != nil {
 		return writeCommandError(standardError, err)
 	}
 	return 0
 }
-
 func runExplain(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
 	if len(arguments) != 2 {
 		return writeCommandError(standardError, cli.NewInvalidArgumentError("explain requires one workspace path and one node query"))
@@ -1482,29 +1516,66 @@ func relationKinds(relations []string) []graph.RelationKind {
 }
 
 type queryResult struct {
+	SchemaVersion     int                        `json:"schemaVersion,omitempty"`
+	Interpretation    *query.QueryPlan           `json:"interpretation,omitempty"`
+	Plan              *query.QueryPlan           `json:"plan,omitempty"`
 	Seeds             []query.SeedSet            `json:"seeds"`
 	Nodes             []graph.Node               `json:"nodes"`
 	Edges             []graph.Edge               `json:"edges"`
+	Impact            []query.ImpactEvidence     `json:"impact,omitempty"`
+	Evidence          []query.EvidenceGroup      `json:"evidence,omitempty"`
+	Limits            []query.StageLimit         `json:"limits,omitempty"`
+	Warnings          []query.PlanWarning        `json:"warnings,omitempty"`
+	Suggestions       []string                   `json:"suggestions,omitempty"`
 	TruncationReasons []storage.TruncationReason `json:"truncationReasons,omitempty"`
 	ScopeBoundary     *query.ScopeBoundary       `json:"scopeBoundary,omitempty"`
 	MaxDepth          int                        `json:"maxDepth"`
 	MaxNodes          int                        `json:"maxNodes"`
 }
 
-func queryResultData(result query.Result, maxDepth, maxNodes int) queryResult {
-	return queryResult{
+func queryResultData(result query.Result, plan *query.QueryPlan, maxDepth, maxNodes int) queryResult {
+	data := queryResult{
+		Plan:              plan,
 		Seeds:             result.Seeds,
 		Nodes:             result.Facts.Nodes,
 		Edges:             result.Facts.Edges,
+		Impact:            result.Impact,
+		Evidence:          result.Evidence,
+		Limits:            result.Limits,
+		Warnings:          result.Warnings,
 		TruncationReasons: result.TruncationReasons,
 		ScopeBoundary:     result.ScopeBoundary,
 		MaxDepth:          maxDepth,
 		MaxNodes:          maxNodes,
 	}
+	if plan != nil {
+		data.SchemaVersion = 1
+		data.Interpretation = plan
+		for _, warning := range append(append([]query.PlanWarning(nil), plan.Warnings...), result.Warnings...) {
+			data.Suggestions = append(data.Suggestions, warning.Suggestions...)
+		}
+	}
+	return data
 }
 
-func renderQueryText(result queryResult) string {
-	lines := []string{"Seeds:"}
+func renderQueryText(result queryResult, showPlan bool) string {
+	lines := make([]string, 0)
+	if result.Plan != nil && (showPlan || len(result.Plan.Warnings) > 0) {
+		lines = append(lines, fmt.Sprintf("Interpreted as: %s (%s, confidence %.2f)", result.Plan.Intent, result.Plan.Operator, result.Plan.Confidence))
+		for _, warning := range result.Plan.Warnings {
+			lines = append(lines, "Warning: "+warning.Message)
+		}
+	}
+	for _, warning := range result.Warnings {
+		lines = append(lines, "Warning: "+warning.Message)
+		for _, suggestion := range warning.Suggestions {
+			lines = append(lines, "Next: "+suggestion)
+		}
+	}
+	if result.Plan != nil && len(result.Evidence) == 0 {
+		lines = append(lines, "No answer-ready evidence was found.")
+	}
+	lines = append(lines, "Seeds:")
 	for _, seedSet := range result.Seeds {
 		lines = append(lines, seedSet.Term+":")
 		for _, node := range seedSet.Nodes {
@@ -1512,6 +1583,12 @@ func renderQueryText(result queryResult) string {
 		}
 	}
 	lines = append(lines, fmt.Sprintf("Nodes: %d", len(result.Nodes)), fmt.Sprintf("Edges: %d", len(result.Edges)))
+	if len(result.Impact) > 0 {
+		lines = append(lines, "Impact:")
+		for _, evidence := range result.Impact {
+			lines = append(lines, fmt.Sprintf("- %s via %s (distance %d, score %.4f)", evidence.Node.QualifiedName, evidence.Relation, evidence.Distance, evidence.Score))
+		}
+	}
 	if len(result.TruncationReasons) > 0 {
 		reasons := make([]string, len(result.TruncationReasons))
 		for index, reason := range result.TruncationReasons {
@@ -1523,6 +1600,23 @@ func renderQueryText(result queryResult) string {
 		lines = append(lines, "Scope boundary: "+result.ScopeBoundary.Node.QualifiedName)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func isQuestionArgument(terms []string) bool {
+	if len(terms) != 1 {
+		return false
+	}
+	term := strings.TrimSpace(terms[0])
+	if strings.ContainsAny(term, " ?!\t\n") {
+		return true
+	}
+	word := strings.ToLower(strings.Trim(term, "."))
+	switch word {
+	case "describe", "explain", "find", "how", "show", "what", "where", "which", "who":
+		return true
+	default:
+		return false
+	}
 }
 
 type pathResult struct {
