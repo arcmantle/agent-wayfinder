@@ -1,6 +1,9 @@
 package query
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"unicode"
@@ -42,9 +45,10 @@ const (
 type RetrievalRequest = storage.LexicalSearchRequest
 
 type EntitySlot struct {
-	Role      string           `json:"role"`
-	Text      string           `json:"text"`
-	Retrieval RetrievalRequest `json:"retrieval"`
+	Role       string           `json:"role"`
+	EntityRole string           `json:"entityRole,omitempty"`
+	Text       string           `json:"text"`
+	Retrieval  RetrievalRequest `json:"retrieval"`
 }
 
 type PlanWarning struct {
@@ -73,6 +77,87 @@ type QueryPlan struct {
 	Warnings         []PlanWarning              `json:"warnings"`
 }
 
+type copilotPlannerResponse struct {
+	SchemaVersion int      `json:"schemaVersion"`
+	Intent        Intent   `json:"intent"`
+	Entities      []string `json:"entities"`
+}
+
+type copilotPlannerIntent struct {
+	operator  ExecutionOperator
+	direction storage.TraversalDirection
+	roles     []string
+	relations []graph.RelationKind
+	maxDepth  int
+}
+
+var copilotPlannerIntents = map[Intent]copilotPlannerIntent{
+	IntentLookup:         {operator: OperatorLookup, direction: storage.TraverseBoth, roles: []string{"entity"}, maxDepth: 2},
+	IntentExplain:        {operator: OperatorExplain, direction: storage.TraverseBoth, roles: []string{"entity"}, maxDepth: 2},
+	IntentCalls:          {operator: OperatorNeighbors, direction: storage.TraverseOutgoing, roles: []string{"caller"}, relations: []graph.RelationKind{"calls"}, maxDepth: 2},
+	IntentCalledBy:       {operator: OperatorNeighbors, direction: storage.TraverseIncoming, roles: []string{"callee"}, relations: []graph.RelationKind{"calls"}, maxDepth: 2},
+	IntentDependencies:   {operator: OperatorNeighbors, direction: storage.TraverseOutgoing, roles: []string{"dependent"}, relations: []graph.RelationKind{"imports_from", "requires", "depends_on"}, maxDepth: 2},
+	IntentDependents:     {operator: OperatorNeighbors, direction: storage.TraverseIncoming, roles: []string{"dependency"}, relations: []graph.RelationKind{"imports_from", "requires", "depends_on"}, maxDepth: 2},
+	IntentPath:           {operator: OperatorPath, direction: storage.TraverseOutgoing, roles: []string{"source", "target"}, relations: []graph.RelationKind{"calls"}, maxDepth: 8},
+	IntentReachability:   {operator: OperatorPath, direction: storage.TraverseOutgoing, roles: []string{"source", "target"}, relations: []graph.RelationKind{"calls"}, maxDepth: 8},
+	IntentSharedContract: {operator: OperatorIntersection, direction: storage.TraverseBoth, roles: []string{"left", "right"}, relations: []graph.RelationKind{"implements", "contains"}, maxDepth: 2},
+	IntentImpact:         {operator: OperatorImpact, direction: storage.TraverseIncoming, roles: []string{"changed"}, relations: []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}, maxDepth: 2},
+}
+
+// ParseCopilotPlannerResponse validates a bounded Copilot planner response.
+func ParseCopilotPlannerResponse(response []byte) (QueryPlan, error) {
+	decoder := json.NewDecoder(strings.NewReader(string(response)))
+	decoder.DisallowUnknownFields()
+	var plannerResponse copilotPlannerResponse
+	if err := decoder.Decode(&plannerResponse); err != nil {
+		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: multiple JSON values")
+	}
+	if plannerResponse.SchemaVersion != QueryPlanSchemaVersion {
+		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: unsupported schema version %d", plannerResponse.SchemaVersion)
+	}
+	intent, found := copilotPlannerIntents[plannerResponse.Intent]
+	if !found {
+		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: unsupported intent %q", plannerResponse.Intent)
+	}
+	if len(plannerResponse.Entities) != len(intent.roles) {
+		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: intent %q requires %d entities", plannerResponse.Intent, len(intent.roles))
+	}
+	for _, entity := range plannerResponse.Entities {
+		if cleanEntityText(entity) == "" {
+			return QueryPlan{}, fmt.Errorf("parse Copilot planner response: entity text is required")
+		}
+	}
+	return copilotQueryPlan(plannerResponse.Intent, intent, plannerResponse.Entities), nil
+}
+
+func copilotQueryPlan(intent Intent, specification copilotPlannerIntent, entities []string) QueryPlan {
+	question := strings.Join(entities, " and ")
+	slots := make([]EntitySlot, len(entities))
+	for index, entity := range entities {
+		slots[index] = entitySlot(specification.roles[index], cleanEntityText(entity))
+	}
+	return QueryPlan{
+		SchemaVersion:    QueryPlanSchemaVersion,
+		Question:         question,
+		Tokens:           questionTokens(question),
+		NormalizedTerms:  lowercaseTokens(questionTokens(question)),
+		Intent:           intent,
+		Confidence:       1,
+		EntitySlots:      slots,
+		AllowedRelations: append([]graph.RelationKind(nil), specification.relations...),
+		RelationHints:    relationHints(specification.relations),
+		DirectionHints:   []string{string(specification.direction)},
+		Direction:        specification.direction,
+		Operator:         specification.operator,
+		MaxDepth:         specification.maxDepth,
+		MaxNodes:         100,
+		Warnings:         []PlanWarning{},
+	}
+}
+
 type questionRule struct {
 	pattern        *regexp.Regexp
 	intent         Intent
@@ -86,17 +171,21 @@ type questionRule struct {
 
 var questionRules = []questionRule{
 	rule(`^what is the (?:shared|common) contracts? between (.+?) and (.+?)$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
+	rule(`^what do (.+?) and (.+?) have in common$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
 	rule(`^which interfaces are common to (.+?) and (?:a )?(.+?)$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
 	rule(`^show the common storage contracts for (.+?) and (.+?)$`, IntentSharedContract, OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, nil, []graph.RelationKind{"implements", "contains"}),
 	rule(`^what is affected if (.+?) changes$`, IntentImpact, OperatorImpact, storage.TraverseIncoming, []string{"changed"}, nil, []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}),
+	rule(`^what will break if (.+?) changes$`, IntentImpact, OperatorImpact, storage.TraverseIncoming, []string{"changed"}, nil, []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}),
 	rule(`^impact of changing (.+?)$`, IntentImpact, OperatorImpact, storage.TraverseIncoming, []string{"changed"}, nil, []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}),
 	rule(`^find a path from (.+?) to (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^how do i get from (.+?) to (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^how does (.+?) reach (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^trace (.+?) from (.+?)$`, IntentPath, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, []int{2, 1}, []graph.RelationKind{"calls"}),
 	rule(`^can (.+?) reach (.+?)$`, IntentReachability, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^does (.+?) flow to (.+?)$`, IntentReachability, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^is (.+?) connected to (.+?) through calls$`, IntentReachability, OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^who calls (.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
+	rule(`^which functions call (.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^show callers of (.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^where is (.+?) called by other code$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
 	rule(`^what calls (?:the )?(.+?)$`, IntentCalledBy, OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, nil, []graph.RelationKind{"calls"}),
@@ -107,6 +196,7 @@ var questionRules = []questionRule{
 	rule(`^which packages does (.+?) depend on$`, IntentDependencies, OperatorNeighbors, storage.TraverseOutgoing, []string{"dependent"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
 	rule(`^what modules are required by (.+?)$`, IntentDependencies, OperatorNeighbors, storage.TraverseOutgoing, []string{"dependent"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
 	rule(`^what depends on the (.+?) package$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
+	rule(`^which modules depend on (.+?)$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
 	rule(`^find users of (.+?)$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"references", "imports_from"}),
 	rule(`^which packages use (.+?)$`, IntentDependents, OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, nil, []graph.RelationKind{"imports_from", "requires", "depends_on"}),
 	rule(`^explain (.+?)$`, IntentExplain, OperatorExplain, storage.TraverseBoth, []string{"entity"}, nil, nil),
@@ -121,6 +211,16 @@ var architecturalMoveComparisonPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^should (.+?) move out of (.+?) into (?:a )?(.+?)(?: package)?, or should (.+?) move into (?:a )?(.+?)(?: package)?\?? compare dependenc(?:y|ies)(?: direction| directions)? and consumers?$`),
 	regexp.MustCompile(`(?i)^should (.+?) move out of (.+?) into (?:a )?(.+?)(?: package)?, or should (.+?) move into (?:a )?(.+?)(?: package)?\?? compare consumers? and dependenc(?:y|ies)(?: direction| directions)?$`),
 }
+
+var folderLookupPattern = regexp.MustCompile(`(?i)^where is (?:the )?(.+?) folder$`)
+
+var packageExplainPattern = regexp.MustCompile(`(?i)^describe the (.+?) package$`)
+
+var fileLookupPattern = regexp.MustCompile(`(?i)^where is (?:the )?(.+?) file$`)
+
+var classExplainPattern = regexp.MustCompile(`(?i)^explain (?:the )?(.+?) class$`)
+
+var serviceExplainPattern = regexp.MustCompile(`(?i)^explain (?:the )?(.+?) service$`)
 
 func rule(pattern string, intent Intent, operator ExecutionOperator, direction storage.TraversalDirection, roles []string, captureIndexes []int, relations []graph.RelationKind) questionRule {
 	if captureIndexes == nil {
@@ -164,6 +264,39 @@ func AnalyzeQuestion(question string) QueryPlan {
 	}
 
 	normalizedQuestion := strings.TrimRight(strings.TrimSpace(question), "?!. ")
+	if matches := folderLookupPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
+		plan.Intent = IntentLookup
+		plan.Confidence = 1
+		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "folder", cleanEntityText(matches[1]))}
+		return plan
+	}
+	if matches := packageExplainPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
+		plan.Intent = IntentExplain
+		plan.Confidence = 1
+		plan.Operator = OperatorExplain
+		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "package", cleanEntityText(matches[1]))}
+		return plan
+	}
+	if matches := fileLookupPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
+		plan.Intent = IntentLookup
+		plan.Confidence = 1
+		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "file", cleanEntityText(matches[1]))}
+		return plan
+	}
+	if matches := classExplainPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
+		plan.Intent = IntentExplain
+		plan.Confidence = 1
+		plan.Operator = OperatorExplain
+		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "class", cleanEntityText(matches[1]))}
+		return plan
+	}
+	if matches := serviceExplainPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
+		plan.Intent = IntentExplain
+		plan.Confidence = 1
+		plan.Operator = OperatorExplain
+		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "service", cleanEntityText(matches[1]))}
+		return plan
+	}
 	if matches := matchArchitecturalMoveComparison(normalizedQuestion); matches != nil {
 		groups := make([][]string, 0, len(matches)-1)
 		concepts := make([]string, 0, len(matches)-1)
@@ -238,6 +371,10 @@ func matchArchitecturalMoveComparison(question string) []string {
 }
 
 func entitySlot(role, text string) EntitySlot {
+	return entitySlotWithEntityRole(role, "", text)
+}
+
+func entitySlotWithEntityRole(role, entityRole, text string) EntitySlot {
 	tokens := questionTokens(text)
 	tokenGroups := [][]string{lowercaseTokens(tokens)}
 	var kinds []graph.NodeKind
@@ -262,9 +399,19 @@ func entitySlot(role, text string) EntitySlot {
 	if (role == "left" || role == "right") && len(kinds) == 0 {
 		kinds = []graph.NodeKind{"typescript:class", "typescript:interface", "typescript:type_alias", "go:type"}
 	}
+	if entityRole == "folder" || entityRole == "file" {
+		kinds = []graph.NodeKind{"file"}
+	}
+	if entityRole == "package" {
+		kinds = []graph.NodeKind{"go:package"}
+	}
+	if entityRole == "class" || entityRole == "service" {
+		kinds = []graph.NodeKind{"typescript:class", "javascript:class", "go:type"}
+	}
 	return EntitySlot{
-		Role: role,
-		Text: text,
+		Role:       role,
+		EntityRole: entityRole,
+		Text:       text,
 		Retrieval: RetrievalRequest{
 			Text:        text,
 			TokenGroups: tokenGroups,

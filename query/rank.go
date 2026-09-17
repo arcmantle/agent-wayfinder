@@ -16,8 +16,9 @@ const maxSeedsPerTerm = 3
 const questionCandidateMultiplier = 4
 
 type SeedRequest struct {
-	Role      string                       `json:"role"`
-	Retrieval storage.LexicalSearchRequest `json:"retrieval"`
+	Role       string                       `json:"role"`
+	EntityRole string                       `json:"entityRole,omitempty"`
+	Retrieval  storage.LexicalSearchRequest `json:"retrieval"`
 }
 
 type SeedScoreComponents struct {
@@ -154,7 +155,7 @@ func RankSeedRequestsSnapshot(ctx context.Context, lookup storage.NodeLookup, se
 					components: SeedScoreComponents{
 						Exact:         seedLabelExactness(request, match.Node),
 						Lexical:       match.Score,
-						EntityRole:    seedRoleFit(seedRequest.Role, match.Node.Kind),
+						EntityRole:    max(seedRoleFit(seedRequest.Role, match.Node.Kind), seedEntityRoleFit(seedRequest.EntityRole, match.Node.Kind)),
 						NodeKind:      seedKindFit(request.Kinds, match.Node.Kind),
 						ProjectScope:  seedProjectScopeFit(request.ProjectIDs),
 						PathAffinity:  seedTextCoverage(request, match.Node.Evidence.Span.Path),
@@ -348,8 +349,30 @@ func seedRoleFit(role string, kind graph.NodeKind) float64 {
 		}
 		return 0
 	default:
-		return 1
+		return 0
 	}
+}
+
+func seedEntityRoleFit(role string, kind graph.NodeKind) float64 {
+	baseKind := string(kind)
+	if separator := strings.LastIndex(baseKind, ":"); separator >= 0 {
+		baseKind = baseKind[separator+1:]
+	}
+	switch role {
+	case "folder", "file":
+		if baseKind == "file" {
+			return 1
+		}
+	case "package":
+		if baseKind == "package" {
+			return 1
+		}
+	case "class", "service":
+		if baseKind == "class" || baseKind == "type" {
+			return 1
+		}
+	}
+	return 0
 }
 
 func seedKindFit(kinds []graph.NodeKind, kind graph.NodeKind) float64 {

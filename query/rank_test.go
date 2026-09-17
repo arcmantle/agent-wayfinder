@@ -358,6 +358,34 @@ func TestRankSeedRequestsSnapshotPrefersAdapterNodesForSharedContractSlots(t *te
 	}
 }
 
+func TestRankSeedRequestsSnapshotPrefersServiceEntityRole(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(context.Context, storage.Snapshot, storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			return nil, nil
+		}),
+		exact: func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error) { return nil, nil },
+	}
+	searcher := lexicalSearcherFunc(func(context.Context, storage.Snapshot, storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+		return []storage.LexicalMatch{
+			{Node: graph.Node{ID: "function:index", Kind: "go:function", Label: "IndexHandler", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "cmd/index.go"}}}, Score: 10},
+			{Node: graph.Node{ID: "type:index-service", Kind: "go:type", Label: "IndexService", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "query/index_service.go"}}}, Score: 5},
+		}, nil
+	})
+
+	seeds, err := query.RankSeedRequestsSnapshot(context.Background(), lookup, searcher, snapshot, []query.SeedRequest{{
+		Role:       "entity",
+		EntityRole: "service",
+		Retrieval:  storage.LexicalSearchRequest{Text: "index", TokenGroups: [][]string{{"index"}}, Limit: 2},
+	}})
+	if err != nil {
+		t.Fatalf("rank service entity: %v", err)
+	}
+	if got, want := nodeIDs(seeds[0].Nodes), []string{"type:index-service", "function:index"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("service seed IDs = %v, want %v", got, want)
+	}
+}
+
 func TestRankSeedRequestsSnapshotUsesExactMatchWhenAvailable(t *testing.T) {
 	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
 	wantNode := graph.Node{ID: "function:main", Kind: "function", Label: "main", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "src/main.go"}}}

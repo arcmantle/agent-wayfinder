@@ -2,13 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"agent-wayfinder/graph"
 	"agent-wayfinder/query"
@@ -22,6 +28,132 @@ func TestMain(testMain *testing.M) {
 		panic(err)
 	}
 	os.Exit(testMain.Run())
+}
+
+func TestCopilotBudgetRejectsPromptThatConsumesFullBudgetBeforeReadingResponse(t *testing.T) {
+	response := &copilotBudgetTestResponse{}
+	_, err := readCopilotPlannerResponse(context.Background(), "three", 5, response)
+	if !errors.Is(err, errCopilotPromptBudgetExceeded) {
+		t.Fatalf("read planner response error = %v, want prompt-budget error", err)
+	}
+	if response.read {
+		t.Error("read planner response read output after the prompt used the full budget")
+	}
+}
+
+func TestCopilotBudgetRejectsExcessResponse(t *testing.T) {
+	contents, err := readCopilotPlannerResponse(context.Background(), "one", 6, io.NopCloser(strings.NewReader("four")))
+	if !errors.Is(err, errCopilotResponseBudgetExceeded) {
+		t.Fatalf("read planner response error = %v, want response-budget error", err)
+	}
+	if contents != nil {
+		t.Errorf("read planner response contents = %q, want no excess output", contents)
+	}
+}
+
+func TestCopilotBudgetReturnsTimeoutForBlockedResponse(t *testing.T) {
+	context, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := readCopilotPlannerResponse(context, "one", 10, newCopilotBudgetBlockingResponse())
+	if !errors.Is(err, errCopilotPlannerTimeout) {
+		t.Fatalf("read planner response error = %v, want timeout error", err)
+	}
+}
+
+func TestCopilotBudgetBuildsMetadataOnlyPlannerPrompt(t *testing.T) {
+	prompt := copilotPlannerPrompt("which functions call runQuery?")
+	if !strings.Contains(prompt, `"schemaVersion":1`) || !strings.Contains(prompt, `"intent"`) || !strings.Contains(prompt, `"entities"`) {
+		t.Errorf("planner prompt = %q, want the response schema", prompt)
+	}
+	if !strings.Contains(prompt, strconv.Quote("which functions call runQuery?")) {
+		t.Errorf("planner prompt = %q, want the encoded question", prompt)
+	}
+}
+
+func TestCopilotSubprocessUsesOnlyConfiguredPlannerArguments(t *testing.T) {
+	var gotName string
+	var gotArguments []string
+	runner := func(_ context.Context, name string, arguments ...string) *exec.Cmd {
+		gotName = name
+		gotArguments = append([]string(nil), arguments...)
+		return exec.Command("true")
+	}
+
+	response, err := runCopilotPlanner(context.Background(), copilotConfiguration{
+		Model:        "gpt-5",
+		MaxAICredits: 2,
+		TokenBudget:  4096,
+		Timeout:      30 * time.Second,
+	}, "which functions call runQuery?", runner)
+	if err != nil {
+		t.Fatalf("run Copilot planner: %v", err)
+	}
+	if len(response) != 0 {
+		t.Errorf("planner response = %q, want empty true-command output", response)
+	}
+	if gotName != "copilot" {
+		t.Errorf("planner command = %q, want copilot", gotName)
+	}
+	wantArguments := []string{"--silent", "--output-format", "json", "--model", "gpt-5", "--max-ai-credits", "2", copilotPlannerPrompt("which functions call runQuery?")}
+	if !reflect.DeepEqual(gotArguments, wantArguments) {
+		t.Errorf("planner arguments = %q, want %q", gotArguments, wantArguments)
+	}
+}
+
+func TestCopilotSubprocessOmitsAutomaticModelOverride(t *testing.T) {
+	var gotArguments []string
+	runner := func(_ context.Context, _ string, arguments ...string) *exec.Cmd {
+		gotArguments = append([]string(nil), arguments...)
+		return exec.Command("true")
+	}
+
+	_, err := runCopilotPlanner(context.Background(), copilotConfiguration{
+		Model:        defaultCopilotModel,
+		MaxAICredits: 1,
+		TokenBudget:  4096,
+		Timeout:      30 * time.Second,
+	}, "where is runQuery?", runner)
+	if err != nil {
+		t.Fatalf("run Copilot planner: %v", err)
+	}
+	for _, argument := range gotArguments {
+		if argument == "--model" {
+			t.Errorf("planner arguments = %q, must omit automatic model override", gotArguments)
+		}
+	}
+}
+
+type copilotBudgetTestResponse struct {
+	read bool
+}
+
+func (response *copilotBudgetTestResponse) Read([]byte) (int, error) {
+	response.read = true
+	return 0, io.EOF
+}
+
+func (response *copilotBudgetTestResponse) Close() error {
+	return nil
+}
+
+type copilotBudgetBlockingResponse struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newCopilotBudgetBlockingResponse() *copilotBudgetBlockingResponse {
+	return &copilotBudgetBlockingResponse{closed: make(chan struct{})}
+}
+
+func (response *copilotBudgetBlockingResponse) Read([]byte) (int, error) {
+	<-response.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (response *copilotBudgetBlockingResponse) Close() error {
+	response.once.Do(func() { close(response.closed) })
+	return nil
 }
 
 func TestCommandRuns(t *testing.T) {
@@ -236,6 +368,391 @@ func TestQueryCommandHelpDescribesQuestionAndTermModes(t *testing.T) {
 			t.Errorf("query help output = %q, want %q", output, expected)
 		}
 	}
+}
+
+func TestReadCopilotConfigurationReadsWorkspaceAndEnvironment(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder": `{"copilot":{"enabled":true,"model":"gpt-5","maxAiCredits":2,"tokenBudget":2048,"timeout":"12s"}}`,
+	})
+	t.Setenv("WAYFINDER_COPILOT_TOKEN_BUDGET", "3072")
+
+	configuration, err := readCopilotConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read Copilot configuration: %v", err)
+	}
+	if !configuration.Enabled || configuration.Model != "gpt-5" || configuration.MaxAICredits != 2 || configuration.TokenBudget != 3072 || configuration.Timeout != 12*time.Second {
+		t.Errorf("Copilot configuration = %+v, want workspace values with environment token budget", configuration)
+	}
+}
+
+func TestReadCopilotConfigurationUsesDisabledDefaults(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+	})
+
+	configuration, err := readCopilotConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read Copilot configuration: %v", err)
+	}
+	want := copilotConfiguration{
+		Model:        "auto",
+		MaxAICredits: 1,
+		TokenBudget:  4096,
+		Timeout:      30 * time.Second,
+	}
+	if !reflect.DeepEqual(configuration, want) {
+		t.Errorf("Copilot configuration = %+v, want %+v", configuration, want)
+	}
+}
+
+func TestReadCopilotConfigurationAcceptsIntegerSecondTimeout(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder": `{"copilot":{"timeout":12}}`,
+	})
+
+	configuration, err := readCopilotConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read Copilot configuration: %v", err)
+	}
+	if configuration.Timeout != 12*time.Second {
+		t.Errorf("Copilot timeout = %s, want 12s", configuration.Timeout)
+	}
+}
+
+func TestReadCopilotConfigurationRejectsInvalidInputWithoutSecretValues(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		configuration string
+		environment   string
+		value         string
+		wantError     string
+	}{
+		{
+			name:          "unknown copilot property",
+			configuration: `{"copilot":{"apiKey":"not-a-secret"}}`,
+			wantError:     "unknown field",
+		},
+		{
+			name:        "invalid enabled environment value",
+			environment: "WAYFINDER_COPILOT_ENABLED",
+			value:       "yes",
+			wantError:   "WAYFINDER_COPILOT_ENABLED",
+		},
+		{
+			name:          "timeout exceeds maximum",
+			configuration: `{"copilot":{"timeout":"31s"}}`,
+			wantError:     "invalid timeout",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			configuration := testCase.configuration
+			if configuration == "" {
+				configuration = `{}`
+			}
+			workspace := testkit.NewWorkspace(t, map[string]string{
+				".wayfinder": configuration,
+			})
+			if testCase.environment != "" {
+				t.Setenv(testCase.environment, testCase.value)
+			}
+
+			_, err := readCopilotConfiguration(workspace.Root)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf("configuration error = %v, want %q", err, testCase.wantError)
+			}
+			if strings.Contains(err.Error(), "not-a-secret") {
+				t.Errorf("configuration error = %q, must not expose configuration values", err)
+			}
+		})
+	}
+}
+
+func TestReadCopilotConfigurationValidatesModelAndBounds(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		configuration string
+		wantError     string
+	}{
+		{
+			name:          "valid model identifier",
+			configuration: `{"copilot":{"model":"github/gpt-5.1_mini"}}`,
+		},
+		{
+			name:          "empty model",
+			configuration: `{"copilot":{"model":""}}`,
+			wantError:     "invalid Copilot model",
+		},
+		{
+			name:          "model with space",
+			configuration: `{"copilot":{"model":"gpt 5"}}`,
+			wantError:     "invalid Copilot model",
+		},
+		{
+			name:          "zero AI credits",
+			configuration: `{"copilot":{"maxAiCredits":0}}`,
+			wantError:     "invalid max AI credits",
+		},
+		{
+			name:          "negative token budget",
+			configuration: `{"copilot":{"tokenBudget":-1}}`,
+			wantError:     "invalid token budget",
+		},
+		{
+			name:          "zero timeout",
+			configuration: `{"copilot":{"timeout":"0s"}}`,
+			wantError:     "invalid timeout",
+		},
+		{
+			name:          "negative timeout",
+			configuration: `{"copilot":{"timeout":-1}}`,
+			wantError:     "invalid copilot.timeout",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			workspace := testkit.NewWorkspace(t, map[string]string{
+				".wayfinder": testCase.configuration,
+			})
+
+			configuration, err := readCopilotConfiguration(workspace.Root)
+			if testCase.wantError == "" {
+				if err != nil || configuration.Model != "github/gpt-5.1_mini" {
+					t.Fatalf("Copilot configuration = %+v, %v; want valid model", configuration, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Errorf("configuration error = %v, want %q", err, testCase.wantError)
+			}
+		})
+	}
+}
+
+func TestCopilotFlagPrecedenceOverridesEnvironmentAndWorkspaceConfiguration(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder":   `{"copilot":{"enabled":false,"model":"workspace-model","maxAiCredits":1,"tokenBudget":100,"timeout":"5s"}}`,
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  `export function main() { return 1; }`,
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+	t.Setenv("WAYFINDER_COPILOT_ENABLED", "false")
+	t.Setenv("WAYFINDER_COPILOT_MODEL", "environment-model")
+	t.Setenv("WAYFINDER_COPILOT_MAX_AI_CREDITS", "2")
+	t.Setenv("WAYFINDER_COPILOT_TOKEN_BUDGET", "200")
+	t.Setenv("WAYFINDER_COPILOT_TIMEOUT", "10s")
+	installCopilotPlanner(t, `{"schemaVersion":1,"intent":"lookup","entities":["main"]}`)
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--copilot", "--copilot-model", "flag-model", "--copilot-max-ai-credits", "3", "--copilot-token-budget", "300", "--copilot-timeout", "15s", workspace.Root, "where is main?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("query with Copilot flags: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Copilot struct {
+				Enabled      bool   `json:"enabled"`
+				Model        string `json:"model"`
+				MaxAICredits int    `json:"maxAiCredits"`
+				TokenBudget  int    `json:"tokenBudget"`
+				Timeout      string `json:"timeout"`
+				Sources      struct {
+					Enabled      string `json:"enabled"`
+					Model        string `json:"model"`
+					MaxAICredits string `json:"maxAiCredits"`
+					TokenBudget  string `json:"tokenBudget"`
+					Timeout      string `json:"timeout"`
+				} `json:"sources"`
+			} `json:"copilot"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode query result: %v\n%s", err, output)
+	}
+	if got := result.Result.Copilot; !got.Enabled || got.Model != "flag-model" || got.MaxAICredits != 3 || got.TokenBudget != 300 || got.Timeout != "15s" || got.Sources.Enabled != "flag" || got.Sources.Model != "flag" || got.Sources.MaxAICredits != "flag" || got.Sources.TokenBudget != "flag" || got.Sources.Timeout != "flag" {
+		t.Errorf("Copilot configuration = %+v, want enabled flag configuration", got)
+	}
+}
+
+func TestCopilotQueryExecutesValidatedPlanAgainstPublishedGraph(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder":    `{"copilot":{"enabled":true}}`,
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+
+	installCopilotPlanner(t, `{"schemaVersion":1,"intent":"calls","entities":["main"]}`)
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Where is missing?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("query with Copilot planner: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Interpretation *query.QueryPlan      `json:"interpretation"`
+			Plan           query.QueryPlan       `json:"plan"`
+			Edges          []graph.Edge          `json:"edges"`
+			Evidence       []query.EvidenceGroup `json:"evidence"`
+			Limits         []query.StageLimit    `json:"limits"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode query result: %v\n%s", err, output)
+	}
+	if result.Result.Plan.Intent != query.IntentCalls {
+		t.Errorf("executed plan intent = %q, want %q", result.Result.Plan.Intent, query.IntentCalls)
+	}
+	if result.Result.Plan.Question != "Where is missing?" || result.Result.Interpretation == nil {
+		t.Errorf("executed plan = %+v, want the original question and interpretation", result.Result.Plan)
+	}
+	if len(result.Result.Edges) != 1 || result.Result.Edges[0].Relation != "typescript:calls" {
+		t.Errorf("executed evidence = %+v, want the planned calls relation", result.Result.Edges)
+	}
+	if len(result.Result.Evidence) == 0 || len(result.Result.Evidence[0].Nodes) == 0 || len(result.Result.Limits) == 0 {
+		t.Errorf("query result evidence = %+v, limits = %+v; want source-backed evidence and limits", result.Result.Evidence, result.Result.Limits)
+	}
+}
+
+func TestCopilotQueryOutputJSONSeparatesPlannerMetadataFromEvidence(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder":   `{"copilot":{"enabled":true}}`,
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+
+	const plannerResponse = `{"schemaVersion":1,"intent":"lookup","entities":["main"]}`
+	installCopilotPlanner(t, plannerResponse)
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Where is missing?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("query with Copilot planner: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Plan     *query.QueryPlan      `json:"plan"`
+			Evidence []query.EvidenceGroup `json:"evidence"`
+			Limits   []query.StageLimit    `json:"limits"`
+			Warnings []query.PlanWarning   `json:"warnings"`
+			Copilot  struct {
+				Available bool            `json:"available"`
+				Response  json.RawMessage `json:"response"`
+			} `json:"copilot"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode query result: %v\n%s", err, output)
+	}
+	if result.Result.Plan == nil || len(result.Result.Evidence) == 0 || len(result.Result.Limits) == 0 {
+		t.Errorf("deterministic result = %+v, want separate plan, evidence, and limits", result.Result)
+	}
+	if !result.Result.Copilot.Available {
+		t.Error("Copilot metadata available = false, want true")
+	}
+	if string(result.Result.Copilot.Response) != plannerResponse {
+		t.Errorf("Copilot response = %s, want %s", result.Result.Copilot.Response, plannerResponse)
+	}
+}
+
+func TestCopilotQueryOutputTextReportsPlannerAvailability(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder":   `{"copilot":{"enabled":true}}`,
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+	installCopilotPlanner(t, `{"schemaVersion":1,"intent":"lookup","entities":["main"]}`)
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, workspace.Root, "Where is missing?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("query with Copilot planner: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Copilot planner: available.") {
+		t.Errorf("Copilot text output = %q, want planner availability", output)
+	}
+}
+
+func TestCopilotFallbackOutputReturnsDeterministicEvidenceWhenPlannerFails(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".wayfinder":   `{"copilot":{"enabled":true}}`,
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+	installFailingCopilotPlanner(t)
+
+	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
+	if err != nil {
+		t.Fatalf("query with failed Copilot planner: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Plan     *query.QueryPlan    `json:"plan"`
+			Nodes    []graph.Node        `json:"nodes"`
+			Warnings []query.PlanWarning `json:"warnings"`
+			Copilot  struct {
+				Available         bool            `json:"available"`
+				UnavailableReason string          `json:"unavailableReason"`
+				Response          json.RawMessage `json:"response"`
+			} `json:"copilot"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode fallback result: %v\n%s", err, output)
+	}
+	if result.Result.Plan == nil || result.Result.Plan.Intent != query.IntentLookup || result.Result.Plan.Question != "Where is main?" {
+		t.Errorf("fallback result = %+v, want the deterministic query plan", result.Result)
+	}
+	if !hasWarningCode(result.Result.Warnings, "copilot_unavailable") {
+		t.Errorf("fallback warnings = %+v, want non-secret Copilot availability warning", result.Result.Warnings)
+	}
+	if result.Result.Copilot.Available || result.Result.Copilot.UnavailableReason == "" || len(result.Result.Copilot.Response) != 0 {
+		t.Errorf("fallback Copilot metadata = %+v, want unavailable state, reason, and no response", result.Result.Copilot)
+	}
+}
+
+func hasWarningCode(warnings []query.PlanWarning, code string) bool {
+	for _, warning := range warnings {
+		if warning.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func installCopilotPlanner(t *testing.T, response string) {
+	t.Helper()
+	plannerDirectory := t.TempDir()
+	plannerPath := filepath.Join(plannerDirectory, "copilot")
+	plannerScript := "#!/bin/sh\nprintf '%s\\n' '" + response + "'\n"
+	if err := os.WriteFile(plannerPath, []byte(plannerScript), 0o755); err != nil {
+		t.Fatalf("write Copilot planner: %v", err)
+	}
+	t.Setenv("PATH", plannerDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func installFailingCopilotPlanner(t *testing.T) {
+	t.Helper()
+	plannerDirectory := t.TempDir()
+	plannerPath := filepath.Join(plannerDirectory, "copilot")
+	if err := os.WriteFile(plannerPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write failing Copilot planner: %v", err)
+	}
+	t.Setenv("PATH", plannerDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func TestIndexerCommandHelpListsItsActions(t *testing.T) {
@@ -920,8 +1437,12 @@ func TestQueryCommandReportsLowConfidenceEmptyQuestionWithoutAnAnswerClaim(t *te
 	if err != nil {
 		t.Fatalf("run low-confidence text question: %v\n%s", err, textOutput)
 	}
-	if !strings.Contains(string(textOutput), "No answer-ready evidence was found.") || !strings.Contains(string(textOutput), "Next:") {
-		t.Errorf("low-confidence text = %q, want empty-result text and next command", textOutput)
+	text := string(textOutput)
+	if !strings.Contains(text, "No answer-ready evidence was found.") || !strings.Contains(text, "Next: Try a supported question such as: where is <entity>?") {
+		t.Errorf("low-confidence text = %q, want empty-result text and a supported next question", text)
+	}
+	if got := strings.Count(text, "Warning: The question grammar is not in the supported intent set."); got != 1 {
+		t.Errorf("unknown-intent warning count = %d, want 1 in %q", got, text)
 	}
 }
 
@@ -932,7 +1453,7 @@ func TestQueryResultDataIncludesImpactEvidence(t *testing.T) {
 		Relation: "calls",
 		Distance: 1,
 		Score:    1,
-	}}}, nil, 2, 100)
+	}}}, nil, 2, 100, copilotQueryMetadata{})
 
 	if len(result.Impact) != 1 || result.Impact[0].Node.ID != node.ID || result.Impact[0].Relation != "calls" || result.Impact[0].Distance != 1 || result.Impact[0].Score != 1 {
 		t.Errorf("impact result = %+v, want visible node, relation, distance, and score", result.Impact)

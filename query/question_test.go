@@ -39,6 +39,140 @@ func TestAnalyzeQuestionPlansSharedContractIntersection(t *testing.T) {
 	}
 }
 
+func TestAnalyzeQuestionPlansFolderRoleRetrieval(t *testing.T) {
+	plan := query.AnalyzeQuestion("where is the storage folder")
+
+	if plan.Intent != query.IntentLookup || len(plan.EntitySlots) != 1 {
+		t.Fatalf("plan = %+v, want one lookup entity slot", plan)
+	}
+	slot := plan.EntitySlots[0]
+	if slot.Role != "entity" || slot.EntityRole != "folder" || slot.Text != "storage" {
+		t.Errorf("slot = %+v, want storage folder entity", slot)
+	}
+	if got, want := slot.Retrieval, (query.RetrievalRequest{Text: "storage", TokenGroups: [][]string{{"storage"}}, Kinds: []graph.NodeKind{"file"}, Limit: 10}); !reflect.DeepEqual(got, want) {
+		t.Errorf("folder retrieval = %+v, want %+v", got, want)
+	}
+}
+
+func TestAnalyzeQuestionPlansPackageRoleRetrieval(t *testing.T) {
+	plan := query.AnalyzeQuestion("describe the query package")
+
+	if plan.Intent != query.IntentExplain || len(plan.EntitySlots) != 1 {
+		t.Fatalf("plan = %+v, want one explain entity slot", plan)
+	}
+	slot := plan.EntitySlots[0]
+	if slot.Role != "entity" || slot.EntityRole != "package" || slot.Text != "query" {
+		t.Errorf("slot = %+v, want query package entity", slot)
+	}
+	if got, want := slot.Retrieval.Kinds, []graph.NodeKind{"go:package"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("package kinds = %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeQuestionPlansFileRoleRetrieval(t *testing.T) {
+	plan := query.AnalyzeQuestion("where is the query.go file")
+
+	if plan.Intent != query.IntentLookup || len(plan.EntitySlots) != 1 {
+		t.Fatalf("plan = %+v, want one lookup entity slot", plan)
+	}
+	slot := plan.EntitySlots[0]
+	if slot.Role != "entity" || slot.EntityRole != "file" || slot.Text != "query.go" {
+		t.Errorf("slot = %+v, want query.go file entity", slot)
+	}
+	if got, want := slot.Retrieval.Kinds, []graph.NodeKind{"file"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("file kinds = %v, want %v", got, want)
+	}
+}
+
+func TestAnalyzeQuestionPlansClassRoleRetrieval(t *testing.T) {
+	plan := query.AnalyzeQuestion("explain the QueryPlan class")
+
+	if plan.Intent != query.IntentExplain || len(plan.EntitySlots) != 1 {
+		t.Fatalf("plan = %+v, want one explain entity slot", plan)
+	}
+	slot := plan.EntitySlots[0]
+	if slot.Role != "entity" || slot.EntityRole != "class" || slot.Text != "QueryPlan" {
+		t.Errorf("slot = %+v, want QueryPlan class entity", slot)
+	}
+	wantKinds := []graph.NodeKind{"typescript:class", "javascript:class", "go:type"}
+	if !reflect.DeepEqual(slot.Retrieval.Kinds, wantKinds) {
+		t.Errorf("class kinds = %v, want %v", slot.Retrieval.Kinds, wantKinds)
+	}
+}
+
+func TestAnalyzeQuestionPlansServiceRoleRetrieval(t *testing.T) {
+	plan := query.AnalyzeQuestion("explain the index service")
+
+	if plan.Intent != query.IntentExplain || len(plan.EntitySlots) != 1 {
+		t.Fatalf("plan = %+v, want one explain entity slot", plan)
+	}
+	slot := plan.EntitySlots[0]
+	if slot.Role != "entity" || slot.EntityRole != "service" || slot.Text != "index" {
+		t.Errorf("slot = %+v, want index service entity", slot)
+	}
+	wantKinds := []graph.NodeKind{"typescript:class", "javascript:class", "go:type"}
+	if !reflect.DeepEqual(slot.Retrieval.Kinds, wantKinds) {
+		t.Errorf("service kinds = %v, want %v", slot.Retrieval.Kinds, wantKinds)
+	}
+}
+
+func TestParseCopilotPlannerResponseProtocolAcceptsAllowlistedIntent(t *testing.T) {
+	plan, err := query.ParseCopilotPlannerResponse([]byte(`{
+		"schemaVersion": 1,
+		"intent": "shared_contract",
+		"entities": ["postgres", "sqlite"]
+	}`))
+	if err != nil {
+		t.Fatalf("parse planner response: %v", err)
+	}
+	if plan.Intent != query.IntentSharedContract || plan.Operator != query.OperatorIntersection || plan.Direction != storage.TraverseBoth {
+		t.Errorf("plan operation = {%q, %q, %q}, want shared-contract intersection in both directions", plan.Intent, plan.Operator, plan.Direction)
+	}
+	if len(plan.EntitySlots) != 2 || plan.EntitySlots[0].Text != "postgres" || plan.EntitySlots[1].Text != "sqlite" {
+		t.Errorf("entity slots = %+v, want postgres and sqlite", plan.EntitySlots)
+	}
+}
+
+func TestParseCopilotPlannerResponseProtocolDerivesCallsPlan(t *testing.T) {
+	plan, err := query.ParseCopilotPlannerResponse([]byte(`{
+		"schemaVersion": 1,
+		"intent": "calls",
+		"entities": ["runQuery"]
+	}`))
+	if err != nil {
+		t.Fatalf("parse planner response: %v", err)
+	}
+	if plan.Operator != query.OperatorNeighbors || plan.Direction != storage.TraverseOutgoing || !reflect.DeepEqual(plan.AllowedRelations, []graph.RelationKind{"calls"}) {
+		t.Errorf("plan = %+v, want an outgoing calls plan", plan)
+	}
+	if len(plan.EntitySlots) != 1 || plan.EntitySlots[0].Role != "caller" || plan.EntitySlots[0].Text != "runQuery" {
+		t.Errorf("entity slots = %+v, want runQuery as the caller", plan.EntitySlots)
+	}
+}
+
+func TestParseCopilotPlannerResponseProtocolRejectsUnsafeResponses(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "invalid JSON", response: `{`},
+		{name: "unknown field", response: `{"schemaVersion":1,"intent":"calls","entities":["runQuery"],"relations":["contains"]}`},
+		{name: "model limit", response: `{"schemaVersion":1,"intent":"calls","entities":["runQuery"],"maxNodes":10000}`},
+		{name: "unsupported version", response: `{"schemaVersion":2,"intent":"calls","entities":["runQuery"]}`},
+		{name: "unsupported intent", response: `{"schemaVersion":1,"intent":"delete","entities":["runQuery"]}`},
+		{name: "excess entities", response: `{"schemaVersion":1,"intent":"calls","entities":["one","two"]}`},
+		{name: "empty entity", response: `{"schemaVersion":1,"intent":"calls","entities":[""]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := query.ParseCopilotPlannerResponse([]byte(test.response)); err == nil {
+				t.Error("parse planner response succeeded, want an error")
+			}
+		})
+	}
+}
+
 func TestAnalyzeQuestionPlansIncomingImpactRelations(t *testing.T) {
 	plan := query.AnalyzeQuestion("what is affected if changed changes")
 
@@ -48,6 +182,65 @@ func TestAnalyzeQuestionPlansIncomingImpactRelations(t *testing.T) {
 	want := []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}
 	if !reflect.DeepEqual(plan.AllowedRelations, want) {
 		t.Errorf("impact relations = %v, want %v", plan.AllowedRelations, want)
+	}
+}
+
+func TestAnalyzeQuestionRecognizesImpactParaphrase(t *testing.T) {
+	const question = "what will break if storage changes"
+	plan := query.AnalyzeQuestion(question)
+	if !reflect.DeepEqual(plan, query.AnalyzeQuestion(question)) {
+		t.Fatal("repeated plans differ")
+	}
+
+	if plan.Intent != query.IntentImpact || plan.Operator != query.OperatorImpact || plan.Direction != storage.TraverseIncoming {
+		t.Errorf("plan operation = {%q, %q, %q}, want incoming impact", plan.Intent, plan.Operator, plan.Direction)
+	}
+	wantRelations := []graph.RelationKind{"references", "implements", "contains", "calls", "imports_from", "requires", "depends_on"}
+	if !reflect.DeepEqual(plan.AllowedRelations, wantRelations) {
+		t.Errorf("relations = %v, want %v", plan.AllowedRelations, wantRelations)
+	}
+	if len(plan.EntitySlots) != 1 || plan.EntitySlots[0].Role != "changed" || plan.EntitySlots[0].Text != "storage" {
+		t.Errorf("entity slots = %+v, want storage as the changed entity", plan.EntitySlots)
+	}
+}
+
+func TestAnalyzeQuestionRecognizesControlledParaphrases(t *testing.T) {
+	tests := []struct {
+		question  string
+		intent    query.Intent
+		operator  query.ExecutionOperator
+		direction storage.TraversalDirection
+		roles     []string
+		texts     []string
+		relations []graph.RelationKind
+	}{
+		{"which modules depend on storage", query.IntentDependents, query.OperatorNeighbors, storage.TraverseIncoming, []string{"dependency"}, []string{"storage"}, []graph.RelationKind{"imports_from", "requires", "depends_on"}},
+		{"which functions call runQuery", query.IntentCalledBy, query.OperatorNeighbors, storage.TraverseIncoming, []string{"callee"}, []string{"runQuery"}, []graph.RelationKind{"calls"}},
+		{"what do postgres and sqlite have in common", query.IntentSharedContract, query.OperatorIntersection, storage.TraverseBoth, []string{"left", "right"}, []string{"postgres", "sqlite"}, []graph.RelationKind{"implements", "contains"}},
+		{"how do I get from source to target", query.IntentPath, query.OperatorPath, storage.TraverseOutgoing, []string{"source", "target"}, []string{"source", "target"}, []graph.RelationKind{"calls"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.question, func(t *testing.T) {
+			plan := query.AnalyzeQuestion(test.question)
+			if !reflect.DeepEqual(plan, query.AnalyzeQuestion(test.question)) {
+				t.Fatal("repeated plans differ")
+			}
+			if plan.Intent != test.intent || plan.Operator != test.operator || plan.Direction != test.direction {
+				t.Errorf("plan operation = {%q, %q, %q}, want {%q, %q, %q}", plan.Intent, plan.Operator, plan.Direction, test.intent, test.operator, test.direction)
+			}
+			if !reflect.DeepEqual(plan.AllowedRelations, test.relations) {
+				t.Errorf("relations = %v, want %v", plan.AllowedRelations, test.relations)
+			}
+			if len(plan.EntitySlots) != len(test.roles) {
+				t.Fatalf("entity slots = %+v, want roles %v", plan.EntitySlots, test.roles)
+			}
+			for index, slot := range plan.EntitySlots {
+				if slot.Role != test.roles[index] || slot.Text != test.texts[index] {
+					t.Errorf("entity slot %d = {%q, %q}, want {%q, %q}", index, slot.Role, slot.Text, test.roles[index], test.texts[index])
+				}
+			}
+		})
 	}
 }
 

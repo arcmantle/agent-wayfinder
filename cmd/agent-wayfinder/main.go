@@ -147,6 +147,11 @@ func queryFlags(command *cobra.Command) {
 	command.Flags().Bool("question", false, "interpret one argument as an architecture question")
 	command.Flags().Bool("terms", false, "treat all arguments as literal lookup terms")
 	command.Flags().Bool("show-plan", false, "show the interpreted query plan in text output")
+	command.Flags().Bool("copilot", false, "enable Copilot query planning")
+	command.Flags().String("copilot-model", "", "Copilot model override")
+	command.Flags().Int("copilot-max-ai-credits", 0, "Copilot maximum AI credit override")
+	command.Flags().Int("copilot-token-budget", 0, "Copilot token budget override")
+	command.Flags().String("copilot-timeout", "", "Copilot timeout override")
 	command.Flags().Int("max-depth", 2, "maximum traversal depth")
 	command.Flags().Int("max-nodes", 100, "maximum traversed nodes")
 	command.Flags().StringArray("project", nil, "project scope ID")
@@ -1349,6 +1354,38 @@ func runQuery(command *cobra.Command, arguments []string, standardOutput, standa
 	if err != nil {
 		return writeCommandError(standardError, fmt.Errorf("resolve query workspace path: %w", err))
 	}
+	copilot, err := resolveCopilotConfiguration(command, workspaceRoot)
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	copilotMetadata := copilotQueryMetadata{copilotConfigurationReport: copilot}
+	var copilotWarning *query.PlanWarning
+	if questionMode && copilot.Enabled {
+		plannerConfiguration, err := copilot.plannerConfiguration()
+		if err != nil {
+			return writeCommandError(standardError, err)
+		}
+		response, err := runCopilotPlanner(context.Background(), plannerConfiguration, plan.Question, exec.CommandContext)
+		if err != nil {
+			warning := copilotFallbackWarning(err)
+			copilotWarning = &warning
+			copilotMetadata.UnavailableReason = warning.Message
+		} else if planned, err := query.ParseCopilotPlannerResponse(response); err != nil {
+			warning := copilotFallbackWarning(err)
+			copilotWarning = &warning
+			copilotMetadata.UnavailableReason = warning.Message
+		} else {
+			planned.Question = plan.Question
+			planned.MaxDepth = maxDepth
+			planned.MaxNodes = maxNodes
+			for index := range planned.EntitySlots {
+				planned.EntitySlots[index].Retrieval.ProjectIDs = append([]string(nil), projectIDs...)
+			}
+			plan = &planned
+			copilotMetadata.Available = true
+			copilotMetadata.Response = append(json.RawMessage(nil), response...)
+		}
+	}
 	database, err := commandDatabasePath(command, workspaceRoot)
 	if err != nil {
 		return writeCommandError(standardError, fmt.Errorf("resolve query database path: %w", err))
@@ -1377,7 +1414,10 @@ func runQuery(command *cobra.Command, arguments []string, standardOutput, standa
 	if err != nil {
 		return writeCommandError(standardError, cli.NewInvalidArgumentError(err.Error()))
 	}
-	data := queryResultData(result, plan, maxDepth, maxNodes)
+	if copilotWarning != nil {
+		result.Warnings = append(result.Warnings, *copilotWarning)
+	}
+	data := queryResultData(result, plan, maxDepth, maxNodes, copilotMetadata)
 	if err := cli.Render(standardOutput, cli.Result{
 		Snapshot: snapshot,
 		Text:     renderQueryText(data, showPlan),
@@ -1387,6 +1427,20 @@ func runQuery(command *cobra.Command, arguments []string, standardOutput, standa
 	}
 	return 0
 }
+
+func copilotFallbackWarning(err error) query.PlanWarning {
+	message := "Copilot planner is unavailable. Used deterministic query results."
+	switch {
+	case errors.Is(err, errCopilotPlannerTimeout):
+		message = "Copilot planner timed out. Used deterministic query results."
+	case errors.Is(err, errCopilotPromptBudgetExceeded), errors.Is(err, errCopilotResponseBudgetExceeded):
+		message = "Copilot planner exceeded its token budget. Used deterministic query results."
+	case strings.HasPrefix(err.Error(), "parse Copilot planner response:"):
+		message = "Copilot planner returned an invalid response. Used deterministic query results."
+	}
+	return query.PlanWarning{Code: "copilot_unavailable", Message: message}
+}
+
 func runExplain(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
 	if len(arguments) != 2 {
 		return writeCommandError(standardError, cli.NewInvalidArgumentError("explain requires one workspace path and one node query"))
@@ -1529,11 +1583,19 @@ type queryResult struct {
 	Suggestions       []string                   `json:"suggestions,omitempty"`
 	TruncationReasons []storage.TruncationReason `json:"truncationReasons,omitempty"`
 	ScopeBoundary     *query.ScopeBoundary       `json:"scopeBoundary,omitempty"`
+	Copilot           copilotQueryMetadata       `json:"copilot"`
 	MaxDepth          int                        `json:"maxDepth"`
 	MaxNodes          int                        `json:"maxNodes"`
 }
 
-func queryResultData(result query.Result, plan *query.QueryPlan, maxDepth, maxNodes int) queryResult {
+type copilotQueryMetadata struct {
+	copilotConfigurationReport
+	Available         bool            `json:"available"`
+	UnavailableReason string          `json:"unavailableReason,omitempty"`
+	Response          json.RawMessage `json:"response,omitempty"`
+}
+
+func queryResultData(result query.Result, plan *query.QueryPlan, maxDepth, maxNodes int, copilot copilotQueryMetadata) queryResult {
 	data := queryResult{
 		Plan:              plan,
 		Seeds:             result.Seeds,
@@ -1545,6 +1607,7 @@ func queryResultData(result query.Result, plan *query.QueryPlan, maxDepth, maxNo
 		Warnings:          result.Warnings,
 		TruncationReasons: result.TruncationReasons,
 		ScopeBoundary:     result.ScopeBoundary,
+		Copilot:           copilot,
 		MaxDepth:          maxDepth,
 		MaxNodes:          maxNodes,
 	}
@@ -1563,8 +1626,18 @@ func renderQueryText(result queryResult, showPlan bool) string {
 	if result.Plan != nil && (showPlan || len(result.Plan.Warnings) > 0) {
 		lines = append(lines, fmt.Sprintf("Interpreted as: %s (%s, confidence %.2f)", result.Plan.Intent, result.Plan.Operator, result.Plan.Confidence))
 		for _, warning := range result.Plan.Warnings {
+			if resultWarningPresent(result.Warnings, warning) {
+				continue
+			}
 			lines = append(lines, "Warning: "+warning.Message)
 		}
+	}
+	if result.Copilot.Enabled {
+		availability := "unavailable"
+		if result.Copilot.Available {
+			availability = "available"
+		}
+		lines = append(lines, "Copilot planner: "+availability+".")
 	}
 	for _, warning := range result.Warnings {
 		lines = append(lines, "Warning: "+warning.Message)
@@ -1600,6 +1673,15 @@ func renderQueryText(result queryResult, showPlan bool) string {
 		lines = append(lines, "Scope boundary: "+result.ScopeBoundary.Node.QualifiedName)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func resultWarningPresent(warnings []query.PlanWarning, target query.PlanWarning) bool {
+	for _, warning := range warnings {
+		if warning.Code == target.Code && warning.Message == target.Message {
+			return true
+		}
+	}
+	return false
 }
 
 func isQuestionArgument(terms []string) bool {

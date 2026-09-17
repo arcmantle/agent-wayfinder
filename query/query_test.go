@@ -12,6 +12,89 @@ import (
 	"agent-wayfinder/storage"
 )
 
+func TestQuerySnapshotReturnsUnknownIntentGuidanceWithCandidates(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	candidate := graph.Node{ID: "type:query-snapshot", Kind: "go:type", Label: "QuerySnapshot"}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(context.Context, storage.Snapshot, storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			return nil, nil
+		}),
+		exact: func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error) { return nil, nil },
+	}
+	searcher := lexicalSearcherFunc(func(context.Context, storage.Snapshot, storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+		return []storage.LexicalMatch{{Node: candidate, Score: 1}}, nil
+	})
+	traverser := traverserFunc(func(context.Context, storage.Snapshot, storage.TraversalRequest) (storage.TraversalResult, error) {
+		t.Fatal("unknown intent traversed the graph")
+		return storage.TraversalResult{}, nil
+	})
+	plan := query.AnalyzeQuestion("compare QuerySnapshot with storage")
+
+	result, err := query.QuerySnapshot(context.Background(), struct {
+		exactNodeLookup
+		lexicalSearcherFunc
+	}{exactNodeLookup: lookup, lexicalSearcherFunc: searcher}, traverser, snapshot, query.Request{
+		Plan:     &plan,
+		MaxDepth: plan.MaxDepth,
+		MaxNodes: plan.MaxNodes,
+	})
+	if err != nil {
+		t.Fatalf("execute unknown question: %v", err)
+	}
+	if got, want := nodeIDs(result.Seeds[0].Nodes), []string{candidate.ID}; !reflect.DeepEqual(got, want) {
+		t.Errorf("candidate IDs = %v, want %v", got, want)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0].Code != "unknown_intent" {
+		t.Fatalf("warnings = %+v, want unknown_intent guidance", result.Warnings)
+	}
+	if got, want := result.Warnings[0].Suggestions, []string{
+		"Use --terms with the normalized terms for literal lookup.",
+		"Try a supported question such as: where is <entity>?",
+		"Try a supported question such as: who calls <entity>?",
+	}; !reflect.DeepEqual(got, want) {
+		t.Errorf("suggestions = %v, want %v", got, want)
+	}
+}
+
+func TestQuerySnapshotReturnsUnknownIntentGuidanceWithoutCandidates(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(context.Context, storage.Snapshot, storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			return nil, nil
+		}),
+		exact: func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error) { return nil, nil },
+	}
+	searcher := lexicalSearcherFunc(func(context.Context, storage.Snapshot, storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+		return nil, nil
+	})
+	traverser := traverserFunc(func(context.Context, storage.Snapshot, storage.TraversalRequest) (storage.TraversalResult, error) {
+		t.Fatal("unknown intent traversed the graph")
+		return storage.TraversalResult{}, nil
+	})
+	plan := query.AnalyzeQuestion("compare missing topics")
+
+	result, err := query.QuerySnapshot(context.Background(), struct {
+		exactNodeLookup
+		lexicalSearcherFunc
+	}{exactNodeLookup: lookup, lexicalSearcherFunc: searcher}, traverser, snapshot, query.Request{
+		Plan:     &plan,
+		MaxDepth: plan.MaxDepth,
+		MaxNodes: plan.MaxNodes,
+	})
+	if err != nil {
+		t.Fatalf("execute unknown question: %v", err)
+	}
+	if len(result.Seeds) != 1 || len(result.Seeds[0].Nodes) != 0 || len(result.Evidence) != 0 {
+		t.Fatalf("result = %+v, want no candidate evidence", result)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0].Code != "unknown_intent" {
+		t.Fatalf("warnings = %+v, want unknown_intent guidance", result.Warnings)
+	}
+	if !slices.Contains(result.Warnings[0].Suggestions, "Try a supported question such as: where is <entity>?") {
+		t.Errorf("suggestions = %v, want a supported question template", result.Warnings[0].Suggestions)
+	}
+}
+
 func TestQuerySnapshotReportsExternalProjectScopeBoundary(t *testing.T) {
 	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
 	main := graph.Node{ID: "function:main", Label: "main", QualifiedName: "apps/app/src/main.ts::main"}
@@ -1459,7 +1542,7 @@ func TestQuerySnapshotReportsAbsentExplainEntityWithoutTraversal(t *testing.T) {
 
 func TestQuerySnapshotReportsWeakExplainCandidateWithoutTraversal(t *testing.T) {
 	weak := graph.Node{ID: "function:possible", Kind: "function", Label: "helperMaybe", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "query/helper.go"}}}
-	result := executeExplainPlanWithMatches(t, "explain helper service", []storage.LexicalMatch{{Node: weak, Score: 1}}, nil)
+	result := executeExplainPlanWithMatches(t, "explain helper component", []storage.LexicalMatch{{Node: weak, Score: 1}}, nil)
 	if got, want := nodeIDs(result.Seeds[0].Nodes), []string{weak.ID}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("candidate IDs = %v, want %v", got, want)
 	}

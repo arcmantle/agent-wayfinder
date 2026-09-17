@@ -164,6 +164,33 @@ question mode or `--show-plan` to show the plan in text output. Low-confidence
 and weak results include candidates and follow-up commands instead of an answer
 claim.
 
+### Copilot Configuration
+
+Copilot settings are non-secret. The query command reads them from a workspace
+root `.wayfinder` JSON file and from environment variables. A later CLI slice
+adds the flags and enables Copilot planning.
+
+```json
+{
+  "copilot": {
+    "enabled": true,
+    "model": "auto",
+    "maxAiCredits": 1,
+    "tokenBudget": 4096,
+    "timeout": "30s"
+  }
+}
+```
+
+Use `WAYFINDER_COPILOT_ENABLED`, `WAYFINDER_COPILOT_MODEL`,
+`WAYFINDER_COPILOT_MAX_AI_CREDITS`, `WAYFINDER_COPILOT_TOKEN_BUDGET`, and
+`WAYFINDER_COPILOT_TIMEOUT` to override file settings. Defaults are `false`,
+`auto`, `1`, `4096`, and `30s`. Timeout accepts a Go duration or integer
+seconds. Credit and token values must be positive integers. Timeout must be
+greater than zero and no more than 30 seconds. Unknown settings inside
+`copilot` and invalid values return an error. Unrelated top-level `.wayfinder`
+settings remain valid.
+
 Pass separate terms for legacy literal lookup. Use `--terms` when one literal
 term contains spaces or punctuation:
 
@@ -248,5 +275,5 @@ This command runs the storage conformance, extraction, indexing, query, path, ex
 The ClientFlex acceptance test is opt-in because the corpus is private and external. It uses a temporary SQLite database and does not write graph artifacts to the corpus.
 
 ```bash
-AGENT_WAYFINDER_CLIENTFLEX_ROOT=/path/to/ClientFlex CGO_ENABLED=1 go test ./acceptance -run '^TestClientFlexAcceptanceIndexesIntoTemporaryDatabase$' -v
+AGENT_WAYFINDER_CLIENTFLEX_ROOT=/path/to/ClientFlex CGO_ENABLED=1 go test -tags sqlite_fts5 ./acceptance -run '^TestClientFlexAcceptanceIndexesIntoTemporaryDatabase$' -v
 ```

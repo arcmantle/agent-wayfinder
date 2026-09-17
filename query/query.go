@@ -89,7 +89,7 @@ func QuerySnapshot(ctx context.Context, lookup storage.NodeLookup, traverser sto
 		}
 		seedRequests := make([]SeedRequest, len(request.Plan.EntitySlots))
 		for index, slot := range request.Plan.EntitySlots {
-			seedRequests[index] = SeedRequest{Role: slot.Role, Retrieval: slot.Retrieval}
+			seedRequests[index] = SeedRequest{Role: slot.Role, EntityRole: slot.EntityRole, Retrieval: slot.Retrieval}
 		}
 		seeds, err = RankSeedRequestsSnapshot(ctx, lookup, searcher, snapshot, seedRequests)
 	} else if len(request.SeedRequests) > 0 {
@@ -113,6 +113,9 @@ func QuerySnapshot(ctx context.Context, lookup storage.NodeLookup, traverser sto
 	if request.Plan != nil {
 		warnings := emptyEntitySlotWarnings(request.Plan, seeds)
 		if len(warnings) > 0 {
+			if request.Plan.Intent == IntentUnknown {
+				warnings = unknownIntentWarnings(request.Plan.Warnings)
+			}
 			return Result{
 				Seeds:    seeds,
 				Evidence: retrievalEvidence(request.Plan, seeds),
@@ -122,6 +125,14 @@ func QuerySnapshot(ctx context.Context, lookup storage.NodeLookup, traverser sto
 		}
 	}
 	if request.Plan != nil && (request.Plan.Operator == OperatorLookup || request.Plan.Operator == OperatorExplain) {
+		if request.Plan.Intent == IntentUnknown {
+			return Result{
+				Seeds:    seeds,
+				Evidence: retrievalEvidence(request.Plan, seeds),
+				Limits:   retrievalLimits(request.Plan),
+				Warnings: unknownIntentWarnings(request.Plan.Warnings),
+			}, nil
+		}
 		warning := entityResolutionWarning(request.Plan.Operator, seeds)
 		if request.Plan.Operator == OperatorLookup || warning != nil {
 			result := Result{Seeds: seeds, Evidence: retrievalEvidence(request.Plan, seeds), Limits: retrievalLimits(request.Plan)}
@@ -211,6 +222,20 @@ func QuerySnapshot(ctx context.Context, lookup storage.NodeLookup, traverser sto
 		result.Impact = rankImpactEvidence(traversal.Facts, startNodeIDs)
 	}
 	return result, nil
+}
+
+func unknownIntentWarnings(warnings []PlanWarning) []PlanWarning {
+	result := append([]PlanWarning(nil), warnings...)
+	for index := range result {
+		if result[index].Code != "unknown_intent" {
+			continue
+		}
+		result[index].Suggestions = append(result[index].Suggestions,
+			"Try a supported question such as: where is <entity>?",
+			"Try a supported question such as: who calls <entity>?",
+		)
+	}
+	return result
 }
 
 func retrievalEvidence(plan *QueryPlan, seeds []SeedSet) []EvidenceGroup {
