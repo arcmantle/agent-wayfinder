@@ -169,6 +169,7 @@ func (worker *Worker) Extract(source extractor.Source) (extractor.Contribution, 
 		SourcePath:           source.SourcePath,
 		Metadata:             New().Metadata(),
 		Facts:                facts,
+		CatalogUnits:         extractor.CatalogUnitsForSource(source, facts),
 		UnresolvedReferences: analysis.moduleReferences,
 		SymbolReferences:     symbolReferences,
 		ExportedSurfaces:     exportedSurfaces,
@@ -744,7 +745,7 @@ func declarationKind(kind string) (graph.NodeKind, bool) {
 		return ClassNodeKind, true
 	case "function_declaration":
 		return FunctionNodeKind, true
-	case "method_definition":
+	case "method_definition", "method_signature":
 		return MethodNodeKind, true
 	case "interface_declaration":
 		return InterfaceNodeKind, true

@@ -29,6 +29,7 @@ const (
 	IntentSharedContract       Intent = "shared_contract"
 	IntentImpact               Intent = "impact"
 	IntentDependencyComparison Intent = "dependency_comparison"
+	IntentCapability           Intent = "capability"
 )
 
 type ExecutionOperator string
@@ -77,10 +78,17 @@ type QueryPlan struct {
 	Warnings         []PlanWarning              `json:"warnings"`
 }
 
-type copilotPlannerResponse struct {
+type plannerResponse struct {
 	SchemaVersion int      `json:"schemaVersion"`
 	Intent        Intent   `json:"intent"`
 	Entities      []string `json:"entities"`
+}
+
+type copilotPlannerResponse = plannerResponse
+
+type localPlannerResponse struct {
+	plannerResponse
+	Confidence string `json:"confidence"`
 }
 
 type copilotPlannerIntent struct {
@@ -106,28 +114,60 @@ var copilotPlannerIntents = map[Intent]copilotPlannerIntent{
 
 // ParseCopilotPlannerResponse validates a bounded Copilot planner response.
 func ParseCopilotPlannerResponse(response []byte) (QueryPlan, error) {
+	var plannerResponse copilotPlannerResponse
+	if err := decodePlannerResponse("Copilot", response, &plannerResponse); err != nil {
+		return QueryPlan{}, err
+	}
+	return validatePlannerResponse("Copilot", plannerResponse)
+}
+
+// ParseLocalPlannerResponse validates a bounded local planner response.
+func ParseLocalPlannerResponse(response []byte) (QueryPlan, error) {
+	var responseSchema localPlannerResponse
+	if err := decodePlannerResponse("local", response, &responseSchema); err != nil {
+		return QueryPlan{}, err
+	}
+	if responseSchema.Confidence != "high" {
+		return QueryPlan{}, fmt.Errorf("parse local planner response: confidence must be high")
+	}
+	return validatePlannerResponse("local", responseSchema.plannerResponse)
+}
+
+// ParseClaudePlannerResponse validates a bounded Claude planner response.
+func ParseClaudePlannerResponse(response []byte) (QueryPlan, error) {
+	var plannerResponse plannerResponse
+	if err := decodePlannerResponse("Claude", response, &plannerResponse); err != nil {
+		return QueryPlan{}, err
+	}
+	return validatePlannerResponse("Claude", plannerResponse)
+}
+
+func decodePlannerResponse(planner string, response []byte, target any) error {
 	decoder := json.NewDecoder(strings.NewReader(string(response)))
 	decoder.DisallowUnknownFields()
-	var plannerResponse copilotPlannerResponse
-	if err := decoder.Decode(&plannerResponse); err != nil {
-		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: %w", err)
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("parse %s planner response: %w", planner, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: multiple JSON values")
+		return fmt.Errorf("parse %s planner response: multiple JSON values", planner)
 	}
+	return nil
+}
+
+func validatePlannerResponse(planner string, plannerResponse plannerResponse) (QueryPlan, error) {
 	if plannerResponse.SchemaVersion != QueryPlanSchemaVersion {
-		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: unsupported schema version %d", plannerResponse.SchemaVersion)
+		return QueryPlan{}, fmt.Errorf("parse %s planner response: unsupported schema version %d", planner, plannerResponse.SchemaVersion)
 	}
 	intent, found := copilotPlannerIntents[plannerResponse.Intent]
 	if !found {
-		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: unsupported intent %q", plannerResponse.Intent)
+		return QueryPlan{}, fmt.Errorf("parse %s planner response: unsupported intent %q", planner, plannerResponse.Intent)
 	}
 	if len(plannerResponse.Entities) != len(intent.roles) {
-		return QueryPlan{}, fmt.Errorf("parse Copilot planner response: intent %q requires %d entities", plannerResponse.Intent, len(intent.roles))
+		return QueryPlan{}, fmt.Errorf("parse %s planner response: intent %q requires %d entities", planner, plannerResponse.Intent, len(intent.roles))
 	}
 	for _, entity := range plannerResponse.Entities {
 		if cleanEntityText(entity) == "" {
-			return QueryPlan{}, fmt.Errorf("parse Copilot planner response: entity text is required")
+			return QueryPlan{}, fmt.Errorf("parse %s planner response: entity text is required", planner)
 		}
 	}
 	return copilotQueryPlan(plannerResponse.Intent, intent, plannerResponse.Entities), nil
@@ -222,6 +262,8 @@ var classExplainPattern = regexp.MustCompile(`(?i)^explain (?:the )?(.+?) class$
 
 var serviceExplainPattern = regexp.MustCompile(`(?i)^explain (?:the )?(.+?) service$`)
 
+var capabilityQuestionPattern = regexp.MustCompile(`(?i)^(?:does|can) (?:this |the )?workspace\b.+$`)
+
 func rule(pattern string, intent Intent, operator ExecutionOperator, direction storage.TraversalDirection, roles []string, captureIndexes []int, relations []graph.RelationKind) questionRule {
 	if captureIndexes == nil {
 		captureIndexes = make([]int, len(roles))
@@ -295,6 +337,11 @@ func AnalyzeQuestion(question string) QueryPlan {
 		plan.Confidence = 1
 		plan.Operator = OperatorExplain
 		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "service", cleanEntityText(matches[1]))}
+		return plan
+	}
+	if capabilityQuestionPattern.MatchString(normalizedQuestion) {
+		plan.Intent = IntentCapability
+		plan.Confidence = 1
 		return plan
 	}
 	if matches := matchArchitecturalMoveComparison(normalizedQuestion); matches != nil {

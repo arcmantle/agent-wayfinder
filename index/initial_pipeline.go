@@ -58,6 +58,7 @@ type contributionExtractionSummary struct {
 	totalNodes       int
 	totalEdges       int
 	projectNodes     map[string]struct{}
+	contributions    map[int]extractor.Contribution
 }
 
 type pipelineInterval struct {
@@ -251,7 +252,7 @@ func (pipeline *InitialIndexPipeline) closeExtractionResults(run *contributionEx
 }
 
 func (pipeline *InitialIndexPipeline) consumeContributions(ctx context.Context, session storage.ContributionSession, run *contributionExtractionRun, progress func(int)) (contributionExtractionSummary, time.Duration, error) {
-	summary := contributionExtractionSummary{projectNodes: make(map[string]struct{})}
+	summary := contributionExtractionSummary{projectNodes: make(map[string]struct{}), contributions: make(map[int]extractor.Contribution)}
 	var writeDuration time.Duration
 	var workerInitializationError error
 	var extractionError *contributionExtractionResult
@@ -286,6 +287,7 @@ func (pipeline *InitialIndexPipeline) consumeContributions(ctx context.Context, 
 		writeEnded := time.Now()
 		writeDuration += writeEnded.Sub(writeStarted)
 		pipeline.metrics.writeIntervals = append(pipeline.metrics.writeIntervals, pipelineInterval{started: writeStarted, ended: writeEnded})
+		summary.contributions[result.index] = result.source.contribution
 		summary.completedSources++
 		facts := result.source.contribution.Facts()
 		for _, node := range facts.Nodes {
@@ -363,6 +365,19 @@ func (pipeline *InitialIndexPipeline) Run(ctx context.Context) (Result, error) {
 	pipeline.metrics.pipelineWall = time.Since(pipelineStarted)
 	pipeline.reportMetrics()
 	return result, nil
+}
+
+func (summary contributionExtractionSummary) orderedContributions() []extractor.Contribution {
+	indexes := make([]int, 0, len(summary.contributions))
+	for sourceIndex := range summary.contributions {
+		indexes = append(indexes, sourceIndex)
+	}
+	sort.Ints(indexes)
+	contributions := make([]extractor.Contribution, 0, len(indexes))
+	for _, sourceIndex := range indexes {
+		contributions = append(contributions, summary.contributions[sourceIndex])
+	}
+	return contributions
 }
 
 func (pipeline *InitialIndexPipeline) resolve(ctx context.Context, session storage.ContributionSession, completedSources int) (storage.FactCounts, []extractor.Diagnostic, time.Duration, error) {

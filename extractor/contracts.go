@@ -125,11 +125,23 @@ type ContributionInput struct {
 	SourcePath           string
 	Metadata             Metadata
 	Facts                graph.Facts
+	CatalogUnits         []CatalogUnit
 	UnresolvedReferences []UnresolvedReference
 	SymbolReferences     []SymbolReference
 	ExportedSurfaces     []ExportedSurface
 	Dependencies         []Dependency
 	Diagnostics          []Diagnostic
+}
+
+type CatalogUnit struct {
+	NodeID            string
+	Name              string
+	Kind              graph.NodeKind
+	Owner             string
+	Signature         string
+	DeclarationSource string
+	Comments          []string
+	IdentifierTokens  []string
 }
 
 type ModuleReferenceKind string
@@ -189,6 +201,7 @@ type Contribution struct {
 	sourcePath           string
 	metadata             Metadata
 	facts                graph.Facts
+	catalogUnits         []CatalogUnit
 	unresolvedReferences []UnresolvedReference
 	symbolReferences     []SymbolReference
 	exportedSurfaces     []ExportedSurface
@@ -225,6 +238,19 @@ func NewContribution(vocabulary graph.Vocabulary, input ContributionInput) (Cont
 	nodeIDs := make(map[string]struct{}, len(input.Facts.Nodes))
 	for _, node := range input.Facts.Nodes {
 		nodeIDs[node.ID] = struct{}{}
+	}
+	for _, unit := range input.CatalogUnits {
+		if unit.NodeID == "" || unit.Name == "" || unit.Kind == "" || unit.Signature == "" {
+			return Contribution{}, fmt.Errorf("catalog unit is incomplete")
+		}
+		if _, ok := nodeIDs[unit.NodeID]; !ok {
+			return Contribution{}, fmt.Errorf("catalog unit node %q is not a local node", unit.NodeID)
+		}
+		for _, token := range unit.IdentifierTokens {
+			if token == "" {
+				return Contribution{}, fmt.Errorf("catalog unit identifier token is empty")
+			}
+		}
 	}
 	for _, reference := range input.UnresolvedReferences {
 		if reference.SourceID == "" || reference.Target == "" || reference.Kind == "" {
@@ -280,6 +306,7 @@ func NewContribution(vocabulary graph.Vocabulary, input ContributionInput) (Cont
 		sourcePath:           input.SourcePath,
 		metadata:             copyMetadata(input.Metadata),
 		facts:                copyFacts(input.Facts),
+		catalogUnits:         copyCatalogUnits(input.CatalogUnits),
 		unresolvedReferences: copyUnresolvedReferences(input.UnresolvedReferences),
 		symbolReferences:     append([]SymbolReference(nil), input.SymbolReferences...),
 		exportedSurfaces:     append([]ExportedSurface(nil), input.ExportedSurfaces...),
@@ -302,6 +329,10 @@ func (contribution Contribution) Metadata() Metadata {
 
 func (contribution Contribution) Facts() graph.Facts {
 	return copyFacts(contribution.facts)
+}
+
+func (contribution Contribution) CatalogUnits() []CatalogUnit {
+	return copyCatalogUnits(contribution.catalogUnits)
 }
 
 func (contribution Contribution) UnresolvedReferences() []UnresolvedReference {
@@ -344,6 +375,16 @@ func copyFacts(facts graph.Facts) graph.Facts {
 		Nodes: append([]graph.Node(nil), facts.Nodes...),
 		Edges: append([]graph.Edge(nil), facts.Edges...),
 	}
+}
+
+func copyCatalogUnits(units []CatalogUnit) []CatalogUnit {
+	copied := make([]CatalogUnit, len(units))
+	for index, unit := range units {
+		copied[index] = unit
+		copied[index].Comments = append([]string(nil), unit.Comments...)
+		copied[index].IdentifierTokens = append([]string(nil), unit.IdentifierTokens...)
+	}
+	return copied
 }
 
 func copyUnresolvedReferences(references []UnresolvedReference) []UnresolvedReference {

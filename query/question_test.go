@@ -116,6 +116,14 @@ func TestAnalyzeQuestionPlansServiceRoleRetrieval(t *testing.T) {
 	}
 }
 
+func TestAnalyzeQuestionPlansWorkspaceCapability(t *testing.T) {
+	plan := query.AnalyzeQuestion("Does this workspace validate access tokens?")
+
+	if plan.Intent != query.IntentCapability || plan.Confidence != 1 || len(plan.EntitySlots) != 0 {
+		t.Errorf("capability plan = %+v, want a confident catalog-only capability plan", plan)
+	}
+}
+
 func TestParseCopilotPlannerResponseProtocolAcceptsAllowlistedIntent(t *testing.T) {
 	plan, err := query.ParseCopilotPlannerResponse([]byte(`{
 		"schemaVersion": 1,
@@ -147,6 +155,36 @@ func TestParseCopilotPlannerResponseProtocolDerivesCallsPlan(t *testing.T) {
 	}
 	if len(plan.EntitySlots) != 1 || plan.EntitySlots[0].Role != "caller" || plan.EntitySlots[0].Text != "runQuery" {
 		t.Errorf("entity slots = %+v, want runQuery as the caller", plan.EntitySlots)
+	}
+}
+
+func TestParseLocalPlannerResponseDerivesTrustedCallsPlan(t *testing.T) {
+	plan, err := query.ParseLocalPlannerResponse([]byte(`{
+		"schemaVersion": 1,
+		"intent": "calls",
+		"entities": ["runQuery"],
+		"confidence": "high"
+	}`))
+	if err != nil {
+		t.Fatalf("parse local planner response: %v", err)
+	}
+	if plan.Operator != query.OperatorNeighbors || plan.Direction != storage.TraverseOutgoing || !reflect.DeepEqual(plan.AllowedRelations, []graph.RelationKind{"calls"}) {
+		t.Errorf("plan = %+v, want a trusted outgoing calls plan", plan)
+	}
+	if plan.MaxDepth != 2 || plan.MaxNodes != 100 {
+		t.Errorf("plan limits = {%d, %d}, want {2, 100}", plan.MaxDepth, plan.MaxNodes)
+	}
+}
+
+func TestParseLocalPlannerResponseRejectsLowConfidence(t *testing.T) {
+	_, err := query.ParseLocalPlannerResponse([]byte(`{
+		"schemaVersion": 1,
+		"intent": "calls",
+		"entities": ["runQuery"],
+		"confidence": "low"
+	}`))
+	if err == nil {
+		t.Error("parse local planner response succeeded, want low-confidence rejection")
 	}
 }
 

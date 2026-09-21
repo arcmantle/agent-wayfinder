@@ -1,10 +1,24 @@
 package testkit
 
 import (
+	"errors"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func graphifyCommandOutput(command *exec.Cmd) ([]byte, error) {
+	output, err := command.Output()
+	if err == nil {
+		return output, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) && len(exitError.Stderr) > 0 {
+		return output, fmt.Errorf("%w\n%s", err, exitError.Stderr)
+	}
+	return output, err
+}
 
 func TestRunGraphifyComparisonCorpusComparesCLIAndExportedFacts(t *testing.T) {
 	workspace := NewWorkspace(t, map[string]string{
@@ -14,13 +28,13 @@ func TestRunGraphifyComparisonCorpusComparesCLIAndExportedFacts(t *testing.T) {
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
 
-	command := exec.Command("go", "run", "-tags", "sqlite_fts5", "../cmd/agent-wayfinder", "index", "--database", database, "--format", "json", workspace.Root)
-	if output, err := command.CombinedOutput(); err != nil {
+	command := exec.Command("go", "run", "../cmd/agent-wayfinder", "index", "--catalog-background=false", "--database", database, "--format", "json", workspace.Root)
+	if output, err := graphifyCommandOutput(command); err != nil {
 		t.Fatalf("index comparison corpus workspace: %v\n%s", err, output)
 	}
 
-	command = exec.Command("go", "run", "-tags", "sqlite_fts5", "../cmd/agent-wayfinder", "export", "--database", database, "--format", "json", workspace.Root)
-	candidate, err := command.CombinedOutput()
+	command = exec.Command("go", "run", "../cmd/agent-wayfinder", "export", "--database", database, "--format", "json", workspace.Root)
+	candidate, err := graphifyCommandOutput(command)
 	if err != nil {
 		t.Fatalf("export comparison corpus workspace: %v\n%s", err, candidate)
 	}
@@ -37,12 +51,11 @@ func TestRunGraphifyComparisonCorpusComparesIndexDiagnostics(t *testing.T) {
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
 
-	command := exec.Command("go", "run", "-tags", "sqlite_fts5", "../cmd/agent-wayfinder", "index", "--database", database, "--format", "json", workspace.Root)
-	candidate, err := command.CombinedOutput()
+	command := exec.Command("go", "run", "../cmd/agent-wayfinder", "index", "--catalog-background=false", "--database", database, "--format", "json", workspace.Root)
+	candidate, err := graphifyCommandOutput(command)
 	if err != nil {
 		t.Fatalf("index diagnostic comparison corpus workspace: %v\n%s", err, candidate)
 	}
-
 	if err := RunGraphifyIndexComparisonCorpus("typescript-diagnostic", candidate); err != nil {
 		t.Fatal(err)
 	}

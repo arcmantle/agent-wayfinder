@@ -1,4 +1,4 @@
-package main
+package mcp
 
 import (
 	"context"
@@ -7,6 +7,13 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"agent-wayfinder/cli"
+	"agent-wayfinder/cmd/agent-wayfinder/explain"
+	"agent-wayfinder/cmd/agent-wayfinder/export"
+	cmd "agent-wayfinder/cmd/agent-wayfinder/internal/command"
+	"agent-wayfinder/cmd/agent-wayfinder/path"
+	"agent-wayfinder/cmd/agent-wayfinder/query"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -17,14 +24,45 @@ const mcpServerVersion = "0.1.0"
 
 type mcpCommandRunner func([]string, io.Writer, io.Writer) int
 
-func runMCP(_ *cobra.Command, arguments []string, _ io.Writer, standardError io.Writer) int {
+func New(standardOutput, standardError io.Writer, exitCode *int) *cobra.Command {
+	return cmd.NewLeaf("mcp", "Run the Model Context Protocol server", func(*cobra.Command) {}, runServer, standardOutput, standardError, exitCode)
+}
+
+func runServer(_ *cobra.Command, arguments []string, _ io.Writer, standardError io.Writer) int {
 	if len(arguments) != 0 {
-		return writeCommandError(standardError, fmt.Errorf("mcp does not accept arguments"))
+		return cmd.WriteError(standardError, fmt.Errorf("mcp does not accept arguments"))
 	}
-	if err := server.ServeStdio(newMCPServer(run)); err != nil {
-		return writeCommandError(standardError, fmt.Errorf("serve MCP over stdio: %w", err))
+	if err := server.ServeStdio(newMCPServer(runCommand)); err != nil {
+		return cmd.WriteError(standardError, fmt.Errorf("serve MCP over stdio: %w", err))
 	}
 	return 0
+}
+
+func runCommand(arguments []string, standardOutput, standardError io.Writer) int {
+	if len(arguments) == 0 {
+		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("expected MCP tool command"))
+	}
+	exitCode := 0
+	var command *cobra.Command
+	switch arguments[0] {
+	case "query":
+		command = query.New(standardOutput, standardError, &exitCode)
+	case "path":
+		command = path.New(standardOutput, standardError, &exitCode)
+	case "explain":
+		command = explain.New(standardOutput, standardError, &exitCode)
+	case "export":
+		command = export.New(standardOutput, standardError, &exitCode)
+	default:
+		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("expected MCP tool command"))
+	}
+	command.SetOut(standardOutput)
+	command.SetErr(standardError)
+	command.SetArgs(arguments[1:])
+	if err := command.Execute(); err != nil {
+		return cmd.WriteError(standardError, cli.NewInvalidArgumentError(err.Error()))
+	}
+	return exitCode
 }
 
 func newMCPServer(runCommand mcpCommandRunner) *server.MCPServer {

@@ -11,7 +11,7 @@ import (
 )
 
 func TestStoreConformance(t *testing.T) {
-	conformance.Run(t, func(t *testing.T) storage.Store {
+	conformance.RunStoreSuite(t, func(t *testing.T) storage.Store {
 		t.Helper()
 		store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
 		if err != nil {

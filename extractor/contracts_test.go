@@ -99,6 +99,54 @@ func TestNewContributionAcceptsValidatedDatabaseNeutralData(t *testing.T) {
 	}
 }
 
+func TestNewContributionPreservesCatalogUnits(t *testing.T) {
+	vocabulary, err := graph.NewVocabulary(graph.VocabularyDefinition{
+		NodeKinds: []graph.NodeKind{"file"},
+	})
+	if err != nil {
+		t.Fatalf("new vocabulary: %v", err)
+	}
+
+	input := extractor.ContributionInput{
+		SourcePath: "src/main.go",
+		Metadata:   extractor.Metadata{Name: "go", Version: "v0", Extensions: []string{".go"}},
+		Facts: graph.Facts{Nodes: []graph.Node{{
+			ID:   "function:validate",
+			Kind: "file",
+			Evidence: graph.FactEvidence{
+				Span:       graph.SourceSpan{Path: "src/main.go", StartLine: 1, StartColumn: 1, EndLine: 1, EndColumn: 1},
+				FileHash:   "sha256:fixture",
+				Extractor:  "go",
+				Provenance: "static",
+				Confidence: graph.ConfidenceExtracted,
+			},
+		}}},
+		CatalogUnits: []extractor.CatalogUnit{{
+			NodeID:           "function:validate",
+			Name:             "ValidateToken",
+			Kind:             "go:function",
+			Signature:        "func ValidateToken(token string) error",
+			Comments:         []string{"ValidateToken checks a signed token."},
+			IdentifierTokens: []string{"validate", "token"},
+		}},
+	}
+
+	contribution, err := extractor.NewContribution(vocabulary, input)
+	if err != nil {
+		t.Fatalf("new contribution: %v", err)
+	}
+	input.CatalogUnits[0].Comments[0] = "changed"
+	input.CatalogUnits[0].IdentifierTokens[0] = "changed"
+
+	units := contribution.CatalogUnits()
+	if len(units) != 1 {
+		t.Fatalf("catalog unit count = %d, want 1", len(units))
+	}
+	if got := units[0]; got.NodeID != "function:validate" || got.Name != "ValidateToken" || got.Kind != "go:function" || got.Signature != "func ValidateToken(token string) error" || got.Comments[0] != "ValidateToken checks a signed token." || got.IdentifierTokens[0] != "validate" {
+		t.Errorf("catalog unit = %+v, want original source data", got)
+	}
+}
+
 func TestNewGraphUpdateGroupsImmutableContributions(t *testing.T) {
 	vocabulary, err := graph.NewVocabulary(graph.VocabularyDefinition{NodeKinds: []graph.NodeKind{"file"}})
 	if err != nil {
@@ -161,6 +209,16 @@ func TestNewContributionRejectsMalformedData(t *testing.T) {
 			name: "unregistered fact kind",
 			mutate: func(input *extractor.ContributionInput) {
 				input.Facts.Nodes[0].Kind = "unknown"
+			},
+		},
+		{
+			name: "incomplete catalog unit",
+			mutate: func(input *extractor.ContributionInput) {
+				input.CatalogUnits = []extractor.CatalogUnit{{
+					NodeID: "file:main",
+					Name:   "main",
+					Kind:   "file",
+				}}
 			},
 		},
 		{

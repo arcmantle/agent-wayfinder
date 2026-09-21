@@ -8,12 +8,17 @@ import (
 	"path/filepath"
 
 	"agent-wayfinder/cli"
+	cmd "agent-wayfinder/cmd/agent-wayfinder/internal/command"
 
 	"github.com/spf13/cobra"
 )
 
-//go:embed skill_assets/SKILL.md skill_assets/references/commands.md
+//go:embed skill/skill_assets/SKILL.md skill/skill_assets/references/commands.md
 var bundledSkill embed.FS
+
+func newInstallCommand(standardOutput, standardError io.Writer, exitCode *int) *cobra.Command {
+	return cmd.NewLeaf("install", "Install the Agent Wayfinder skill", installFlags, runInstall, standardOutput, standardError, exitCode)
+}
 
 func installFlags(command *cobra.Command) {
 	command.Flags().Bool("project", false, "install in the current project")
@@ -21,22 +26,22 @@ func installFlags(command *cobra.Command) {
 
 func runInstall(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
 	if len(arguments) != 0 {
-		return writeCommandError(standardError, cli.NewInvalidArgumentError("install accepts no arguments"))
+		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("install accepts no arguments"))
 	}
 	project, err := command.Flags().GetBool("project")
 	if err != nil {
-		return writeCommandError(standardError, err)
+		return cmd.WriteError(standardError, err)
 	}
 	root, err := skillInstallRoot(project)
 	if err != nil {
-		return writeCommandError(standardError, err)
+		return cmd.WriteError(standardError, err)
 	}
 	destination := filepath.Join(root, ".agents", "skills", "agent-wayfinder")
 	if err := installBundledSkill(destination); err != nil {
-		return writeCommandError(standardError, err)
+		return cmd.WriteError(standardError, err)
 	}
 	if _, err := fmt.Fprintf(standardOutput, "Skill installed: %s\n", destination); err != nil {
-		return writeCommandError(standardError, fmt.Errorf("render skill installation: %w", err))
+		return cmd.WriteError(standardError, fmt.Errorf("render skill installation: %w", err))
 	}
 	return 0
 }

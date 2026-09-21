@@ -112,6 +112,7 @@ func Extract(source extractor.Source) (extractor.Contribution, error) {
 		SourcePath:           source.SourcePath,
 		Metadata:             New().Metadata(),
 		Facts:                facts,
+		CatalogUnits:         extractor.CatalogUnitsForSource(source, facts),
 		UnresolvedReferences: moduleReferences,
 		SymbolReferences:     symbolReferences,
 		ExportedSurfaces:     exportedSurfaces,

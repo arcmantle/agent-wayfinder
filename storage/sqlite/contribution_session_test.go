@@ -15,7 +15,7 @@ import (
 	"agent-wayfinder/storage"
 	"agent-wayfinder/storage/sqlite"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/arcmantle/go-sqlite3"
 )
 
 func TestContributionSessionCommitPublishesOneCompleteSnapshot(t *testing.T) {
@@ -372,6 +372,8 @@ func TestContributionSessionCommitReportsBatchedSQLiteWriteMeasurements(t *testi
 		"file_contributions",
 		"contribution_nodes",
 		"contribution_edges",
+		"contribution_catalog_units",
+		"contribution_catalog_unit_coverage",
 		"contribution_extensions",
 		"contribution_dependencies",
 		"contribution_exported_surfaces",
@@ -381,9 +383,10 @@ func TestContributionSessionCommitReportsBatchedSQLiteWriteMeasurements(t *testi
 		"contribution_symbol_references",
 	}
 	applicable := map[string]bool{
-		"file_contributions":      true,
-		"contribution_nodes":      true,
-		"contribution_extensions": true,
+		"file_contributions":                 true,
+		"contribution_nodes":                 true,
+		"contribution_catalog_unit_coverage": true,
+		"contribution_extensions":            true,
 	}
 	if len(measurements) != len(wantNames) {
 		t.Fatalf("SQLite write measurements = %+v, want names %v", measurements, wantNames)

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"agent-wayfinder/extractor"
 	goextractor "agent-wayfinder/extractors/go"
@@ -18,7 +19,7 @@ import (
 	"agent-wayfinder/storage"
 	"agent-wayfinder/storage/sqlite"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/arcmantle/go-sqlite3"
 )
 
 func TestOpenMigratesNewDatabaseAndReopensIt(t *testing.T) {
@@ -38,6 +39,634 @@ func TestOpenMigratesNewDatabaseAndReopensIt(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close migrated database: %v", err)
+	}
+}
+
+func TestCatalogTaskDoesNotRegressToOlderGraphVersion(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	workspace := t.TempDir()
+	startedAt := time.Now().UTC()
+	if err := store.WriteCatalogTask(context.Background(), storage.CatalogTask{
+		Workspace: workspace, GraphVersion: 2, State: storage.CatalogTaskRunning, StartedAt: startedAt,
+	}); err != nil {
+		t.Fatalf("write later catalog task: %v", err)
+	}
+	if err := store.WriteCatalogTask(context.Background(), storage.CatalogTask{
+		Workspace: workspace, GraphVersion: 1, State: storage.CatalogTaskComplete, StartedAt: startedAt, FinishedAt: startedAt,
+	}); err != nil {
+		t.Fatalf("write older catalog task: %v", err)
+	}
+	task, found, err := store.ReadCatalogTask(context.Background(), workspace)
+	if err != nil {
+		t.Fatalf("read catalog task: %v", err)
+	}
+	if !found || task.GraphVersion != 2 || task.State != storage.CatalogTaskRunning {
+		t.Errorf("catalog task = %+v, want running graph version 2", task)
+	}
+}
+
+func TestCopilotPlannerMetricsAggregateExactEventValuesByDay(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	day := time.Date(2026, time.September, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.RecordCopilotPlannerMetric(context.Background(), storage.CopilotPlannerMetric{
+		RecordedAt:              day,
+		Model:                   "gpt-5",
+		MaxAICredits:            30,
+		Outcome:                 storage.CopilotPlannerOutcomeSuccess,
+		Duration:                2 * time.Second,
+		PromptBytes:             120,
+		ResponseBytes:           96,
+		ActualModel:             "gpt-5.3-codex",
+		InputTokens:             storage.ExactMetricValue(15667),
+		OutputTokens:            storage.ExactMetricValue(12),
+		CacheReadTokens:         storage.ExactMetricValue(14848),
+		CacheWriteTokens:        storage.ExactMetricValue(0),
+		ReasoningTokens:         storage.ExactMetricValue(72),
+		SessionTotalNanoAiu:     storage.ExactMetricValue(80),
+		PremiumRequestCredits:   storage.ExactMetricValue(1),
+		UserRequests:            storage.ExactMetricValue(1),
+		APIDurationMilliseconds: storage.ExactMetricValue(2592),
+	}); err != nil {
+		t.Fatalf("record Copilot planner metric: %v", err)
+	}
+
+	aggregates, err := store.ReadCopilotPlannerDailyMetrics(context.Background(), storage.CopilotPlannerDailyMetricsRequest{Day: day})
+	if err != nil {
+		t.Fatalf("read Copilot planner daily metrics: %v", err)
+	}
+	if len(aggregates) != 1 {
+		t.Fatalf("daily metrics = %+v, want one aggregate", aggregates)
+	}
+	got := aggregates[0]
+	if got.Model != "gpt-5.3-codex" || got.ActualModel != "gpt-5.3-codex" || got.MaxAICredits != 30 || got.Successes != 1 || got.Duration != 2*time.Second || got.PromptBytes != 120 || got.ResponseBytes != 96 || got.InputTokens.Value != 15667 || got.OutputTokens.Value != 12 || got.CacheReadTokens.Value != 14848 || got.CacheWriteTokens.Value != 0 || got.ReasoningTokens.Value != 72 || got.OutputTokens.Availability != storage.MetricValueExact || got.SessionTotalNanoAiu.Value != 80 || got.SessionTotalNanoAiu.Availability != storage.MetricValueExact || got.PremiumRequestCredits.Value != 1 || got.UserRequests.Value != 1 || got.APIDurationMilliseconds.Value != 2592 || got.CostUSD.Value != 0.01 || got.CostUSD.Availability != storage.MetricValueEstimate || got.CostUSD.EstimateMethod != "used credits / 100" {
+		t.Errorf("daily metric = %+v, want exact successful aggregate", got)
+	}
+}
+
+func TestClaudePlannerMetricsAggregateNonContentValuesByDay(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	day := time.Date(2026, time.September, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.RecordClaudePlannerMetric(context.Background(), storage.ClaudePlannerMetric{
+		RecordedAt:              day,
+		Model:                   "sonnet",
+		ActualModel:             "claude-sonnet-4-6",
+		FallbackModel:           "haiku",
+		MaxBudgetUSD:            0.75,
+		Effort:                  "high",
+		Outcome:                 storage.ClaudePlannerOutcomeSuccess,
+		Duration:                2 * time.Second,
+		PromptBytes:             120,
+		ResponseBytes:           96,
+		InputTokens:             storage.ExactMetricValue(15667),
+		OutputTokens:            storage.ExactMetricValue(12),
+		APIDurationMilliseconds: storage.ExactMetricValue(1500),
+		CostUSD:                 storage.DollarValue{Value: 0.012, Availability: storage.MetricValueExact},
+	}); err != nil {
+		t.Fatalf("record Claude planner metric: %v", err)
+	}
+	if err := store.RecordClaudePlannerMetric(context.Background(), storage.ClaudePlannerMetric{
+		RecordedAt:    day.Add(time.Second),
+		Model:         "sonnet",
+		ActualModel:   "claude-sonnet-4-6",
+		FallbackModel: "haiku",
+		MaxBudgetUSD:  0.75,
+		Effort:        "high",
+		Outcome:       storage.ClaudePlannerOutcomeModelUnavailable,
+		Duration:      time.Second,
+		PromptBytes:   120,
+	}); err != nil {
+		t.Fatalf("record unavailable Claude planner metric: %v", err)
+	}
+
+	metrics, err := store.ReadClaudePlannerDailyMetrics(context.Background(), storage.ClaudePlannerDailyMetricsRequest{Day: day})
+	if err != nil {
+		t.Fatalf("read Claude planner daily metrics: %v", err)
+	}
+	if len(metrics) != 1 {
+		t.Fatalf("daily metrics = %+v, want one aggregate", metrics)
+	}
+	got := metrics[0]
+	if got.Model != "sonnet" || got.ActualModel != "claude-sonnet-4-6" || got.FallbackModel != "haiku" || got.MaxBudgetUSD != 0.75 || got.Effort != "high" || got.Successes != 1 || got.ModelUnavailables != 1 || got.Duration != 3*time.Second || got.PromptBytes != 240 || got.ResponseBytes != 96 || got.InputTokens.Availability != storage.MetricValueUnavailable || got.OutputTokens.Availability != storage.MetricValueUnavailable || got.APIDurationMilliseconds.Availability != storage.MetricValueUnavailable || got.CostUSD.Availability != storage.MetricValueUnavailable {
+		t.Errorf("daily Claude metric = %+v, want partial non-content aggregate", got)
+	}
+}
+
+func TestCopilotPlannerMetricsReadMonthByDay(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, day := range []time.Time{
+		time.Date(2026, time.September, 2, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC),
+	} {
+		if err := store.RecordCopilotPlannerMetric(context.Background(), storage.CopilotPlannerMetric{
+			RecordedAt:            day,
+			Model:                 "auto",
+			ActualModel:           "gpt-5.6-luna",
+			MaxAICredits:          30,
+			Outcome:               storage.CopilotPlannerOutcomeSuccess,
+			OutputTokens:          storage.MetricValue{Availability: storage.MetricValueUnavailable},
+			SessionTotalNanoAiu:   storage.MetricValue{Availability: storage.MetricValueUnavailable},
+			PremiumRequestCredits: storage.ExactMetricValue(1),
+		}); err != nil {
+			t.Fatalf("record planner metric: %v", err)
+		}
+	}
+	metrics, err := store.ReadCopilotPlannerMonthlyMetrics(context.Background(), storage.CopilotPlannerMonthlyMetricsRequest{
+		Month: time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("read monthly metrics: %v", err)
+	}
+	if len(metrics) != 2 || metrics[0].Day.Day() != 2 || metrics[1].Day.Day() != 3 || metrics[0].ActualModel != "gpt-5.6-luna" || metrics[1].PremiumRequestCredits.Value != 1 {
+		t.Errorf("monthly metrics = %+v, want daily Luna metrics", metrics)
+	}
+}
+
+func TestCopilotPlannerMetricsSeparateActualModelsByDay(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	day := time.Date(2026, time.September, 19, 12, 0, 0, 0, time.UTC)
+	for _, record := range []struct {
+		model       string
+		actualModel string
+		maxCredits  int
+	}{
+		{"auto", "gpt-5.3-codex", 30},
+		{"gpt-5.3-codex", "gpt-5.3-codex", 60},
+		{"auto", "claude-sonnet-4", 30},
+	} {
+		if err := store.RecordCopilotPlannerMetric(context.Background(), storage.CopilotPlannerMetric{
+			RecordedAt:              day,
+			Model:                   record.model,
+			ActualModel:             record.actualModel,
+			MaxAICredits:            record.maxCredits,
+			Outcome:                 storage.CopilotPlannerOutcomeSuccess,
+			OutputTokens:            storage.ExactMetricValue(12),
+			SessionTotalNanoAiu:     storage.ExactMetricValue(80),
+			PremiumRequestCredits:   storage.ExactMetricValue(1),
+			APIDurationMilliseconds: storage.ExactMetricValue(100),
+		}); err != nil {
+			t.Fatalf("record %s planner metric: %v", record.actualModel, err)
+		}
+	}
+	metrics, err := store.ReadCopilotPlannerDailyMetrics(context.Background(), storage.CopilotPlannerDailyMetricsRequest{Day: day})
+	if err != nil {
+		t.Fatalf("read daily metrics: %v", err)
+	}
+	if len(metrics) != 2 || metrics[0].ActualModel != "claude-sonnet-4" || metrics[0].Successes != 1 || metrics[1].ActualModel != "gpt-5.3-codex" || metrics[1].Successes != 2 || metrics[1].PremiumRequestCredits.Value != 2 {
+		t.Errorf("daily metrics = %+v, want aggregates grouped by actual model", metrics)
+	}
+}
+
+func TestCopilotPlannerMetricsKeepUnavailableEventValuesUnavailable(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	day := time.Date(2026, time.September, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.RecordCopilotPlannerMetric(context.Background(), storage.CopilotPlannerMetric{
+		RecordedAt:          day,
+		Model:               "gpt-5",
+		MaxAICredits:        30,
+		Outcome:             storage.CopilotPlannerOutcomeTimeout,
+		Duration:            time.Second,
+		OutputTokens:        storage.MetricValue{Availability: storage.MetricValueUnavailable},
+		SessionTotalNanoAiu: storage.MetricValue{Availability: storage.MetricValueUnavailable},
+	}); err != nil {
+		t.Fatalf("record timeout metric: %v", err)
+	}
+	metrics, err := store.ReadCopilotPlannerDailyMetrics(context.Background(), storage.CopilotPlannerDailyMetricsRequest{Day: day})
+	if err != nil {
+		t.Fatalf("read daily metrics: %v", err)
+	}
+	if len(metrics) != 1 || metrics[0].Timeouts != 1 || metrics[0].OutputTokens.Availability != storage.MetricValueUnavailable || metrics[0].SessionTotalNanoAiu.Availability != storage.MetricValueUnavailable {
+		t.Errorf("timeout metric aggregate = %+v, want one timeout with unavailable event values", metrics)
+	}
+}
+
+func TestCopilotPlannerMetricsDoNotExposePartialExactTotals(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	day := time.Date(2026, time.September, 19, 12, 0, 0, 0, time.UTC)
+	for _, outputTokens := range []storage.MetricValue{
+		storage.ExactMetricValue(12),
+		{Availability: storage.MetricValueUnavailable},
+	} {
+		if err := store.RecordCopilotPlannerMetric(context.Background(), storage.CopilotPlannerMetric{
+			RecordedAt:          day,
+			Model:               "gpt-5",
+			MaxAICredits:        30,
+			Outcome:             storage.CopilotPlannerOutcomeSuccess,
+			OutputTokens:        outputTokens,
+			SessionTotalNanoAiu: storage.ExactMetricValue(80),
+		}); err != nil {
+			t.Fatalf("record planner metric: %v", err)
+		}
+	}
+	metrics, err := store.ReadCopilotPlannerDailyMetrics(context.Background(), storage.CopilotPlannerDailyMetricsRequest{Day: day})
+	if err != nil {
+		t.Fatalf("read daily metrics: %v", err)
+	}
+	if len(metrics) != 1 || metrics[0].OutputTokens.Availability != storage.MetricValueUnavailable || metrics[0].OutputTokens.Value != 0 {
+		t.Errorf("mixed output token aggregate = %+v, want unavailable value without partial total", metrics)
+	}
+}
+
+func TestCopilotPlannerMetricsReportEstimateMethod(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	day := time.Date(2026, time.September, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.RecordCopilotPlannerMetric(context.Background(), storage.CopilotPlannerMetric{
+		RecordedAt:          day,
+		Model:               "gpt-5",
+		MaxAICredits:        30,
+		Outcome:             storage.CopilotPlannerOutcomeSuccess,
+		OutputTokens:        storage.MetricValue{Value: 12, Availability: storage.MetricValueEstimate, EstimateMethod: "event-byte-ratio"},
+		SessionTotalNanoAiu: storage.MetricValue{Value: 80, Availability: storage.MetricValueEstimate, EstimateMethod: "event-byte-ratio"},
+	}); err != nil {
+		t.Fatalf("record estimated planner metric: %v", err)
+	}
+	metrics, err := store.ReadCopilotPlannerDailyMetrics(context.Background(), storage.CopilotPlannerDailyMetricsRequest{Day: day})
+	if err != nil {
+		t.Fatalf("read daily metrics: %v", err)
+	}
+	if len(metrics) != 1 || metrics[0].OutputTokens.Availability != storage.MetricValueEstimate || metrics[0].OutputTokens.Value != 12 || metrics[0].OutputTokens.EstimateMethod != "event-byte-ratio" || metrics[0].SessionTotalNanoAiu.Availability != storage.MetricValueEstimate || metrics[0].SessionTotalNanoAiu.EstimateMethod != "event-byte-ratio" {
+		t.Errorf("estimated metric aggregate = %+v, want labeled estimate values", metrics)
+	}
+}
+
+func TestCopilotPlannerMetricsSchemaExcludesRequestContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "graph.db")
+	store, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	rows, err := database.Query("PRAGMA table_info(copilot_planner_metrics)")
+	if err != nil {
+		t.Fatalf("read planner metric schema: %v", err)
+	}
+	defer rows.Close()
+	forbidden := map[string]struct{}{"prompt": {}, "response": {}, "source": {}, "credential": {}, "content": {}, "question": {}}
+	for rows.Next() {
+		var columnID, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&columnID, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan planner metric column: %v", err)
+		}
+		if _, found := forbidden[name]; found {
+			t.Errorf("planner metric schema contains forbidden content column %q", name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate planner metric schema: %v", err)
+	}
+}
+
+func TestCatalogSearchIsSnapshotScopedAndSeparateFromNodeSearch(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	first, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/main.ts", "function:validateToken"),
+	})
+	if err != nil {
+		t.Fatalf("publish first snapshot: %v", err)
+	}
+	if err := store.WriteCatalog(context.Background(), first, storage.CatalogWriteRequest{
+		Entries: []storage.CatalogEntry{{
+			NodeID:                "function:validateToken",
+			Name:                  "validate token",
+			DeterministicSynopsis: "checks a ledger sentinel",
+		}},
+	}); err != nil {
+		t.Fatalf("write first catalog: %v", err)
+	}
+
+	second, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/main.ts", "function:rotateCredentials"),
+	})
+	if err != nil {
+		t.Fatalf("publish second snapshot: %v", err)
+	}
+	if err := store.WriteCatalog(context.Background(), second, storage.CatalogWriteRequest{
+		Entries: []storage.CatalogEntry{{
+			NodeID:                "function:rotateCredentials",
+			Name:                  "rotate credentials",
+			DeterministicSynopsis: "rotates authentication credentials",
+		}},
+	}); err != nil {
+		t.Fatalf("write second catalog: %v", err)
+	}
+	other, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "other-workspace",
+		Update:    graphUpdate(t, "src/main.ts", "function:validateToken"),
+	})
+	if err != nil {
+		t.Fatalf("publish other workspace snapshot: %v", err)
+	}
+	if err := store.WriteCatalog(context.Background(), other, storage.CatalogWriteRequest{
+		Entries: []storage.CatalogEntry{{
+			NodeID:                "function:validateToken",
+			Name:                  "validate token",
+			DeterministicSynopsis: "checks a ledger sentinel",
+		}},
+	}); err != nil {
+		t.Fatalf("write other workspace catalog: %v", err)
+	}
+
+	firstMatches, err := store.SearchCatalog(context.Background(), first, storage.CatalogSearchRequest{Text: "validate token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search first catalog: %v", err)
+	}
+	if len(firstMatches) != 1 || firstMatches[0].Node.ID != "function:validateToken" {
+		t.Errorf("first catalog matches = %+v, want validate token", firstMatches)
+	}
+
+	secondMatches, err := store.SearchCatalog(context.Background(), second, storage.CatalogSearchRequest{Text: "validate token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search second catalog: %v", err)
+	}
+	if len(secondMatches) != 0 {
+		t.Errorf("second catalog matches = %+v, want no stale catalog entry", secondMatches)
+	}
+
+	nodeMatches, err := store.SearchNodes(context.Background(), first, storage.LexicalSearchRequest{Text: "ledger sentinel", Limit: 10})
+	if err != nil {
+		t.Fatalf("search node index: %v", err)
+	}
+	if len(nodeMatches) != 0 {
+		t.Errorf("node search matches = %+v, want no catalog prose", nodeMatches)
+	}
+}
+
+func TestCatalogEmbeddingsAreSnapshotScoped(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/main.ts", "function:validateToken"),
+	})
+	if err != nil {
+		t.Fatalf("publish snapshot: %v", err)
+	}
+	if err := store.WriteCatalog(context.Background(), snapshot, storage.CatalogWriteRequest{Entries: []storage.CatalogEntry{{
+		NodeID:                "function:validateToken",
+		Name:                  "validate token",
+		DeterministicSynopsis: "checks a ledger sentinel",
+		CopilotSynopsis:       "Validates access tokens.",
+	}}}); err != nil {
+		t.Fatalf("write catalog: %v", err)
+	}
+	if err := store.WriteCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingWriteRequest{Embeddings: []storage.CatalogEmbedding{
+		{NodeID: "function:validateToken", Source: storage.CatalogEmbeddingDeterministic, Text: "checks a ledger sentinel", Vector: []float32{0.1, 0.2}},
+		{NodeID: "function:validateToken", Source: storage.CatalogEmbeddingCopilot, Text: "Validates access tokens.", Vector: []float32{0.3, 0.4}},
+	}}); err != nil {
+		t.Fatalf("write catalog embeddings: %v", err)
+	}
+
+	embeddings, err := store.ReadCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingReadRequest{NodeIDs: []string{"function:validateToken"}})
+	if err != nil {
+		t.Fatalf("read catalog embeddings: %v", err)
+	}
+	if len(embeddings) != 2 || embeddings[0].Source != storage.CatalogEmbeddingDeterministic || embeddings[1].Source != storage.CatalogEmbeddingCopilot || !reflect.DeepEqual(embeddings[0].Vector, []float32{0.1, 0.2}) || !reflect.DeepEqual(embeddings[1].Vector, []float32{0.3, 0.4}) {
+		t.Errorf("catalog embeddings = %+v, want snapshot-scoped deterministic and Copilot vectors", embeddings)
+	}
+	matches, err := store.SearchCatalogVectors(context.Background(), snapshot, storage.CatalogVectorSearchRequest{Vector: []float32{0.3, 0.4}, Limit: 10})
+	if err != nil {
+		t.Fatalf("search catalog vectors: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Node.ID != "function:validateToken" {
+		t.Errorf("catalog vector matches = %+v, want validate token", matches)
+	}
+}
+
+func TestCatalogVectorSearchReturnsNoMatchesWithoutDimensionIndex(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/main.ts", "function:validateToken")})
+	if err != nil {
+		t.Fatalf("publish snapshot: %v", err)
+	}
+	matches, err := store.SearchCatalogVectors(context.Background(), snapshot, storage.CatalogVectorSearchRequest{Vector: []float32{0.1, 0.2}, Limit: 10})
+	if err != nil {
+		t.Fatalf("search catalog vectors: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("catalog vector matches = %+v, want none", matches)
+	}
+}
+
+func TestCatalogEmbeddingsFollowRollbackAndPrune(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	writeEmbedding := func(snapshot storage.Snapshot, nodeID string) {
+		t.Helper()
+		if err := store.WriteCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingWriteRequest{Embeddings: []storage.CatalogEmbedding{{
+			NodeID: nodeID,
+			Source: storage.CatalogEmbeddingDeterministic,
+			Text:   nodeID,
+			Vector: []float32{0.1, 0.2},
+		}}}); err != nil {
+			t.Fatalf("write catalog embedding: %v", err)
+		}
+	}
+
+	first, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/first.ts", "function:first")})
+	if err != nil {
+		t.Fatalf("publish first snapshot: %v", err)
+	}
+	writeEmbedding(first, "function:first")
+	second, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/second.ts", "function:second")})
+	if err != nil {
+		t.Fatalf("publish second snapshot: %v", err)
+	}
+	writeEmbedding(second, "function:second")
+	if _, err := store.Rollback(context.Background(), storage.RollbackRequest{Workspace: "workspace", Version: first.Version}); err != nil {
+		t.Fatalf("roll back snapshot: %v", err)
+	}
+	if embeddings, err := store.ReadCatalogEmbeddings(context.Background(), second, storage.CatalogEmbeddingReadRequest{NodeIDs: []string{"function:second"}}); err != nil || len(embeddings) != 0 {
+		t.Errorf("rolled back catalog embeddings = %+v, error %v, want none", embeddings, err)
+	}
+
+	retained, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/retained.ts", "function:retained")})
+	if err != nil {
+		t.Fatalf("publish retained snapshot: %v", err)
+	}
+	writeEmbedding(retained, "function:retained")
+	if _, err := store.Prune(context.Background(), storage.PruneRequest{Workspace: "workspace", BeforeVersion: retained.Version}); err != nil {
+		t.Fatalf("prune snapshots: %v", err)
+	}
+	if embeddings, err := store.ReadCatalogEmbeddings(context.Background(), first, storage.CatalogEmbeddingReadRequest{NodeIDs: []string{"function:first"}}); err != nil || len(embeddings) != 0 {
+		t.Errorf("pruned catalog embeddings = %+v, error %v, want none", embeddings, err)
+	}
+}
+
+func TestOpenMigratesCatalogEmbeddingsIntoVectorIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "graph.db")
+	store, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{Workspace: "workspace", Update: graphUpdate(t, "src/main.ts", "function:validateToken")})
+	if err != nil {
+		t.Fatalf("publish snapshot: %v", err)
+	}
+	if err := store.WriteCatalog(context.Background(), snapshot, storage.CatalogWriteRequest{Entries: []storage.CatalogEntry{{NodeID: "function:validateToken", Name: "validate token", DeterministicSynopsis: "checks access tokens"}}}); err != nil {
+		t.Fatalf("write catalog: %v", err)
+	}
+	if err := store.WriteCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingWriteRequest{Embeddings: []storage.CatalogEmbedding{{NodeID: "function:validateToken", Source: storage.CatalogEmbeddingDeterministic, Text: "checks access tokens", Vector: []float32{0.1, 0.2}}}}); err != nil {
+		t.Fatalf("write catalog embeddings: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := database.Exec("DROP TABLE catalog_embedding_vectors_2; DELETE FROM schema_migrations; INSERT INTO schema_migrations (version, applied_at) VALUES (13, 'test')"); err != nil {
+		_ = database.Close()
+		t.Fatalf("seed version 13 database: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	store, err = sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("migrate database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	matches, err := store.SearchCatalogVectors(context.Background(), snapshot, storage.CatalogVectorSearchRequest{Vector: []float32{0.1, 0.2}, Limit: 10})
+	if err != nil {
+		t.Fatalf("search migrated catalog vectors: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Node.ID != "function:validateToken" {
+		t.Errorf("migrated catalog vector matches = %+v, want validate token", matches)
+	}
+}
+
+func TestDeleteCatalogEntriesRemovesSnapshotEntries(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/main.ts", "function:validateToken"),
+	})
+	if err != nil {
+		t.Fatalf("publish snapshot: %v", err)
+	}
+	if err := store.WriteCatalog(context.Background(), snapshot, storage.CatalogWriteRequest{
+		Entries: []storage.CatalogEntry{{
+			NodeID:                "function:validateToken",
+			Name:                  "validate token",
+			DeterministicSynopsis: "checks a ledger sentinel",
+		}},
+	}); err != nil {
+		t.Fatalf("write catalog: %v", err)
+	}
+	if err := store.WriteCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingWriteRequest{Embeddings: []storage.CatalogEmbedding{{
+		NodeID: "function:validateToken",
+		Source: storage.CatalogEmbeddingDeterministic,
+		Text:   "checks a ledger sentinel",
+		Vector: []float32{0.1, 0.2},
+	}}}); err != nil {
+		t.Fatalf("write catalog embedding: %v", err)
+	}
+	if err := store.DeleteCatalogEntries(context.Background(), snapshot, []string{"function:validateToken"}); err != nil {
+		t.Fatalf("delete catalog entry: %v", err)
+	}
+
+	matches, err := store.SearchCatalog(context.Background(), snapshot, storage.CatalogSearchRequest{Text: "validate token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search catalog after deletion: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("catalog matches after deletion = %+v, want none", matches)
+	}
+	embeddings, err := store.ReadCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingReadRequest{NodeIDs: []string{"function:validateToken"}})
+	if err != nil {
+		t.Fatalf("read catalog embeddings after deletion: %v", err)
+	}
+	if len(embeddings) != 0 {
+		t.Errorf("catalog embeddings after deletion = %+v, want none", embeddings)
 	}
 }
 
@@ -72,7 +701,7 @@ func TestOpenRecreatesMismatchedSchema(t *testing.T) {
 		CREATE TABLE old_graph_data (value TEXT NOT NULL);
 		INSERT INTO schema_migrations (version, applied_at) VALUES (%d, '2026-08-14T00:00:00Z');
 		INSERT INTO old_graph_data (value) VALUES ('stale');
-	`, sqlite.CurrentSchemaVersion-1))
+	`, 10))
 	if err != nil {
 		t.Fatalf("seed mismatched schema version: %v", err)
 	}
@@ -123,7 +752,7 @@ func TestOpenMigratesVersionTenAndRebuildsLexicalRowsInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open version-ten database: %v", err)
 	}
-	if _, err := database.Exec(`DROP TABLE node_search; DELETE FROM schema_migrations WHERE version = 11; INSERT INTO schema_migrations (version, applied_at) VALUES (10, '2026-08-31T00:00:00Z')`); err != nil {
+	if _, err := database.Exec(`DROP TABLE catalog_search; DROP TABLE catalog_entries; DROP TABLE node_search; DELETE FROM schema_migrations; INSERT INTO schema_migrations (version, applied_at) VALUES (10, '2026-08-31T00:00:00Z')`); err != nil {
 		t.Fatalf("downgrade schema marker: %v", err)
 	}
 	if err := database.Close(); err != nil {
@@ -141,6 +770,67 @@ func TestOpenMigratesVersionTenAndRebuildsLexicalRowsInPlace(t *testing.T) {
 	}
 	if len(matches) != 1 || matches[0].Node.ID != "function:LegacyHandler" {
 		t.Errorf("rebuilt lexical matches = %+v, want legacy handler", matches)
+	}
+}
+
+func TestOpenMigratesVersionEighteenWithoutCatalogUnitCoverage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "version-eighteen.db")
+	store, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/handler.go", "function:Handler"),
+	})
+	if err != nil {
+		t.Fatalf("publish pre-migration snapshot: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close pre-migration store: %v", err)
+	}
+
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open version-eighteen database: %v", err)
+	}
+	if _, err := database.Exec(`
+		DROP TABLE contribution_catalog_unit_coverage;
+		DELETE FROM contribution_catalog_units;
+		DELETE FROM schema_migrations;
+		INSERT INTO schema_migrations (version, applied_at) VALUES (18, '2026-09-21T00:00:00Z')`); err != nil {
+		t.Fatalf("seed version-eighteen database: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close version-eighteen database: %v", err)
+	}
+
+	store, err = sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("migrate version-eighteen database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	covered, err := store.CatalogUnitsCovered(context.Background(), snapshot)
+	if err != nil {
+		t.Fatalf("read migrated catalog-unit coverage: %v", err)
+	}
+	if covered {
+		t.Error("migrated version-eighteen snapshot has catalog-unit coverage, want full re-index requirement")
+	}
+
+	reindexed, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdate(t, "src/handler.go", "function:Handler"),
+	})
+	if err != nil {
+		t.Fatalf("publish re-indexed snapshot: %v", err)
+	}
+	covered, err = store.CatalogUnitsCovered(context.Background(), reindexed)
+	if err != nil {
+		t.Fatalf("read re-indexed catalog-unit coverage: %v", err)
+	}
+	if !covered {
+		t.Error("re-indexed snapshot has no catalog-unit coverage")
 	}
 }
 

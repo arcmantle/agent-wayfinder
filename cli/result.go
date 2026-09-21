@@ -76,14 +76,21 @@ func RenderError(writer io.Writer, err error) error {
 }
 
 type Result struct {
-	Snapshot storage.Snapshot
-	Text     string
-	Data     any
+	Snapshot     storage.Snapshot
+	OmitSnapshot bool
+	Text         string
+	Data         any
 }
 
 func Render(writer io.Writer, result Result, format Format) error {
 	switch format {
 	case FormatText:
+		if result.OmitSnapshot {
+			if _, err := fmt.Fprintf(writer, "%s\n", result.Text); err != nil {
+				return fmt.Errorf("render text result: %w", err)
+			}
+			return nil
+		}
 		_, err := fmt.Fprintf(
 			writer,
 			"Graph version: %d\nPublished at: %s\n\n%s\n",
@@ -96,6 +103,15 @@ func Render(writer io.Writer, result Result, format Format) error {
 		}
 		return nil
 	case FormatJSON:
+		if result.OmitSnapshot {
+			envelope := struct {
+				Result any `json:"result"`
+			}{Result: result.Data}
+			if err := json.NewEncoder(writer).Encode(envelope); err != nil {
+				return fmt.Errorf("render JSON result: %w", err)
+			}
+			return nil
+		}
 		envelope := struct {
 			GraphVersion storage.GraphVersion `json:"graphVersion"`
 			PublishedAt  string               `json:"publishedAt"`

@@ -4,7 +4,9 @@
 	"description": "Install and run the agent-wayfinder code graph CLI.",
 	"bin": {
 		"agent-wayfinder": "bin/agent-wayfinder.js",
-		"a-wayfinder": "bin/agent-wayfinder.js"
+		"a-wayfinder": "bin/agent-wayfinder.js",
+		"wayfind": "bin/agent-wayfinder.js",
+		"awf": "bin/agent-wayfinder.js"
 	},
 	"files": [
 		"bin/agent-wayfinder.js"

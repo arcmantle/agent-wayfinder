@@ -30,7 +30,7 @@ type Store struct {
 
 import (
 	"database/sql"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/arcmantle/go-sqlite3"
 )
 
 type Service struct {
@@ -43,7 +43,7 @@ type Service struct {
 	if err == nil {
 		t.Fatal("check accepted SQLite details outside the adapter")
 	}
-	for _, want := range []string{"storage/service.go", "database/sql", "github.com/mattn/go-sqlite3"} {
+	for _, want := range []string{"storage/service.go", "database/sql", "github.com/arcmantle/go-sqlite3"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("boundary error = %q, want %q", err, want)
 		}

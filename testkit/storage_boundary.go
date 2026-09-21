@@ -12,8 +12,8 @@ import (
 )
 
 var sqliteImplementationImports = map[string]struct{}{
-	"database/sql":                {},
-	"github.com/mattn/go-sqlite3": {},
+	"database/sql":                    {},
+	"github.com/arcmantle/go-sqlite3": {},
 }
 
 func CheckStorageAdapterBoundary(root string) error {

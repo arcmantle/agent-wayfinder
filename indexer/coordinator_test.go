@@ -326,6 +326,7 @@ func TestManagerRecoversFromPublisherPanic(t *testing.T) {
 			return nil
 		}),
 		indexer.WithPublishThrottle(time.Millisecond),
+		indexer.WithRetryBackoff(time.Millisecond, time.Millisecond),
 	)
 	t.Cleanup(func() {
 		if err := manager.Stop(root); err != nil {

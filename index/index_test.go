@@ -48,6 +48,30 @@ type contributionSessionStore struct {
 	sealed                  bool
 }
 
+type uncoveredCatalogStore struct {
+	snapshot storage.Snapshot
+}
+
+func (store uncoveredCatalogStore) OpenSnapshot(context.Context, storage.OpenSnapshotRequest) (storage.Snapshot, error) {
+	return store.snapshot, nil
+}
+
+func (uncoveredCatalogStore) SourceContributions(context.Context, storage.Snapshot) ([]storage.SourceContribution, error) {
+	return nil, nil
+}
+
+func (uncoveredCatalogStore) CatalogUnitsCovered(context.Context, storage.Snapshot) (bool, error) {
+	return false, nil
+}
+
+func (uncoveredCatalogStore) WriteCatalog(context.Context, storage.Snapshot, storage.CatalogWriteRequest) error {
+	return nil
+}
+
+func (uncoveredCatalogStore) CopyCatalog(context.Context, storage.Snapshot, storage.Snapshot) error {
+	return nil
+}
+
 func (store *contributionSessionStore) Publish(context.Context, storage.PublishRequest) (storage.Snapshot, error) {
 	return storage.Snapshot{}, errors.New("initial index used legacy publisher")
 }
@@ -64,6 +88,12 @@ func (store *contributionSessionStore) BeginContributionSession(ctx context.Cont
 type contributionSessionObserver struct {
 	storage.ContributionSession
 	store *contributionSessionStore
+}
+
+type catalogEmbeddingGenerator struct{}
+
+func (catalogEmbeddingGenerator) GenerateCatalogEmbedding(context.Context, string) ([]float32, error) {
+	return []float32{0.25, 0.75}, nil
 }
 
 func (observer contributionSessionObserver) StageSource(ctx context.Context, sourcePath string) error {
@@ -220,6 +250,166 @@ func TestIndexPublishesInitialWorkspaceThroughContributionSession(t *testing.T) 
 	}
 	if !hasImportTargetFrom(collector, "src/main.ts", "src/helper.ts::helper", "typescript:imports_from") {
 		t.Errorf("indexed graph does not contain the resolved TypeScript import: %+v", collector.edges)
+	}
+}
+
+func TestIndexPublishesGraphWithoutWritingCatalog(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/token.go": "package validator\n\n// ValidateToken checks a signed access token.\nfunc ValidateToken(token string) error { return nil }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close graph store: %v", err)
+		}
+	})
+
+	result, err := index.Index(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("index workspace: %v", err)
+	}
+	matches, err := store.SearchCatalog(context.Background(), result.Snapshot, storage.CatalogSearchRequest{Text: "validate token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search catalog before later refresh: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("catalog matches before later refresh = %+v, want none", matches)
+	}
+}
+
+func TestCatalogRefreshCopiesUnchangedUnitsAndReplacesChangedUnits(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/other.go": "package validator\n\nfunc KeepToken() error { return nil }\n",
+		"validator/token.go": "package validator\n\nfunc ValidateToken() error { return nil }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	first, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish initial graph: %v", err)
+	}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{Root: workspace.Root}); err != nil {
+		t.Fatalf("build initial catalog: %v", err)
+	}
+
+	workspace.WriteFile(t, "validator/token.go", "package validator\n\n// ValidateToken verifies a signed token.\nfunc ValidateToken() error { return nil }\n")
+	second, err := index.PublishBatch(context.Background(), store, index.BatchRequest{
+		Root:         workspace.Root,
+		ChangedPaths: []string{"validator/token.go"},
+	})
+	if err != nil {
+		t.Fatalf("publish changed graph: %v", err)
+	}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root:             workspace.Root,
+		PreviousSnapshot: first,
+		ChangedPaths:     []string{"validator/token.go"},
+	}); err != nil {
+		t.Fatalf("refresh changed catalog: %v", err)
+	}
+
+	matches, err := store.SearchCatalog(context.Background(), second, storage.CatalogSearchRequest{Text: "token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search refreshed catalog: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("refreshed catalog matches = %+v, want changed and unchanged units", matches)
+	}
+	for _, match := range matches {
+		if match.Entry.Name == "ValidateToken" && !strings.Contains(match.Entry.DeterministicSynopsis, "verifies a signed token") {
+			t.Errorf("changed catalog entry = %+v, want refreshed synopsis", match.Entry)
+		}
+	}
+}
+
+func TestCatalogRefreshUsesPublishedSnapshotSources(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/token.go": "package validator\n\n// ValidateToken checks the published token.\nfunc ValidateToken() error { return nil }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	snapshot, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish graph: %v", err)
+	}
+	workspace.WriteFile(t, "validator/token.go", "package validator\n\n// ValidateToken reads newer live content.\nfunc ValidateToken() error { return nil }\n")
+
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{Root: workspace.Root, Snapshot: snapshot}); err != nil {
+		t.Fatalf("build delayed catalog: %v", err)
+	}
+
+	matches, err := store.SearchCatalog(context.Background(), snapshot, storage.CatalogSearchRequest{Text: "validate token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search delayed catalog: %v", err)
+	}
+	if len(matches) != 1 || !strings.Contains(matches[0].Entry.DeterministicSynopsis, "checks the published token") {
+		t.Errorf("catalog matches = %+v, want synopsis from published source", matches)
+	}
+}
+
+func TestCatalogRejectsSnapshotWithoutCatalogUnitCoverage(t *testing.T) {
+	workspace := t.TempDir()
+	store := uncoveredCatalogStore{snapshot: storage.Snapshot{Workspace: workspace, Version: 1}}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{Root: workspace, Snapshot: store.snapshot}); err == nil || !strings.Contains(err.Error(), "catalog units require a full re-index") {
+		t.Errorf("catalog error = %v, want full re-index requirement", err)
+	}
+}
+
+func TestCatalogRefreshOmitsDeletedUnits(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/other.go": "package validator\n\nfunc RemoveToken() error { return nil }\n",
+		"validator/token.go": "package validator\n\nfunc KeepToken() error { return nil }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	first, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish initial graph: %v", err)
+	}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{Root: workspace.Root}); err != nil {
+		t.Fatalf("build initial catalog: %v", err)
+	}
+	workspace.RemoveFile(t, "validator/other.go")
+	second, err := index.PublishBatch(context.Background(), store, index.BatchRequest{
+		Root:         workspace.Root,
+		ChangedPaths: []string{"validator/other.go"},
+	})
+	if err != nil {
+		t.Fatalf("publish deletion graph: %v", err)
+	}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root:             workspace.Root,
+		PreviousSnapshot: first,
+		ChangedPaths:     []string{"validator/other.go"},
+	}); err != nil {
+		t.Fatalf("refresh deleted catalog: %v", err)
+	}
+
+	matches, err := store.SearchCatalog(context.Background(), second, storage.CatalogSearchRequest{Text: "token", Limit: 10})
+	if err != nil {
+		t.Fatalf("search refreshed catalog: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Entry.Name != "KeepToken" {
+		t.Errorf("refreshed catalog matches = %+v, want only KeepToken", matches)
 	}
 }
 

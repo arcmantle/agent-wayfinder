@@ -130,6 +130,7 @@ type SourceContribution struct {
 	SourcePath           string
 	Metadata             extractor.Metadata
 	Facts                graph.Facts
+	CatalogUnits         []extractor.CatalogUnit
 	UnresolvedReferences []extractor.UnresolvedReference
 	SymbolReferences     []extractor.SymbolReference
 	ExportedSurfaces     []extractor.ExportedSurface
@@ -139,6 +140,10 @@ type SourceContribution struct {
 
 type SourceContributionReader interface {
 	SourceContributions(context.Context, Snapshot) ([]SourceContribution, error)
+}
+
+type CatalogUnitCoverageReader interface {
+	CatalogUnitsCovered(context.Context, Snapshot) (bool, error)
 }
 
 type ResolverProjection = extractor.ResolverProjection
@@ -195,6 +200,289 @@ type LexicalMatch struct {
 
 type LexicalSearcher interface {
 	SearchNodes(context.Context, Snapshot, LexicalSearchRequest) ([]LexicalMatch, error)
+}
+
+type CatalogEntry struct {
+	NodeID                string
+	Name                  string
+	DeterministicSynopsis string
+	CopilotSynopsis       string
+	OllamaSynopsis        string
+	ClaudeSynopsis        string
+}
+
+type CatalogWriteRequest struct {
+	Entries []CatalogEntry
+}
+
+type CatalogWriter interface {
+	WriteCatalog(context.Context, Snapshot, CatalogWriteRequest) error
+}
+
+type CatalogTaskState string
+
+const (
+	CatalogTaskQueued   CatalogTaskState = "queued"
+	CatalogTaskRunning  CatalogTaskState = "running"
+	CatalogTaskComplete CatalogTaskState = "complete"
+	CatalogTaskFailed   CatalogTaskState = "failed"
+)
+
+type CatalogTask struct {
+	Workspace      string
+	GraphVersion   GraphVersion
+	State          CatalogTaskState
+	StartedAt      time.Time
+	FinishedAt     time.Time
+	CompletedUnits int
+	TotalUnits     int
+	ChangedPaths   []string
+	Failure        string
+}
+
+type CatalogTaskWriter interface {
+	WriteCatalogTask(context.Context, CatalogTask) error
+}
+
+type CatalogTaskReader interface {
+	ReadCatalogTask(context.Context, string) (CatalogTask, bool, error)
+}
+
+type CatalogCopier interface {
+	CopyCatalog(context.Context, Snapshot, Snapshot) error
+}
+
+type CatalogEntryReadRequest struct {
+	NodeIDs []string
+}
+
+type CatalogEntryReader interface {
+	ReadCatalogEntries(context.Context, Snapshot, CatalogEntryReadRequest) ([]CatalogEntry, error)
+}
+
+type CatalogEmbeddingSource string
+
+const (
+	CatalogEmbeddingDeterministic CatalogEmbeddingSource = "deterministic"
+	CatalogEmbeddingCopilot       CatalogEmbeddingSource = "copilot"
+	CatalogEmbeddingOllama        CatalogEmbeddingSource = "ollama"
+	CatalogEmbeddingClaude        CatalogEmbeddingSource = "claude"
+)
+
+type CatalogEmbedding struct {
+	NodeID string
+	Source CatalogEmbeddingSource
+	Text   string
+	Vector []float32
+}
+
+type CatalogEmbeddingWriteRequest struct {
+	Embeddings []CatalogEmbedding
+}
+
+type CatalogEmbeddingWriter interface {
+	WriteCatalogEmbeddings(context.Context, Snapshot, CatalogEmbeddingWriteRequest) error
+}
+
+type CatalogEmbeddingReadRequest struct {
+	NodeIDs []string
+}
+
+type CatalogEmbeddingReader interface {
+	ReadCatalogEmbeddings(context.Context, Snapshot, CatalogEmbeddingReadRequest) ([]CatalogEmbedding, error)
+}
+
+type CatalogVectorSearchRequest struct {
+	Vector []float32
+	Limit  int
+}
+
+type CatalogVectorSearcher interface {
+	SearchCatalogVectors(context.Context, Snapshot, CatalogVectorSearchRequest) ([]CatalogMatch, error)
+}
+
+type CatalogSearchRequest struct {
+	Text  string
+	Limit int
+}
+
+type CatalogMatch struct {
+	Node  graph.Node
+	Entry CatalogEntry
+	Score float64
+}
+
+type CatalogSearcher interface {
+	SearchCatalog(context.Context, Snapshot, CatalogSearchRequest) ([]CatalogMatch, error)
+}
+
+type CopilotPlannerOutcome string
+
+const (
+	CopilotPlannerOutcomeSuccess  CopilotPlannerOutcome = "success"
+	CopilotPlannerOutcomeFallback CopilotPlannerOutcome = "fallback"
+	CopilotPlannerOutcomeTimeout  CopilotPlannerOutcome = "timeout"
+)
+
+type MetricValueAvailability string
+
+const (
+	MetricValueExact       MetricValueAvailability = "exact"
+	MetricValueUnavailable MetricValueAvailability = "unavailable"
+	MetricValueEstimate    MetricValueAvailability = "estimate"
+)
+
+type MetricValue struct {
+	Value          int64                   `json:"value,omitempty"`
+	Availability   MetricValueAvailability `json:"availability"`
+	EstimateMethod string                  `json:"estimateMethod,omitempty"`
+}
+
+type DollarValue struct {
+	Value          float64                 `json:"value,omitempty"`
+	Availability   MetricValueAvailability `json:"availability"`
+	EstimateMethod string                  `json:"estimateMethod,omitempty"`
+}
+
+func ExactMetricValue(value int64) MetricValue {
+	return MetricValue{Value: value, Availability: MetricValueExact}
+}
+
+type CopilotPlannerMetric struct {
+	RecordedAt              time.Time
+	Model                   string
+	ActualModel             string
+	MaxAICredits            int
+	Outcome                 CopilotPlannerOutcome
+	Duration                time.Duration
+	PromptBytes             int64
+	ResponseBytes           int64
+	InputTokens             MetricValue
+	OutputTokens            MetricValue
+	CacheReadTokens         MetricValue
+	CacheWriteTokens        MetricValue
+	ReasoningTokens         MetricValue
+	SessionTotalNanoAiu     MetricValue
+	PremiumRequestCredits   MetricValue
+	UserRequests            MetricValue
+	APIDurationMilliseconds MetricValue
+}
+
+type CopilotPlannerMetricRecorder interface {
+	RecordCopilotPlannerMetric(context.Context, CopilotPlannerMetric) error
+}
+
+type CopilotPlannerDailyMetricsRequest struct {
+	Day time.Time
+}
+
+type CopilotPlannerDailyMetrics struct {
+	Day                     time.Time     `json:"day"`
+	Model                   string        `json:"model"`
+	ActualModel             string        `json:"actualModel"`
+	MaxAICredits            int           `json:"maxAiCredits"`
+	Successes               int           `json:"successes"`
+	Fallbacks               int           `json:"fallbacks"`
+	Timeouts                int           `json:"timeouts"`
+	Duration                time.Duration `json:"durationNs"`
+	PromptBytes             int64         `json:"promptBytes"`
+	ResponseBytes           int64         `json:"responseBytes"`
+	InputTokens             MetricValue   `json:"inputTokens"`
+	OutputTokens            MetricValue   `json:"outputTokens"`
+	CacheReadTokens         MetricValue   `json:"cacheReadTokens"`
+	CacheWriteTokens        MetricValue   `json:"cacheWriteTokens"`
+	ReasoningTokens         MetricValue   `json:"reasoningTokens"`
+	SessionTotalNanoAiu     MetricValue   `json:"sessionTotalNanoAiu"`
+	PremiumRequestCredits   MetricValue   `json:"premiumRequestCredits"`
+	UserRequests            MetricValue   `json:"userRequests"`
+	APIDurationMilliseconds MetricValue   `json:"apiDurationMilliseconds"`
+	CostUSD                 DollarValue   `json:"costUsd"`
+}
+
+type CopilotPlannerDailyMetricsReader interface {
+	ReadCopilotPlannerDailyMetrics(context.Context, CopilotPlannerDailyMetricsRequest) ([]CopilotPlannerDailyMetrics, error)
+}
+
+type CopilotPlannerMonthlyMetricsRequest struct {
+	Month time.Time
+}
+
+type ClaudePlannerOutcome string
+
+const (
+	ClaudePlannerOutcomeSuccess          ClaudePlannerOutcome = "success"
+	ClaudePlannerOutcomeFallback         ClaudePlannerOutcome = "fallback"
+	ClaudePlannerOutcomeTimeout          ClaudePlannerOutcome = "timeout"
+	ClaudePlannerOutcomeBudget           ClaudePlannerOutcome = "budget"
+	ClaudePlannerOutcomeModelUnavailable ClaudePlannerOutcome = "model_unavailable"
+	ClaudePlannerOutcomeUnavailable      ClaudePlannerOutcome = "unavailable"
+)
+
+type ClaudePlannerMetric struct {
+	RecordedAt              time.Time
+	Model                   string
+	ActualModel             string
+	FallbackModel           string
+	MaxBudgetUSD            float64
+	Effort                  string
+	Outcome                 ClaudePlannerOutcome
+	Duration                time.Duration
+	PromptBytes             int64
+	ResponseBytes           int64
+	InputTokens             MetricValue
+	OutputTokens            MetricValue
+	APIDurationMilliseconds MetricValue
+	CostUSD                 DollarValue
+}
+
+type ClaudePlannerMetricRecorder interface {
+	RecordClaudePlannerMetric(context.Context, ClaudePlannerMetric) error
+}
+
+type ClaudePlannerDailyMetricsRequest struct {
+	Day time.Time
+}
+
+type ClaudePlannerMonthlyMetricsRequest struct {
+	Month time.Time
+}
+
+type ClaudePlannerDailyMetrics struct {
+	Day                     time.Time     `json:"day"`
+	Model                   string        `json:"model"`
+	ActualModel             string        `json:"actualModel"`
+	FallbackModel           string        `json:"fallbackModel"`
+	MaxBudgetUSD            float64       `json:"maxBudgetUsd"`
+	Effort                  string        `json:"effort"`
+	Successes               int           `json:"successes"`
+	Fallbacks               int           `json:"fallbacks"`
+	Timeouts                int           `json:"timeouts"`
+	BudgetFailures          int           `json:"budgetFailures"`
+	ModelUnavailables       int           `json:"modelUnavailables"`
+	Unavailables            int           `json:"unavailables"`
+	Duration                time.Duration `json:"durationNs"`
+	PromptBytes             int64         `json:"promptBytes"`
+	ResponseBytes           int64         `json:"responseBytes"`
+	InputTokens             MetricValue   `json:"inputTokens"`
+	OutputTokens            MetricValue   `json:"outputTokens"`
+	APIDurationMilliseconds MetricValue   `json:"apiDurationMilliseconds"`
+	CostUSD                 DollarValue   `json:"costUsd"`
+}
+
+type ClaudePlannerDailyMetricsReader interface {
+	ReadClaudePlannerDailyMetrics(context.Context, ClaudePlannerDailyMetricsRequest) ([]ClaudePlannerDailyMetrics, error)
+}
+
+type ClaudePlannerMonthlyMetricsReader interface {
+	ReadClaudePlannerMonthlyMetrics(context.Context, ClaudePlannerMonthlyMetricsRequest) ([]ClaudePlannerDailyMetrics, error)
+}
+
+type CopilotPlannerMonthlyMetricsReader interface {
+	ReadCopilotPlannerMonthlyMetrics(context.Context, CopilotPlannerMonthlyMetricsRequest) ([]CopilotPlannerDailyMetrics, error)
+}
+
+type CatalogRemover interface {
+	DeleteCatalogEntries(context.Context, Snapshot, []string) error
 }
 
 type LexicalIndexRebuilder interface {
@@ -321,6 +609,13 @@ type Store interface {
 	ResolverPackagePageReader
 	NodeLookup
 	LexicalSearcher
+	CatalogWriter
+	CatalogTaskWriter
+	CatalogTaskReader
+	CatalogCopier
+	CatalogEntryReader
+	CatalogSearcher
+	CatalogRemover
 	Traverser
 	Explainer
 	Exporter

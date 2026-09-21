@@ -351,6 +351,34 @@ func (contractStore) SearchNodes(context.Context, storage.Snapshot, storage.Lexi
 	panic("unimplemented")
 }
 
+func (contractStore) WriteCatalog(context.Context, storage.Snapshot, storage.CatalogWriteRequest) error {
+	panic("unimplemented")
+}
+
+func (contractStore) WriteCatalogTask(context.Context, storage.CatalogTask) error {
+	panic("unimplemented")
+}
+
+func (contractStore) ReadCatalogTask(context.Context, string) (storage.CatalogTask, bool, error) {
+	panic("unimplemented")
+}
+
+func (contractStore) CopyCatalog(context.Context, storage.Snapshot, storage.Snapshot) error {
+	panic("unimplemented")
+}
+
+func (contractStore) ReadCatalogEntries(context.Context, storage.Snapshot, storage.CatalogEntryReadRequest) ([]storage.CatalogEntry, error) {
+	panic("unimplemented")
+}
+
+func (contractStore) SearchCatalog(context.Context, storage.Snapshot, storage.CatalogSearchRequest) ([]storage.CatalogMatch, error) {
+	panic("unimplemented")
+}
+
+func (contractStore) DeleteCatalogEntries(context.Context, storage.Snapshot, []string) error {
+	panic("unimplemented")
+}
+
 // SourceContributions implements [storage.Store].
 func (c contractStore) SourceContributions(context.Context, storage.Snapshot) ([]storage.SourceContribution, error) {
 	panic("unimplemented")

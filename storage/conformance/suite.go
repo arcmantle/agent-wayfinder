@@ -12,7 +12,7 @@ import (
 
 type StoreFactory func(*testing.T) storage.Store
 
-func Run(t *testing.T, open StoreFactory) {
+func RunStoreSuite(t *testing.T, open StoreFactory) {
 	t.Helper()
 
 	t.Run("publishes a complete workspace snapshot", func(t *testing.T) {

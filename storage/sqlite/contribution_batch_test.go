@@ -50,7 +50,7 @@ func TestContributionSessionBatchFlushesAtRowLimit(t *testing.T) {
 		t.Fatalf("open database: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	store.contributionBatchLimits = contributionBatchLimits{maximumRows: 4, maximumBytes: 1 << 20, maximumSources: 100}
+	store.contributionBatchLimits = contributionBatchLimits{maximumRows: 5, maximumBytes: 1 << 20, maximumSources: 100}
 
 	if _, err := store.database.Exec(`
 		CREATE TRIGGER fail_contribution_batch

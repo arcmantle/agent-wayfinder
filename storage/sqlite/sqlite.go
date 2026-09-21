@@ -3,11 +3,15 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,11 +21,11 @@ import (
 	"agent-wayfinder/graph"
 	"agent-wayfinder/storage"
 
-	"github.com/mattn/go-sqlite3"
+	"github.com/arcmantle/go-sqlite3"
 )
 
 const (
-	CurrentSchemaVersion                         = 11
+	CurrentSchemaVersion                         = 20
 	retainedGraphVersions                        = 25
 	defaultMaxDatabaseBytes                int64 = 4 << 30
 	defaultMaxResolverProjectionCacheBytes int64 = 64 << 20
@@ -92,14 +96,26 @@ var _ storage.ContributionSessionStore = (*Store)(nil)
 var _ storage.ContributionSession = (*contributionSession)(nil)
 var _ storage.AffectedSourceFinder = (*Store)(nil)
 var _ storage.SourceContributionReader = (*Store)(nil)
+var _ storage.CatalogUnitCoverageReader = (*Store)(nil)
 var _ storage.ResolverProjectionReader = (*Store)(nil)
 var _ storage.ResolverProjectionPageReader = (*Store)(nil)
 var _ storage.ResolverTargetReader = (*Store)(nil)
 var _ storage.ResolverPackagePageReader = (*Store)(nil)
+var _ storage.CopilotPlannerMetricRecorder = (*Store)(nil)
+var _ storage.CopilotPlannerDailyMetricsReader = (*Store)(nil)
+var _ storage.ClaudePlannerMetricRecorder = (*Store)(nil)
+var _ storage.ClaudePlannerDailyMetricsReader = (*Store)(nil)
+var _ storage.ClaudePlannerMonthlyMetricsReader = (*Store)(nil)
 var _ storage.SnapshotOpener = (*Store)(nil)
 var _ storage.NodeLookup = (*Store)(nil)
 var _ storage.ExactNodeLookup = (*Store)(nil)
 var _ storage.LexicalSearcher = (*Store)(nil)
+var _ storage.CatalogEmbeddingWriter = (*Store)(nil)
+var _ storage.CatalogEmbeddingReader = (*Store)(nil)
+var _ storage.CatalogVectorSearcher = (*Store)(nil)
+var _ storage.CatalogCopier = (*Store)(nil)
+var _ storage.CatalogTaskWriter = (*Store)(nil)
+var _ storage.CatalogTaskReader = (*Store)(nil)
 var _ storage.LexicalIndexRebuilder = (*Store)(nil)
 var _ storage.Traverser = (*Store)(nil)
 var _ storage.Explainer = (*Store)(nil)
@@ -1067,18 +1083,20 @@ func factTotals(contributions []encodedContribution, workspaceFacts graph.Facts)
 }
 
 type preparedContribution struct {
-	index            int
-	contribution     encodedContribution
-	contributionRows [][]any
-	nodeRows         [][]any
-	edgeRows         [][]any
-	extensionRows    [][]any
-	dependencyRows   [][]any
-	surfaceRows      [][]any
-	diagnosticRows   [][]any
-	unresolvedRows   [][]any
-	bindingRows      [][]any
-	symbolRows       [][]any
+	index               int
+	contribution        encodedContribution
+	contributionRows    [][]any
+	nodeRows            [][]any
+	edgeRows            [][]any
+	catalogUnitRows     [][]any
+	catalogCoverageRows [][]any
+	extensionRows       [][]any
+	dependencyRows      [][]any
+	surfaceRows         [][]any
+	diagnosticRows      [][]any
+	unresolvedRows      [][]any
+	bindingRows         [][]any
+	symbolRows          [][]any
 }
 
 func storePreparedPublication(ctx context.Context, transaction *sql.Tx, variableLimit int, factLimits factBatchLimits, workspace string, version storage.GraphVersion, workspaceFacts graph.Facts, replacedOwners []string, reportWriteMeasurement func(storage.PublishMeasurement), contributions []encodedContribution, reportProgress func(int, int, int)) error {
@@ -1255,6 +1273,18 @@ func prepareContribution(workspace string, version storage.GraphVersion, index i
 	for _, edge := range contribution.graphFacts.Edges {
 		prepared.edgeRows = append(prepared.edgeRows, append([]any{workspace, contribution.sourcePath, version, edge.SourceID, edge.TargetID, edge.Relation}, evidenceValues(edge.Evidence)...))
 	}
+	for _, unit := range contribution.catalogUnits {
+		comments, err := json.Marshal(unit.Comments)
+		if err != nil {
+			return preparedContribution{}, fmt.Errorf("encode catalog unit comments: %w", err)
+		}
+		identifierTokens, err := json.Marshal(unit.IdentifierTokens)
+		if err != nil {
+			return preparedContribution{}, fmt.Errorf("encode catalog unit identifier tokens: %w", err)
+		}
+		prepared.catalogUnitRows = append(prepared.catalogUnitRows, []any{workspace, contribution.sourcePath, version, unit.NodeID, unit.Name, unit.Kind, unit.Owner, unit.Signature, string(comments), string(identifierTokens)})
+	}
+	prepared.catalogCoverageRows = [][]any{{workspace, contribution.sourcePath, version}}
 	for _, extension := range contribution.metadata.Extensions {
 		prepared.extensionRows = append(prepared.extensionRows, []any{workspace, contribution.sourcePath, version, extension})
 	}
@@ -1311,6 +1341,8 @@ func newPublicationBatch(variableLimit int, reportWriteMeasurement func(storage.
 		{prefix: "INSERT INTO file_contributions (workspace, source_path, valid_from_version, project_id, extractor_name, extractor_version) VALUES ", name: "file_contributions"},
 		{prefix: "INSERT OR IGNORE INTO contribution_nodes (workspace, source_path, valid_from_version, node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence) VALUES ", name: "contribution_nodes"},
 		{prefix: "INSERT OR IGNORE INTO contribution_edges (workspace, source_path, valid_from_version, source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence) VALUES ", name: "contribution_edges"},
+		{prefix: "INSERT OR IGNORE INTO contribution_catalog_units (workspace, source_path, valid_from_version, node_id, name, kind, owner, signature, comments, identifier_tokens) VALUES ", name: "contribution_catalog_units"},
+		{prefix: "INSERT OR IGNORE INTO contribution_catalog_unit_coverage (workspace, source_path, valid_from_version) VALUES ", name: "contribution_catalog_unit_coverage"},
 		{prefix: "INSERT OR IGNORE INTO contribution_extensions (workspace, source_path, valid_from_version, extension) VALUES ", name: "contribution_extensions"},
 		{prefix: "INSERT OR IGNORE INTO contribution_dependencies (workspace, source_path, valid_from_version, target_path) VALUES ", name: "contribution_dependencies"},
 		{prefix: "INSERT OR IGNORE INTO contribution_exported_surfaces (workspace, source_path, valid_from_version, node_id, name) VALUES ", name: "contribution_exported_surfaces"},
@@ -1327,6 +1359,8 @@ func (batch *publicationBatch) add(ctx context.Context, transaction *sql.Tx, wor
 		prepared.contributionRows,
 		prepared.nodeRows,
 		prepared.edgeRows,
+		prepared.catalogUnitRows,
+		prepared.catalogCoverageRows,
 		prepared.extensionRows,
 		prepared.dependencyRows,
 		prepared.surfaceRows,
@@ -1591,10 +1625,15 @@ func (store *Store) SourceContributions(ctx context.Context, snapshot storage.Sn
 		if err != nil {
 			return nil, err
 		}
+		catalogUnits, err := store.readCatalogUnits(ctx, snapshot, sourcePath)
+		if err != nil {
+			return nil, err
+		}
 		contributions = append(contributions, storage.SourceContribution{
 			SourcePath:           sourcePath,
 			Metadata:             metadata,
 			Facts:                facts,
+			CatalogUnits:         catalogUnits,
 			UnresolvedReferences: data.UnresolvedReferences,
 			SymbolReferences:     data.SymbolReferences,
 			ExportedSurfaces:     data.ExportedSurfaces,
@@ -1603,6 +1642,32 @@ func (store *Store) SourceContributions(ctx context.Context, snapshot storage.Sn
 		})
 	}
 	return contributions, nil
+}
+
+func (store *Store) CatalogUnitsCovered(ctx context.Context, snapshot storage.Snapshot) (bool, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 {
+		return false, fmt.Errorf("read catalog-unit coverage: %w: snapshot is required", storage.ErrInvalidRequest)
+	}
+	var missing int
+	if err := store.database.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM file_contributions AS contributions
+			WHERE contributions.workspace = ?
+				AND contributions.valid_from_version <= ?
+				AND (contributions.valid_to_version IS NULL OR contributions.valid_to_version >= ?)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM contribution_catalog_unit_coverage AS coverage
+					WHERE coverage.workspace = contributions.workspace
+						AND coverage.source_path = contributions.source_path
+						AND coverage.valid_from_version <= ?
+						AND (coverage.valid_to_version IS NULL OR coverage.valid_to_version >= ?)
+				)
+		)`, snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Version, snapshot.Version).Scan(&missing); err != nil {
+		return false, fmt.Errorf("read catalog-unit coverage: %w", err)
+	}
+	return missing == 0, nil
 }
 
 func (store *Store) ResolverProjections(ctx context.Context, snapshot storage.Snapshot) ([]storage.ResolverProjection, error) {
@@ -1987,12 +2052,23 @@ func sourceContributionFromStorage(contribution storage.SourceContribution) stor
 		SourcePath:           contribution.SourcePath,
 		Metadata:             extractor.Metadata{Name: contribution.Metadata.Name, Version: contribution.Metadata.Version, Extensions: append([]string(nil), contribution.Metadata.Extensions...)},
 		Facts:                graph.Facts{Nodes: append([]graph.Node(nil), contribution.Facts.Nodes...), Edges: append([]graph.Edge(nil), contribution.Facts.Edges...)},
+		CatalogUnits:         copyCatalogUnits(contribution.CatalogUnits),
 		UnresolvedReferences: copyUnresolvedReferences(contribution.UnresolvedReferences),
 		SymbolReferences:     append([]extractor.SymbolReference(nil), contribution.SymbolReferences...),
 		ExportedSurfaces:     append([]extractor.ExportedSurface(nil), contribution.ExportedSurfaces...),
 		Dependencies:         append([]extractor.Dependency(nil), contribution.Dependencies...),
 		Diagnostics:          append([]extractor.Diagnostic(nil), contribution.Diagnostics...),
 	}
+}
+
+func copyCatalogUnits(units []extractor.CatalogUnit) []extractor.CatalogUnit {
+	copied := make([]extractor.CatalogUnit, len(units))
+	for index, unit := range units {
+		copied[index] = unit
+		copied[index].Comments = append([]string(nil), unit.Comments...)
+		copied[index].IdentifierTokens = append([]string(nil), unit.IdentifierTokens...)
+	}
+	return copied
 }
 
 func copyUnresolvedReferences(references []extractor.UnresolvedReference) []extractor.UnresolvedReference {
@@ -2177,6 +2253,934 @@ func (store *Store) RebuildLexicalIndex(ctx context.Context, workspace string) e
 		return fmt.Errorf("commit lexical index rebuild: %w", err)
 	}
 	return nil
+}
+
+func (store *Store) RecordCopilotPlannerMetric(ctx context.Context, metric storage.CopilotPlannerMetric) error {
+	metric = normalizeCopilotPlannerMetric(metric)
+	if err := validateCopilotPlannerMetric(metric); err != nil {
+		return err
+	}
+	_, err := store.database.ExecContext(ctx, `
+		INSERT INTO copilot_planner_metrics (
+			recorded_at, day, model, max_ai_credits, outcome, duration_ns, prompt_bytes, response_bytes,
+			output_tokens, output_tokens_availability, output_tokens_estimate_method,
+			session_total_nano_aiu, session_total_nano_aiu_availability, session_total_nano_aiu_estimate_method,
+			actual_model, input_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+			premium_request_credits, user_requests, api_duration_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		metric.RecordedAt.UTC().Format(time.RFC3339Nano),
+		metric.RecordedAt.UTC().Format("2006-01-02"),
+		metric.Model,
+		metric.MaxAICredits,
+		metric.Outcome,
+		metric.Duration.Nanoseconds(),
+		metric.PromptBytes,
+		metric.ResponseBytes,
+		metricValueDatabaseValue(metric.OutputTokens),
+		metric.OutputTokens.Availability,
+		metric.OutputTokens.EstimateMethod,
+		metricValueDatabaseValue(metric.SessionTotalNanoAiu),
+		metric.SessionTotalNanoAiu.Availability,
+		metric.SessionTotalNanoAiu.EstimateMethod,
+		metric.ActualModel,
+		metricValueDatabaseValue(metric.InputTokens),
+		metricValueDatabaseValue(metric.CacheReadTokens),
+		metricValueDatabaseValue(metric.CacheWriteTokens),
+		metricValueDatabaseValue(metric.ReasoningTokens),
+		metricValueDatabaseValue(metric.PremiumRequestCredits),
+		metricValueDatabaseValue(metric.UserRequests),
+		metricValueDatabaseValue(metric.APIDurationMilliseconds),
+	)
+	if err != nil {
+		return fmt.Errorf("record Copilot planner metric: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) RecordClaudePlannerMetric(ctx context.Context, metric storage.ClaudePlannerMetric) error {
+	if metric.RecordedAt.IsZero() || metric.Model == "" || metric.Outcome == "" {
+		return fmt.Errorf("record Claude planner metric: %w: recorded time, model, and outcome are required", storage.ErrInvalidRequest)
+	}
+	_, err := store.database.ExecContext(ctx, `
+		INSERT INTO claude_planner_metrics (
+			recorded_at, day, model, actual_model, fallback_model, max_budget_usd, effort, outcome,
+			duration_ns, prompt_bytes, response_bytes, input_tokens, input_tokens_availability,
+			output_tokens, output_tokens_availability, api_duration_ms, api_duration_ms_availability,
+			cost_usd, cost_usd_availability
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		metric.RecordedAt.UTC().Format(time.RFC3339Nano),
+		metric.RecordedAt.UTC().Format("2006-01-02"),
+		metric.Model,
+		metric.ActualModel,
+		metric.FallbackModel,
+		metric.MaxBudgetUSD,
+		metric.Effort,
+		metric.Outcome,
+		metric.Duration.Nanoseconds(),
+		metric.PromptBytes,
+		metric.ResponseBytes,
+		metricValueDatabaseValue(metric.InputTokens),
+		metric.InputTokens.Availability,
+		metricValueDatabaseValue(metric.OutputTokens),
+		metric.OutputTokens.Availability,
+		metricValueDatabaseValue(metric.APIDurationMilliseconds),
+		metric.APIDurationMilliseconds.Availability,
+		dollarValueDatabaseValue(metric.CostUSD),
+		metric.CostUSD.Availability,
+	)
+	if err != nil {
+		return fmt.Errorf("record Claude planner metric: %w", err)
+	}
+	return nil
+}
+
+func dollarValueDatabaseValue(value storage.DollarValue) any {
+	if value.Availability != storage.MetricValueExact && value.Availability != storage.MetricValueEstimate {
+		return nil
+	}
+	return value.Value
+}
+
+func (store *Store) ReadClaudePlannerDailyMetrics(ctx context.Context, request storage.ClaudePlannerDailyMetricsRequest) ([]storage.ClaudePlannerDailyMetrics, error) {
+	if request.Day.IsZero() {
+		return nil, fmt.Errorf("read Claude planner daily metrics: %w: day is required", storage.ErrInvalidRequest)
+	}
+	day := request.Day.UTC()
+	return store.readClaudePlannerMetrics(ctx, time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC), time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1))
+}
+
+func (store *Store) ReadClaudePlannerMonthlyMetrics(ctx context.Context, request storage.ClaudePlannerMonthlyMetricsRequest) ([]storage.ClaudePlannerDailyMetrics, error) {
+	if request.Month.IsZero() {
+		return nil, fmt.Errorf("read Claude planner monthly metrics: %w: month is required", storage.ErrInvalidRequest)
+	}
+	month := request.Month.UTC()
+	start := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return store.readClaudePlannerMetrics(ctx, start, start.AddDate(0, 1, 0))
+}
+
+func (store *Store) readClaudePlannerMetrics(ctx context.Context, start, end time.Time) ([]storage.ClaudePlannerDailyMetrics, error) {
+	rows, err := store.database.QueryContext(ctx, `
+		SELECT day, model, COALESCE(NULLIF(actual_model, ''), model), fallback_model, MAX(max_budget_usd), effort,
+		SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN outcome = 'fallback' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN outcome = 'timeout' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN outcome = 'budget' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN outcome = 'model_unavailable' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN outcome = 'unavailable' THEN 1 ELSE 0 END),
+		SUM(duration_ns), SUM(prompt_bytes), SUM(response_bytes),
+		COUNT(input_tokens), COALESCE(SUM(input_tokens), 0),
+		COUNT(output_tokens), COALESCE(SUM(output_tokens), 0),
+		COUNT(api_duration_ms), COALESCE(SUM(api_duration_ms), 0),
+		COUNT(cost_usd), COALESCE(SUM(cost_usd), 0)
+		FROM claude_planner_metrics
+		WHERE day >= ? AND day < ?
+		GROUP BY day, model, actual_model, fallback_model, effort
+		ORDER BY day, model, effort`, start.Format(time.DateOnly), end.Format(time.DateOnly))
+	if err != nil {
+		return nil, fmt.Errorf("read Claude planner daily metrics: %w", err)
+	}
+	defer rows.Close()
+	metrics := make([]storage.ClaudePlannerDailyMetrics, 0)
+	for rows.Next() {
+		var metric storage.ClaudePlannerDailyMetrics
+		var day string
+		var durationNS, inputCount, inputTokens, outputCount, outputTokens, apiCount, apiDuration, costCount int64
+		var cost float64
+		if err := rows.Scan(&day, &metric.Model, &metric.ActualModel, &metric.FallbackModel, &metric.MaxBudgetUSD, &metric.Effort, &metric.Successes, &metric.Fallbacks, &metric.Timeouts, &metric.BudgetFailures, &metric.ModelUnavailables, &metric.Unavailables, &durationNS, &metric.PromptBytes, &metric.ResponseBytes, &inputCount, &inputTokens, &outputCount, &outputTokens, &apiCount, &apiDuration, &costCount, &cost); err != nil {
+			return nil, fmt.Errorf("scan Claude planner daily metrics: %w", err)
+		}
+		parsedDay, err := time.Parse(time.DateOnly, day)
+		if err != nil {
+			return nil, fmt.Errorf("parse Claude planner metric day: %w", err)
+		}
+		metric.Day = parsedDay
+		metric.Duration = time.Duration(durationNS)
+		requests := metric.Successes + metric.Fallbacks + metric.Timeouts + metric.BudgetFailures + metric.ModelUnavailables + metric.Unavailables
+		if inputCount > 0 && inputCount == int64(requests) {
+			metric.InputTokens = storage.ExactMetricValue(inputTokens)
+		} else {
+			metric.InputTokens.Availability = storage.MetricValueUnavailable
+		}
+		if outputCount > 0 && outputCount == int64(requests) {
+			metric.OutputTokens = storage.ExactMetricValue(outputTokens)
+		} else {
+			metric.OutputTokens.Availability = storage.MetricValueUnavailable
+		}
+		if apiCount > 0 && apiCount == int64(requests) {
+			metric.APIDurationMilliseconds = storage.ExactMetricValue(apiDuration)
+		} else {
+			metric.APIDurationMilliseconds.Availability = storage.MetricValueUnavailable
+		}
+		if costCount > 0 && costCount == int64(requests) {
+			metric.CostUSD = storage.DollarValue{Value: cost, Availability: storage.MetricValueExact}
+		} else {
+			metric.CostUSD.Availability = storage.MetricValueUnavailable
+		}
+		metrics = append(metrics, metric)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read Claude planner daily metrics: %w", err)
+	}
+	return metrics, nil
+}
+
+func normalizeCopilotPlannerMetric(metric storage.CopilotPlannerMetric) storage.CopilotPlannerMetric {
+	for _, value := range []*storage.MetricValue{
+		&metric.InputTokens,
+		&metric.CacheReadTokens,
+		&metric.CacheWriteTokens,
+		&metric.ReasoningTokens,
+		&metric.PremiumRequestCredits,
+		&metric.UserRequests,
+		&metric.APIDurationMilliseconds,
+	} {
+		if value.Availability == "" && value.Value == 0 && value.EstimateMethod == "" {
+			value.Availability = storage.MetricValueUnavailable
+		}
+	}
+	return metric
+}
+
+func (store *Store) ReadCopilotPlannerDailyMetrics(ctx context.Context, request storage.CopilotPlannerDailyMetricsRequest) ([]storage.CopilotPlannerDailyMetrics, error) {
+	if request.Day.IsZero() {
+		return nil, fmt.Errorf("read Copilot planner daily metrics: %w: day is required", storage.ErrInvalidRequest)
+	}
+	day := request.Day.UTC()
+	start := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+	return store.readCopilotPlannerMetrics(ctx, start, start.AddDate(0, 0, 1))
+}
+
+func (store *Store) ReadCopilotPlannerMonthlyMetrics(ctx context.Context, request storage.CopilotPlannerMonthlyMetricsRequest) ([]storage.CopilotPlannerDailyMetrics, error) {
+	if request.Month.IsZero() {
+		return nil, fmt.Errorf("read Copilot planner monthly metrics: %w: month is required", storage.ErrInvalidRequest)
+	}
+	month := request.Month.UTC()
+	start := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return store.readCopilotPlannerMetrics(ctx, start, start.AddDate(0, 1, 0))
+}
+
+func (store *Store) readCopilotPlannerMetrics(ctx context.Context, start, end time.Time) ([]storage.CopilotPlannerDailyMetrics, error) {
+	rows, err := store.database.QueryContext(ctx, `
+		SELECT
+			day,
+			COALESCE(NULLIF(actual_model, ''), model),
+			MAX(max_ai_credits),
+			SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN outcome = 'fallback' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN outcome = 'timeout' THEN 1 ELSE 0 END),
+			SUM(duration_ns),
+			SUM(prompt_bytes),
+			SUM(response_bytes),
+			COUNT(*),
+			SUM(CASE WHEN output_tokens_availability = 'exact' THEN 1 ELSE 0 END),
+			COALESCE(SUM(CASE WHEN output_tokens_availability = 'exact' THEN output_tokens ELSE 0 END), 0),
+			SUM(CASE WHEN output_tokens_availability = 'estimate' THEN 1 ELSE 0 END),
+			COALESCE(SUM(CASE WHEN output_tokens_availability = 'estimate' THEN output_tokens ELSE 0 END), 0),
+			COALESCE(MIN(CASE WHEN output_tokens_availability = 'estimate' THEN output_tokens_estimate_method END), ''),
+			COUNT(DISTINCT CASE WHEN output_tokens_availability = 'estimate' THEN output_tokens_estimate_method END),
+			SUM(CASE WHEN session_total_nano_aiu_availability = 'exact' THEN 1 ELSE 0 END),
+			COALESCE(SUM(CASE WHEN session_total_nano_aiu_availability = 'exact' THEN session_total_nano_aiu ELSE 0 END), 0),
+			SUM(CASE WHEN session_total_nano_aiu_availability = 'estimate' THEN 1 ELSE 0 END),
+			COALESCE(SUM(CASE WHEN session_total_nano_aiu_availability = 'estimate' THEN session_total_nano_aiu ELSE 0 END), 0),
+			COALESCE(MIN(CASE WHEN session_total_nano_aiu_availability = 'estimate' THEN session_total_nano_aiu_estimate_method END), ''),
+			COUNT(DISTINCT CASE WHEN session_total_nano_aiu_availability = 'estimate' THEN session_total_nano_aiu_estimate_method END),
+			COUNT(input_tokens), COALESCE(SUM(input_tokens), 0),
+			COUNT(cache_read_tokens), COALESCE(SUM(cache_read_tokens), 0),
+			COUNT(cache_write_tokens), COALESCE(SUM(cache_write_tokens), 0),
+			COUNT(reasoning_tokens), COALESCE(SUM(reasoning_tokens), 0),
+			COUNT(premium_request_credits), COALESCE(SUM(premium_request_credits), 0),
+			COUNT(user_requests), COALESCE(SUM(user_requests), 0),
+			COUNT(api_duration_ms), COALESCE(SUM(api_duration_ms), 0)
+		FROM copilot_planner_metrics
+		WHERE day >= ? AND day < ?
+		GROUP BY day, COALESCE(NULLIF(actual_model, ''), model)
+		ORDER BY day, COALESCE(NULLIF(actual_model, ''), model)`, start.Format(time.DateOnly), end.Format(time.DateOnly))
+	if err != nil {
+		return nil, fmt.Errorf("read Copilot planner daily metrics: %w", err)
+	}
+	defer rows.Close()
+
+	metrics := make([]storage.CopilotPlannerDailyMetrics, 0)
+	for rows.Next() {
+		var metric storage.CopilotPlannerDailyMetrics
+		var durationNS int64
+		var recordCount, exactOutputTokenCount, estimatedOutputTokenCount, estimatedOutputTokenMethodCount int
+		var exactNanoAiuCount, estimatedNanoAiuCount, estimatedNanoAiuMethodCount int
+		var exactOutputTokens, estimatedOutputTokens, exactNanoAiu, estimatedNanoAiu int64
+		var inputTokenCount, cacheReadTokenCount, cacheWriteTokenCount, reasoningTokenCount int
+		var premiumRequestCreditCount, userRequestCount, apiDurationMillisecondsCount int
+		var inputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens int64
+		var premiumRequestCredits, userRequests, apiDurationMilliseconds int64
+		var estimatedOutputTokenMethod, estimatedNanoAiuMethod string
+		var metricDay string
+		if err := rows.Scan(
+			&metricDay,
+			&metric.ActualModel,
+			&metric.MaxAICredits,
+			&metric.Successes,
+			&metric.Fallbacks,
+			&metric.Timeouts,
+			&durationNS,
+			&metric.PromptBytes,
+			&metric.ResponseBytes,
+			&recordCount,
+			&exactOutputTokenCount,
+			&exactOutputTokens,
+			&estimatedOutputTokenCount,
+			&estimatedOutputTokens,
+			&estimatedOutputTokenMethod,
+			&estimatedOutputTokenMethodCount,
+			&exactNanoAiuCount,
+			&exactNanoAiu,
+			&estimatedNanoAiuCount,
+			&estimatedNanoAiu,
+			&estimatedNanoAiuMethod,
+			&estimatedNanoAiuMethodCount,
+			&inputTokenCount,
+			&inputTokens,
+			&cacheReadTokenCount,
+			&cacheReadTokens,
+			&cacheWriteTokenCount,
+			&cacheWriteTokens,
+			&reasoningTokenCount,
+			&reasoningTokens,
+			&premiumRequestCreditCount,
+			&premiumRequestCredits,
+			&userRequestCount,
+			&userRequests,
+			&apiDurationMillisecondsCount,
+			&apiDurationMilliseconds,
+		); err != nil {
+			return nil, fmt.Errorf("read Copilot planner daily metrics: %w", err)
+		}
+		day, err := time.Parse(time.DateOnly, metricDay)
+		if err != nil {
+			return nil, fmt.Errorf("read Copilot planner daily metrics: parse day: %w", err)
+		}
+		metric.Model = metric.ActualModel
+		metric.Day = day.UTC()
+		metric.Duration = time.Duration(durationNS)
+		metric.OutputTokens = aggregateMetricValue(recordCount, exactOutputTokenCount, exactOutputTokens, estimatedOutputTokenCount, estimatedOutputTokens, estimatedOutputTokenMethod, estimatedOutputTokenMethodCount)
+		metric.SessionTotalNanoAiu = aggregateMetricValue(recordCount, exactNanoAiuCount, exactNanoAiu, estimatedNanoAiuCount, estimatedNanoAiu, estimatedNanoAiuMethod, estimatedNanoAiuMethodCount)
+		metric.InputTokens = aggregateExactMetricValue(recordCount, inputTokenCount, inputTokens)
+		metric.CacheReadTokens = aggregateExactMetricValue(recordCount, cacheReadTokenCount, cacheReadTokens)
+		metric.CacheWriteTokens = aggregateExactMetricValue(recordCount, cacheWriteTokenCount, cacheWriteTokens)
+		metric.ReasoningTokens = aggregateExactMetricValue(recordCount, reasoningTokenCount, reasoningTokens)
+		metric.PremiumRequestCredits = aggregateExactMetricValue(recordCount, premiumRequestCreditCount, premiumRequestCredits)
+		metric.UserRequests = aggregateExactMetricValue(recordCount, userRequestCount, userRequests)
+		metric.APIDurationMilliseconds = aggregateExactMetricValue(recordCount, apiDurationMillisecondsCount, apiDurationMilliseconds)
+		metric.CostUSD = dollarValue(metric.PremiumRequestCredits)
+		metrics = append(metrics, metric)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read Copilot planner daily metrics: %w", err)
+	}
+	return metrics, nil
+}
+
+func validateCopilotPlannerMetric(metric storage.CopilotPlannerMetric) error {
+	if metric.RecordedAt.IsZero() || metric.Model == "" || metric.MaxAICredits < 1 || metric.Duration < 0 || metric.PromptBytes < 0 || metric.ResponseBytes < 0 {
+		return fmt.Errorf("record Copilot planner metric: %w", storage.ErrInvalidRequest)
+	}
+	if metric.Outcome != storage.CopilotPlannerOutcomeSuccess && metric.Outcome != storage.CopilotPlannerOutcomeFallback && metric.Outcome != storage.CopilotPlannerOutcomeTimeout {
+		return fmt.Errorf("record Copilot planner metric: %w", storage.ErrInvalidRequest)
+	}
+	if !validMetricValue(metric.InputTokens) || !validMetricValue(metric.OutputTokens) || !validMetricValue(metric.CacheReadTokens) || !validMetricValue(metric.CacheWriteTokens) || !validMetricValue(metric.ReasoningTokens) || !validMetricValue(metric.SessionTotalNanoAiu) || !validMetricValue(metric.PremiumRequestCredits) || !validMetricValue(metric.UserRequests) || !validMetricValue(metric.APIDurationMilliseconds) {
+		return fmt.Errorf("record Copilot planner metric: %w", storage.ErrInvalidRequest)
+	}
+	return nil
+}
+
+func validMetricValue(value storage.MetricValue) bool {
+	if value.Value < 0 {
+		return false
+	}
+	switch value.Availability {
+	case storage.MetricValueExact, storage.MetricValueUnavailable:
+		return value.EstimateMethod == ""
+	case storage.MetricValueEstimate:
+		return value.EstimateMethod != ""
+	default:
+		return false
+	}
+}
+
+func metricValueDatabaseValue(value storage.MetricValue) any {
+	if value.Availability != storage.MetricValueExact && value.Availability != storage.MetricValueEstimate {
+		return nil
+	}
+	return value.Value
+}
+
+func aggregateMetricValue(recordCount, exactCount int, exactValue int64, estimatedCount int, estimatedValue int64, estimateMethod string, estimateMethodCount int) storage.MetricValue {
+	if recordCount > 0 && recordCount == exactCount {
+		return storage.ExactMetricValue(exactValue)
+	}
+	if recordCount > 0 && recordCount == estimatedCount && estimateMethodCount == 1 {
+		return storage.MetricValue{Value: estimatedValue, Availability: storage.MetricValueEstimate, EstimateMethod: estimateMethod}
+	}
+	return storage.MetricValue{Availability: storage.MetricValueUnavailable}
+}
+
+func aggregateExactMetricValue(recordCount, exactCount int, value int64) storage.MetricValue {
+	if recordCount > 0 && recordCount == exactCount {
+		return storage.ExactMetricValue(value)
+	}
+	return storage.MetricValue{Availability: storage.MetricValueUnavailable}
+}
+
+func dollarValue(credits storage.MetricValue) storage.DollarValue {
+	if credits.Availability != storage.MetricValueExact {
+		return storage.DollarValue{Availability: storage.MetricValueUnavailable}
+	}
+	return storage.DollarValue{Value: float64(credits.Value) / 100, Availability: storage.MetricValueEstimate, EstimateMethod: "used credits / 100"}
+}
+
+func (store *Store) WriteCatalog(ctx context.Context, snapshot storage.Snapshot, request storage.CatalogWriteRequest) error {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || len(request.Entries) == 0 {
+		return fmt.Errorf("write catalog: %w: snapshot and catalog entries are required", storage.ErrInvalidRequest)
+	}
+
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start catalog write: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := verifyCatalogSnapshot(ctx, transaction, snapshot); err != nil {
+		return err
+	}
+	for _, entry := range request.Entries {
+		if entry.NodeID == "" || entry.Name == "" || entry.DeterministicSynopsis == "" {
+			return fmt.Errorf("write catalog: %w: node ID, name, and deterministic synopsis are required", storage.ErrInvalidRequest)
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO catalog_entries (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (workspace, version, node_id) DO UPDATE SET
+				name = excluded.name,
+				deterministic_synopsis = excluded.deterministic_synopsis,
+				copilot_synopsis = excluded.copilot_synopsis,
+				ollama_synopsis = excluded.ollama_synopsis,
+				claude_synopsis = excluded.claude_synopsis`,
+			snapshot.Workspace, snapshot.Version, entry.NodeID, entry.Name, entry.DeterministicSynopsis, entry.CopilotSynopsis, entry.OllamaSynopsis, entry.ClaudeSynopsis); err != nil {
+			return fmt.Errorf("store catalog entry: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_search WHERE workspace = ? AND version = ? AND node_id = ?", snapshot.Workspace, snapshot.Version, entry.NodeID); err != nil {
+			return fmt.Errorf("replace catalog search entry: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO catalog_search (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			snapshot.Workspace, snapshot.Version, entry.NodeID, entry.Name, entry.DeterministicSynopsis, entry.CopilotSynopsis, entry.OllamaSynopsis, entry.ClaudeSynopsis); err != nil {
+			return fmt.Errorf("index catalog entry: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit catalog write: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) WriteCatalogTask(ctx context.Context, task storage.CatalogTask) error {
+	if task.Workspace == "" || task.GraphVersion == 0 || task.State == "" || task.StartedAt.IsZero() || task.CompletedUnits < 0 || task.TotalUnits < 0 || task.CompletedUnits > task.TotalUnits {
+		return fmt.Errorf("write catalog task: %w: workspace, graph version, state, start time, and valid progress are required", storage.ErrInvalidRequest)
+	}
+	changedPaths, err := json.Marshal(task.ChangedPaths)
+	if err != nil {
+		return fmt.Errorf("write catalog task: encode changed paths: %w", err)
+	}
+	if _, err := store.database.ExecContext(ctx, `
+		INSERT INTO catalog_tasks (workspace, graph_version, state, started_at, finished_at, completed_units, total_units, changed_paths, failure)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (workspace) DO UPDATE SET
+			graph_version = excluded.graph_version,
+			state = excluded.state,
+			started_at = excluded.started_at,
+			finished_at = excluded.finished_at,
+			completed_units = excluded.completed_units,
+			total_units = excluded.total_units,
+			changed_paths = excluded.changed_paths,
+			failure = excluded.failure
+		WHERE excluded.graph_version >= catalog_tasks.graph_version`,
+		task.Workspace, task.GraphVersion, task.State, task.StartedAt.UTC().Format(time.RFC3339Nano), nullableTime(task.FinishedAt), task.CompletedUnits, task.TotalUnits, string(changedPaths), task.Failure); err != nil {
+		return fmt.Errorf("write catalog task: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) ReadCatalogTask(ctx context.Context, workspace string) (storage.CatalogTask, bool, error) {
+	if workspace == "" {
+		return storage.CatalogTask{}, false, fmt.Errorf("read catalog task: %w: workspace is required", storage.ErrInvalidRequest)
+	}
+	var task storage.CatalogTask
+	var startedAt, finishedAt, changedPaths string
+	err := store.database.QueryRowContext(ctx, `SELECT graph_version, state, started_at, COALESCE(finished_at, ''), completed_units, total_units, changed_paths, failure FROM catalog_tasks WHERE workspace = ?`, workspace).Scan(&task.GraphVersion, &task.State, &startedAt, &finishedAt, &task.CompletedUnits, &task.TotalUnits, &changedPaths, &task.Failure)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storage.CatalogTask{}, false, nil
+	}
+	if err != nil {
+		return storage.CatalogTask{}, false, fmt.Errorf("read catalog task: %w", err)
+	}
+	if task.StartedAt, err = time.Parse(time.RFC3339Nano, startedAt); err != nil {
+		return storage.CatalogTask{}, false, fmt.Errorf("read catalog task start time: %w", err)
+	}
+	if finishedAt != "" {
+		if task.FinishedAt, err = time.Parse(time.RFC3339Nano, finishedAt); err != nil {
+			return storage.CatalogTask{}, false, fmt.Errorf("read catalog task finish time: %w", err)
+		}
+	}
+	if err := json.Unmarshal([]byte(changedPaths), &task.ChangedPaths); err != nil {
+		return storage.CatalogTask{}, false, fmt.Errorf("read catalog task changed paths: %w", err)
+	}
+	task.Workspace = workspace
+	return task, true, nil
+}
+
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func (store *Store) CopyCatalog(ctx context.Context, source, target storage.Snapshot) error {
+	if source.Workspace == "" || source.Version == 0 || target.Workspace == "" || target.Version == 0 || source.Workspace != target.Workspace {
+		return fmt.Errorf("copy catalog: %w: matching source and target snapshots are required", storage.ErrInvalidRequest)
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start catalog copy: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := verifyCatalogSnapshot(ctx, transaction, source); err != nil {
+		return err
+	}
+	if err := verifyCatalogSnapshot(ctx, transaction, target); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		WITH visible_nodes AS (
+			SELECT node_id FROM contribution_nodes WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION
+			SELECT node_id FROM workspace_nodes WHERE workspace = ? AND version = ?
+		)
+		INSERT INTO catalog_entries (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+		SELECT ?, ?, entry.node_id, entry.name, entry.deterministic_synopsis, entry.copilot_synopsis, entry.ollama_synopsis, entry.claude_synopsis
+		FROM catalog_entries AS entry JOIN visible_nodes ON visible_nodes.node_id = entry.node_id
+		WHERE entry.workspace = ? AND entry.version = ?
+		ON CONFLICT (workspace, version, node_id) DO UPDATE SET
+			name = excluded.name,
+			deterministic_synopsis = excluded.deterministic_synopsis,
+			copilot_synopsis = excluded.copilot_synopsis,
+			ollama_synopsis = excluded.ollama_synopsis,
+			claude_synopsis = excluded.claude_synopsis`,
+		target.Workspace, target.Version, target.Version, target.Workspace, target.Version,
+		target.Workspace, target.Version, source.Workspace, source.Version); err != nil {
+		return fmt.Errorf("copy catalog entries: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		WITH visible_nodes AS (
+			SELECT node_id FROM contribution_nodes WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION
+			SELECT node_id FROM workspace_nodes WHERE workspace = ? AND version = ?
+		)
+		INSERT INTO catalog_embeddings (workspace, version, node_id, source, text, dimensions, vector)
+		SELECT ?, ?, embedding.node_id, embedding.source, embedding.text, embedding.dimensions, embedding.vector
+		FROM catalog_embeddings AS embedding JOIN visible_nodes ON visible_nodes.node_id = embedding.node_id
+		WHERE embedding.workspace = ? AND embedding.version = ?
+		ON CONFLICT (workspace, version, node_id, source) DO UPDATE SET
+			text = excluded.text,
+			dimensions = excluded.dimensions,
+			vector = excluded.vector`,
+		target.Workspace, target.Version, target.Version, target.Workspace, target.Version,
+		target.Workspace, target.Version, source.Workspace, source.Version); err != nil {
+		return fmt.Errorf("copy catalog embeddings: %w", err)
+	}
+	if err := copyCatalogEmbeddingVectors(ctx, transaction, target); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_search WHERE workspace = ? AND version = ?", target.Workspace, target.Version); err != nil {
+		return fmt.Errorf("clear copied catalog search entries: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO catalog_search (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+		SELECT workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis
+		FROM catalog_entries WHERE workspace = ? AND version = ?`, target.Workspace, target.Version); err != nil {
+		return fmt.Errorf("index copied catalog entries: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit catalog copy: %w", err)
+	}
+	return nil
+}
+
+func copyCatalogEmbeddingVectors(ctx context.Context, transaction *sql.Tx, snapshot storage.Snapshot) error {
+	rows, err := transaction.QueryContext(ctx, "SELECT DISTINCT dimensions FROM catalog_embeddings WHERE workspace = ? AND version = ?", snapshot.Workspace, snapshot.Version)
+	if err != nil {
+		return fmt.Errorf("read catalog embedding dimensions: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var dimensions int
+		if err := rows.Scan(&dimensions); err != nil {
+			return fmt.Errorf("read catalog embedding dimension: %w", err)
+		}
+		if err := ensureCatalogEmbeddingVectorTable(ctx, transaction, dimensions); err != nil {
+			return err
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT OR REPLACE INTO "+catalogEmbeddingVectorTable(dimensions)+" (rowid, embedding) SELECT embedding_id, vector FROM catalog_embeddings WHERE workspace = ? AND version = ? AND dimensions = ?", snapshot.Workspace, snapshot.Version, dimensions); err != nil {
+			return fmt.Errorf("index catalog embeddings: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate catalog embedding dimensions: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) ReadCatalogEntries(ctx context.Context, snapshot storage.Snapshot, request storage.CatalogEntryReadRequest) ([]storage.CatalogEntry, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || len(request.NodeIDs) == 0 {
+		return nil, fmt.Errorf("read catalog entries: %w: snapshot and node IDs are required", storage.ErrInvalidRequest)
+	}
+	arguments := make([]any, 0, len(request.NodeIDs)+2)
+	arguments = append(arguments, snapshot.Workspace, snapshot.Version)
+	for _, nodeID := range request.NodeIDs {
+		if nodeID == "" {
+			return nil, fmt.Errorf("read catalog entries: %w: node ID is required", storage.ErrInvalidRequest)
+		}
+		arguments = append(arguments, nodeID)
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(request.NodeIDs)), ",")
+	rows, err := store.database.QueryContext(ctx, "SELECT node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis FROM catalog_entries WHERE workspace = ? AND version = ? AND node_id IN ("+placeholders+") ORDER BY node_id", arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("read catalog entries: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]storage.CatalogEntry, 0)
+	for rows.Next() {
+		var entry storage.CatalogEntry
+		if err := rows.Scan(&entry.NodeID, &entry.Name, &entry.DeterministicSynopsis, &entry.CopilotSynopsis, &entry.OllamaSynopsis, &entry.ClaudeSynopsis); err != nil {
+			return nil, fmt.Errorf("read catalog entry: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate catalog entries: %w", err)
+	}
+	return entries, nil
+}
+
+func (store *Store) WriteCatalogEmbeddings(ctx context.Context, snapshot storage.Snapshot, request storage.CatalogEmbeddingWriteRequest) error {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || len(request.Embeddings) == 0 {
+		return fmt.Errorf("write catalog embeddings: %w: snapshot and embeddings are required", storage.ErrInvalidRequest)
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start catalog embedding write: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := verifyCatalogSnapshot(ctx, transaction, snapshot); err != nil {
+		return err
+	}
+	for _, embedding := range request.Embeddings {
+		if err := writeCatalogEmbedding(ctx, transaction, snapshot, embedding); err != nil {
+			return err
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit catalog embedding write: %w", err)
+	}
+	return nil
+}
+
+func writeCatalogEmbedding(ctx context.Context, transaction *sql.Tx, snapshot storage.Snapshot, embedding storage.CatalogEmbedding) error {
+	if embedding.NodeID == "" || embedding.Text == "" || len(embedding.Vector) == 0 || (embedding.Source != storage.CatalogEmbeddingDeterministic && embedding.Source != storage.CatalogEmbeddingCopilot && embedding.Source != storage.CatalogEmbeddingOllama && embedding.Source != storage.CatalogEmbeddingClaude) {
+		return fmt.Errorf("write catalog embeddings: %w: node ID, source, text, and vector are required", storage.ErrInvalidRequest)
+	}
+	dimensions := len(embedding.Vector)
+	if err := ensureCatalogEmbeddingVectorTable(ctx, transaction, dimensions); err != nil {
+		return err
+	}
+	serialized := serializeCatalogEmbedding(embedding.Vector)
+	var priorID int64
+	var priorDimensions int
+	err := transaction.QueryRowContext(ctx, "SELECT embedding_id, dimensions FROM catalog_embeddings WHERE workspace = ? AND version = ? AND node_id = ? AND source = ?", snapshot.Workspace, snapshot.Version, embedding.NodeID, embedding.Source).Scan(&priorID, &priorDimensions)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("read existing catalog embedding: %w", err)
+	}
+	if err == nil {
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM "+catalogEmbeddingVectorTable(priorDimensions)+" WHERE rowid = ?", priorID); err != nil {
+			return fmt.Errorf("replace catalog embedding vector: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_embeddings WHERE embedding_id = ?", priorID); err != nil {
+			return fmt.Errorf("replace catalog embedding: %w", err)
+		}
+	}
+	result, err := transaction.ExecContext(ctx, "INSERT INTO catalog_embeddings (workspace, version, node_id, source, text, dimensions, vector) VALUES (?, ?, ?, ?, ?, ?, ?)", snapshot.Workspace, snapshot.Version, embedding.NodeID, embedding.Source, embedding.Text, dimensions, serialized)
+	if err != nil {
+		return fmt.Errorf("store catalog embedding: %w", err)
+	}
+	embeddingID, err := result.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("read catalog embedding ID: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, "INSERT INTO "+catalogEmbeddingVectorTable(dimensions)+" (rowid, embedding) VALUES (?, ?)", embeddingID, serialized); err != nil {
+		return fmt.Errorf("index catalog embedding: %w", err)
+	}
+	return nil
+}
+
+func ensureCatalogEmbeddingVectorTable(ctx context.Context, transaction *sql.Tx, dimensions int) error {
+	if dimensions <= 0 || dimensions > 8192 {
+		return fmt.Errorf("write catalog embeddings: %w: vector dimensions must be between 1 and 8192", storage.ErrInvalidRequest)
+	}
+	if _, err := transaction.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS "+catalogEmbeddingVectorTable(dimensions)+" USING vec0(embedding float["+strconv.Itoa(dimensions)+"])"); err != nil {
+		return fmt.Errorf("create catalog embedding vector table: %w", err)
+	}
+	return nil
+}
+
+func catalogEmbeddingVectorTable(dimensions int) string {
+	return "catalog_embedding_vectors_" + strconv.Itoa(dimensions)
+}
+
+func serializeCatalogEmbedding(vector []float32) []byte {
+	serialized := make([]byte, len(vector)*4)
+	for index, value := range vector {
+		binary.LittleEndian.PutUint32(serialized[index*4:], math.Float32bits(value))
+	}
+	return serialized
+}
+
+func (store *Store) ReadCatalogEmbeddings(ctx context.Context, snapshot storage.Snapshot, request storage.CatalogEmbeddingReadRequest) ([]storage.CatalogEmbedding, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || len(request.NodeIDs) == 0 {
+		return nil, fmt.Errorf("read catalog embeddings: %w: snapshot and node IDs are required", storage.ErrInvalidRequest)
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(request.NodeIDs)), ",")
+	arguments := make([]any, 0, len(request.NodeIDs)+2)
+	arguments = append(arguments, snapshot.Workspace, snapshot.Version)
+	for _, nodeID := range request.NodeIDs {
+		if nodeID == "" {
+			return nil, fmt.Errorf("read catalog embeddings: %w: node ID is required", storage.ErrInvalidRequest)
+		}
+		arguments = append(arguments, nodeID)
+	}
+	rows, err := store.database.QueryContext(ctx, "SELECT node_id, source, text, vector FROM catalog_embeddings WHERE workspace = ? AND version = ? AND node_id IN ("+placeholders+") ORDER BY node_id, CASE source WHEN 'deterministic' THEN 0 ELSE 1 END", arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("read catalog embeddings: %w", err)
+	}
+	defer rows.Close()
+	embeddings := make([]storage.CatalogEmbedding, 0)
+	for rows.Next() {
+		var embedding storage.CatalogEmbedding
+		var serialized []byte
+		if err := rows.Scan(&embedding.NodeID, &embedding.Source, &embedding.Text, &serialized); err != nil {
+			return nil, fmt.Errorf("read catalog embedding: %w", err)
+		}
+		vector, err := deserializeCatalogEmbedding(serialized)
+		if err != nil {
+			return nil, err
+		}
+		embedding.Vector = vector
+		embeddings = append(embeddings, embedding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate catalog embeddings: %w", err)
+	}
+	return embeddings, nil
+}
+
+func deserializeCatalogEmbedding(serialized []byte) ([]float32, error) {
+	if len(serialized) == 0 || len(serialized)%4 != 0 {
+		return nil, fmt.Errorf("read catalog embedding: invalid vector encoding")
+	}
+	vector := make([]float32, len(serialized)/4)
+	for index := range vector {
+		vector[index] = math.Float32frombits(binary.LittleEndian.Uint32(serialized[index*4:]))
+	}
+	return vector, nil
+}
+
+func (store *Store) DeleteCatalogEntries(ctx context.Context, snapshot storage.Snapshot, nodeIDs []string) error {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || len(nodeIDs) == 0 {
+		return fmt.Errorf("delete catalog entries: %w: snapshot and node IDs are required", storage.ErrInvalidRequest)
+	}
+
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start catalog cleanup: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := verifyCatalogSnapshot(ctx, transaction, snapshot); err != nil {
+		return err
+	}
+	for _, nodeID := range nodeIDs {
+		if nodeID == "" {
+			return fmt.Errorf("delete catalog entries: %w: node ID is required", storage.ErrInvalidRequest)
+		}
+		if err := deleteCatalogEmbeddings(ctx, transaction, snapshot.Workspace, snapshot.Version, nodeID); err != nil {
+			return err
+		}
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_entries WHERE workspace = ? AND version = ? AND node_id = ?", snapshot.Workspace, snapshot.Version, nodeID); err != nil {
+			return fmt.Errorf("remove catalog entry: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_search WHERE workspace = ? AND version = ? AND node_id = ?", snapshot.Workspace, snapshot.Version, nodeID); err != nil {
+			return fmt.Errorf("remove catalog search entry: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit catalog cleanup: %w", err)
+	}
+	return nil
+}
+
+func deleteCatalogEmbeddings(ctx context.Context, transaction *sql.Tx, workspace string, version storage.GraphVersion, nodeID string) error {
+	if err := deleteCatalogEmbeddingVectors(ctx, transaction, "workspace = ? AND version = ? AND node_id = ?", workspace, version, nodeID); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_embeddings WHERE workspace = ? AND version = ? AND node_id = ?", workspace, version, nodeID); err != nil {
+		return fmt.Errorf("remove catalog embeddings: %w", err)
+	}
+	return nil
+}
+
+func deleteCatalogEmbeddingVectors(ctx context.Context, transaction *sql.Tx, condition string, arguments ...any) error {
+	rows, err := transaction.QueryContext(ctx, "SELECT embedding_id, dimensions FROM catalog_embeddings WHERE "+condition, arguments...)
+	if err != nil {
+		return fmt.Errorf("read catalog embeddings for deletion: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var embeddingID int64
+		var dimensions int
+		if err := rows.Scan(&embeddingID, &dimensions); err != nil {
+			return fmt.Errorf("read catalog embedding for deletion: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM "+catalogEmbeddingVectorTable(dimensions)+" WHERE rowid = ?", embeddingID); err != nil {
+			return fmt.Errorf("remove catalog embedding vector: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate catalog embeddings for deletion: %w", err)
+	}
+	return nil
+}
+
+func verifyCatalogSnapshot(ctx context.Context, transaction *sql.Tx, snapshot storage.Snapshot) error {
+	var found storage.GraphVersion
+	if err := transaction.QueryRowContext(ctx, "SELECT version FROM graph_versions WHERE workspace = ? AND version = ?", snapshot.Workspace, snapshot.Version).Scan(&found); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("catalog snapshot: %w", storage.ErrGraphVersionNotFound)
+		}
+		return fmt.Errorf("read catalog snapshot: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) SearchCatalog(ctx context.Context, snapshot storage.Snapshot, request storage.CatalogSearchRequest) ([]storage.CatalogMatch, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || request.Limit <= 0 {
+		return nil, fmt.Errorf("search catalog: %w: snapshot and positive limit are required", storage.ErrInvalidRequest)
+	}
+	expression := strings.Join(quotedLexicalTerms(lexicalTerms(request.Text), true), " OR ")
+	if expression == "" {
+		return nil, fmt.Errorf("search catalog: %w: search text is required", storage.ErrInvalidRequest)
+	}
+	rows, err := store.database.QueryContext(ctx, `
+		WITH visible_nodes AS (
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+			FROM contribution_nodes WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+			FROM workspace_nodes WHERE workspace = ? AND version = ?
+		)
+		SELECT -bm25(catalog_search, 0, 0, 0, 8, 5, 1, 1, 1), catalog_search.node_id, catalog_search.name,
+			catalog_search.deterministic_synopsis, catalog_search.copilot_synopsis, catalog_search.ollama_synopsis, catalog_search.claude_synopsis,
+			visible_nodes.node_id, visible_nodes.kind, visible_nodes.label, visible_nodes.qualified_name,
+			visible_nodes.span_path, visible_nodes.start_line, visible_nodes.start_column, visible_nodes.end_line, visible_nodes.end_column,
+			visible_nodes.file_hash, visible_nodes.extractor, visible_nodes.provenance, visible_nodes.confidence
+		FROM catalog_search JOIN visible_nodes ON visible_nodes.node_id = catalog_search.node_id
+		WHERE catalog_search.workspace = ? AND catalog_search.version = ? AND catalog_search MATCH ?
+		ORDER BY bm25(catalog_search, 0, 0, 0, 8, 5, 1, 1, 1), visible_nodes.qualified_name, visible_nodes.node_id
+		LIMIT ?`,
+		snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Workspace, snapshot.Version,
+		snapshot.Workspace, snapshot.Version, expression, request.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("search catalog: %w", err)
+	}
+	defer rows.Close()
+
+	matches := make([]storage.CatalogMatch, 0)
+	for rows.Next() {
+		var match storage.CatalogMatch
+		targets := append([]any{&match.Score, &match.Entry.NodeID, &match.Entry.Name, &match.Entry.DeterministicSynopsis, &match.Entry.CopilotSynopsis, &match.Entry.OllamaSynopsis, &match.Entry.ClaudeSynopsis, &match.Node.ID, &match.Node.Kind, &match.Node.Label, &match.Node.QualifiedName}, evidenceScanTargets(&match.Node.Evidence)...)
+		if err := rows.Scan(targets...); err != nil {
+			return nil, fmt.Errorf("read catalog match: %w", err)
+		}
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate catalog matches: %w", err)
+	}
+	return matches, nil
+}
+
+func (store *Store) SearchCatalogVectors(ctx context.Context, snapshot storage.Snapshot, request storage.CatalogVectorSearchRequest) ([]storage.CatalogMatch, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || len(request.Vector) == 0 || request.Limit <= 0 {
+		return nil, fmt.Errorf("search catalog vectors: %w: snapshot, vector, and positive limit are required", storage.ErrInvalidRequest)
+	}
+	table := catalogEmbeddingVectorTable(len(request.Vector))
+	var found string
+	if err := store.database.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&found); err != nil {
+		if err == sql.ErrNoRows {
+			return []storage.CatalogMatch{}, nil
+		}
+		return nil, fmt.Errorf("search catalog vectors: inspect vector table: %w", err)
+	}
+	rows, err := store.database.QueryContext(ctx, fmt.Sprintf(`
+		WITH visible_nodes AS (
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+			FROM contribution_nodes WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+			FROM workspace_nodes WHERE workspace = ? AND version = ?
+		), vector_matches AS (
+			SELECT rowid, distance FROM %s WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+		), ranked_nodes AS (
+			SELECT embedding.node_id, MIN(vector_matches.distance) AS distance
+			FROM vector_matches JOIN catalog_embeddings AS embedding ON embedding.embedding_id = vector_matches.rowid
+			WHERE embedding.workspace = ? AND embedding.version = ?
+			GROUP BY embedding.node_id
+			ORDER BY distance, embedding.node_id
+			LIMIT ?
+		)
+		SELECT -ranked_nodes.distance, entry.node_id, entry.name, entry.deterministic_synopsis, entry.copilot_synopsis, entry.ollama_synopsis, entry.claude_synopsis,
+			visible_nodes.node_id, visible_nodes.kind, visible_nodes.label, visible_nodes.qualified_name,
+			visible_nodes.span_path, visible_nodes.start_line, visible_nodes.start_column, visible_nodes.end_line, visible_nodes.end_column,
+			visible_nodes.file_hash, visible_nodes.extractor, visible_nodes.provenance, visible_nodes.confidence
+		FROM ranked_nodes JOIN catalog_entries AS entry ON entry.workspace = ? AND entry.version = ? AND entry.node_id = ranked_nodes.node_id
+		JOIN visible_nodes ON visible_nodes.node_id = entry.node_id
+		ORDER BY ranked_nodes.distance, visible_nodes.qualified_name, visible_nodes.node_id`, table),
+		snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Workspace, snapshot.Version,
+		serializeCatalogEmbedding(request.Vector), request.Limit*2,
+		snapshot.Workspace, snapshot.Version, request.Limit,
+		snapshot.Workspace, snapshot.Version)
+	if err != nil {
+		return nil, fmt.Errorf("search catalog vectors: %w", err)
+	}
+	defer rows.Close()
+	matches := make([]storage.CatalogMatch, 0)
+	for rows.Next() {
+		var match storage.CatalogMatch
+		targets := append([]any{&match.Score, &match.Entry.NodeID, &match.Entry.Name, &match.Entry.DeterministicSynopsis, &match.Entry.CopilotSynopsis, &match.Entry.OllamaSynopsis, &match.Entry.ClaudeSynopsis, &match.Node.ID, &match.Node.Kind, &match.Node.Label, &match.Node.QualifiedName}, evidenceScanTargets(&match.Node.Evidence)...)
+		if err := rows.Scan(targets...); err != nil {
+			return nil, fmt.Errorf("read catalog vector match: %w", err)
+		}
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate catalog vector matches: %w", err)
+	}
+	return matches, nil
 }
 
 func lexicalMatchExpression(request storage.LexicalSearchRequest) string {
@@ -2976,6 +3980,23 @@ func (store *Store) Rollback(ctx context.Context, request storage.RollbackReques
 	); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("remove rolled back lexical snapshots: %w", err)
 	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM catalog_entries WHERE workspace = ? AND version > ?",
+		request.Workspace,
+		request.Version,
+	); err != nil {
+		return storage.Snapshot{}, fmt.Errorf("remove rolled back catalog entries: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM catalog_search WHERE workspace = ? AND version > ?",
+		request.Workspace,
+		request.Version,
+	); err != nil {
+		return storage.Snapshot{}, fmt.Errorf("remove rolled back catalog search entries: %w", err)
+	}
+	if err := deleteCatalogEmbeddingsByVersion(ctx, transaction, request.Workspace, ">", request.Version); err != nil {
+		return storage.Snapshot{}, fmt.Errorf("remove rolled back catalog embeddings: %w", err)
+	}
 	if err := reopenContributionRecords(ctx, transaction, request.Workspace, request.Version); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("reopen rolled back contributions: %w", err)
 	}
@@ -3070,6 +4091,23 @@ func pruneVersions(ctx context.Context, transaction *sql.Tx, workspace string, r
 		return storage.PruneResult{}, fmt.Errorf("remove pruned lexical snapshots: %w", err)
 	}
 	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM catalog_entries WHERE workspace = ? AND version < ?",
+		workspace,
+		retainedVersion,
+	); err != nil {
+		return storage.PruneResult{}, fmt.Errorf("remove pruned catalog entries: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM catalog_search WHERE workspace = ? AND version < ?",
+		workspace,
+		retainedVersion,
+	); err != nil {
+		return storage.PruneResult{}, fmt.Errorf("remove pruned catalog search entries: %w", err)
+	}
+	if err := deleteCatalogEmbeddingsByVersion(ctx, transaction, workspace, "<", retainedVersion); err != nil {
+		return storage.PruneResult{}, fmt.Errorf("remove pruned catalog embeddings: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx,
 		"DELETE FROM graph_versions WHERE workspace = ? AND version < ?",
 		workspace,
 		retainedVersion,
@@ -3091,11 +4129,23 @@ func graphVersionWasPruned(ctx context.Context, database *sql.DB, workspace stri
 	return earliestRetained.Valid && version > 0 && version < storage.GraphVersion(earliestRetained.Int64)
 }
 
+func deleteCatalogEmbeddingsByVersion(ctx context.Context, transaction *sql.Tx, workspace, comparison string, version storage.GraphVersion) error {
+	if err := deleteCatalogEmbeddingVectors(ctx, transaction, "workspace = ? AND version "+comparison+" ?", workspace, version); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_embeddings WHERE workspace = ? AND version "+comparison+" ?", workspace, version); err != nil {
+		return fmt.Errorf("remove catalog embeddings: %w", err)
+	}
+	return nil
+}
+
 var contributionTables = []string{
 	"file_contributions",
 	"contribution_extensions",
 	"contribution_nodes",
 	"contribution_edges",
+	"contribution_catalog_units",
+	"contribution_catalog_unit_coverage",
 	"contribution_dependencies",
 	"contribution_exported_surfaces",
 	"contribution_diagnostics",
@@ -3177,6 +4227,39 @@ func (store *Store) readContributionFacts(ctx context.Context, snapshot storage.
 		return graph.Facts{}, err
 	}
 	return facts, nil
+}
+
+func (store *Store) readCatalogUnits(ctx context.Context, snapshot storage.Snapshot, sourcePath string) ([]extractor.CatalogUnit, error) {
+	rows, err := store.database.QueryContext(ctx, `
+		SELECT node_id, name, kind, owner, signature, comments, identifier_tokens
+		FROM contribution_catalog_units
+		WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+		ORDER BY node_id`, snapshot.Workspace, sourcePath, snapshot.Version, snapshot.Version)
+	if err != nil {
+		return nil, fmt.Errorf("read contribution catalog units: %w", err)
+	}
+	defer rows.Close()
+
+	units := make([]extractor.CatalogUnit, 0)
+	for rows.Next() {
+		var unit extractor.CatalogUnit
+		var kind, comments, identifierTokens string
+		if err := rows.Scan(&unit.NodeID, &unit.Name, &kind, &unit.Owner, &unit.Signature, &comments, &identifierTokens); err != nil {
+			return nil, fmt.Errorf("read contribution catalog unit: %w", err)
+		}
+		unit.Kind = graph.NodeKind(kind)
+		if err := json.Unmarshal([]byte(comments), &unit.Comments); err != nil {
+			return nil, fmt.Errorf("read contribution catalog unit comments: %w", err)
+		}
+		if err := json.Unmarshal([]byte(identifierTokens), &unit.IdentifierTokens); err != nil {
+			return nil, fmt.Errorf("read contribution catalog unit identifier tokens: %w", err)
+		}
+		units = append(units, unit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate contribution catalog units: %w", err)
+	}
+	return units, nil
 }
 
 type queryer interface {
@@ -3535,6 +4618,7 @@ type encodedContribution struct {
 	sourcePath           string
 	metadata             extractor.Metadata
 	graphFacts           graph.Facts
+	catalogUnits         []extractor.CatalogUnit
 	unresolvedReferences []extractor.UnresolvedReference
 	symbolReferences     []extractor.SymbolReference
 	exportedSurfaces     []extractor.ExportedSurface
@@ -3567,6 +4651,7 @@ func encodeContributions(update extractor.GraphUpdate) ([]encodedContribution, e
 			sourcePath:           sourcePath,
 			metadata:             contribution.Metadata(),
 			graphFacts:           contribution.Facts(),
+			catalogUnits:         contribution.CatalogUnits(),
 			unresolvedReferences: contribution.UnresolvedReferences(),
 			symbolReferences:     contribution.SymbolReferences(),
 			exportedSurfaces:     contribution.ExportedSurfaces(),
@@ -3674,7 +4759,7 @@ func migrate(ctx context.Context, database *sql.DB) error {
 	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&version); err != nil {
 		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
-	if version != 0 && version != 10 && version != CurrentSchemaVersion {
+	if version != 0 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 15 && version != 16 && version != 17 && version != 18 && version != 19 && version != CurrentSchemaVersion {
 		return fmt.Errorf("%w: found version %d, need version %d", errSchemaMismatch, version, CurrentSchemaVersion)
 	}
 
@@ -3685,6 +4770,8 @@ func migrate(ctx context.Context, database *sql.DB) error {
 			CREATE TABLE contribution_extensions (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, extension TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, extension));
 			CREATE TABLE contribution_nodes (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, node_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, qualified_name TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, node_id));
 			CREATE TABLE contribution_edges (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, source_id TEXT NOT NULL, target_id TEXT NOT NULL, relation TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, source_id, target_id, relation));
+			CREATE TABLE contribution_catalog_units (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, node_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, owner TEXT NOT NULL, signature TEXT NOT NULL, comments TEXT NOT NULL, identifier_tokens TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, node_id));
+			CREATE TABLE contribution_catalog_unit_coverage (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, PRIMARY KEY (workspace, source_path, valid_from_version));
 			CREATE TABLE contribution_dependencies (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, target_path TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, target_path));
 			CREATE TABLE contribution_exported_surfaces (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, node_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, node_id, name));
 			CREATE TABLE contribution_diagnostics (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, severity TEXT NOT NULL, message TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, severity, message));
@@ -3694,6 +4781,14 @@ func migrate(ctx context.Context, database *sql.DB) error {
 			CREATE TABLE workspace_nodes (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, qualified_name TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, PRIMARY KEY (workspace, version, node_id));
 			CREATE TABLE workspace_edges (workspace TEXT NOT NULL, version INTEGER NOT NULL, source_id TEXT NOT NULL, target_id TEXT NOT NULL, relation TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, resolved_fact_owner TEXT NOT NULL, PRIMARY KEY (workspace, version, source_id, target_id, relation));
 			CREATE VIRTUAL TABLE node_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, label, qualified_name, span_path, kind, identifier_tokens, tokenize = 'unicode61 remove_diacritics 2');
+			CREATE TABLE catalog_entries (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, name TEXT NOT NULL, deterministic_synopsis TEXT NOT NULL, copilot_synopsis TEXT NOT NULL, ollama_synopsis TEXT NOT NULL, claude_synopsis TEXT NOT NULL, PRIMARY KEY (workspace, version, node_id));
+			CREATE VIRTUAL TABLE catalog_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis, tokenize = 'unicode61 remove_diacritics 2');
+			CREATE TABLE catalog_embeddings (embedding_id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL, dimensions INTEGER NOT NULL, vector BLOB NOT NULL, UNIQUE (workspace, version, node_id, source));
+			CREATE TABLE catalog_tasks (workspace TEXT PRIMARY KEY, graph_version INTEGER NOT NULL, state TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, completed_units INTEGER NOT NULL, total_units INTEGER NOT NULL, changed_paths TEXT NOT NULL, failure TEXT NOT NULL);
+			CREATE TABLE copilot_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, max_ai_credits INTEGER NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, output_tokens_estimate_method TEXT NOT NULL, session_total_nano_aiu INTEGER, session_total_nano_aiu_availability TEXT NOT NULL, session_total_nano_aiu_estimate_method TEXT NOT NULL, actual_model TEXT NOT NULL DEFAULT '', input_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, premium_request_credits INTEGER, user_requests INTEGER, api_duration_ms INTEGER);
+			CREATE INDEX copilot_planner_metrics_daily ON copilot_planner_metrics (day, model, max_ai_credits);
+			CREATE TABLE claude_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, actual_model TEXT NOT NULL, fallback_model TEXT NOT NULL, max_budget_usd REAL NOT NULL, effort TEXT NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, input_tokens INTEGER, input_tokens_availability TEXT NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, api_duration_ms INTEGER, api_duration_ms_availability TEXT NOT NULL, cost_usd REAL, cost_usd_availability TEXT NOT NULL);
+			CREATE INDEX claude_planner_metrics_daily ON claude_planner_metrics (day, model, effort);
 			CREATE INDEX contribution_dependencies_visible ON contribution_dependencies (workspace, target_path, valid_from_version, valid_to_version);
 		`); err != nil {
 			return fmt.Errorf("create SQLite normalized graph tables: %w", err)
@@ -3738,8 +4833,150 @@ func migrate(ctx context.Context, database *sql.DB) error {
 				return err
 			}
 		}
-		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", CurrentSchemaVersion, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 11, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("record SQLite lexical migration: %w", err)
+		}
+		version = 11
+	}
+	if version == 11 {
+		if _, err := transaction.ExecContext(ctx, `
+			CREATE TABLE catalog_entries (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, name TEXT NOT NULL, deterministic_synopsis TEXT NOT NULL, copilot_synopsis TEXT NOT NULL, ollama_synopsis TEXT NOT NULL DEFAULT '', claude_synopsis TEXT NOT NULL DEFAULT '', PRIMARY KEY (workspace, version, node_id));
+			CREATE VIRTUAL TABLE catalog_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis, tokenize = 'unicode61 remove_diacritics 2')`); err != nil {
+			return fmt.Errorf("create SQLite catalog tables: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 12, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record SQLite catalog migration: %w", err)
+		}
+		version = 12
+	}
+	if version == 12 {
+		if _, err := transaction.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS catalog_embeddings (embedding_id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL, dimensions INTEGER NOT NULL, vector BLOB NOT NULL, UNIQUE (workspace, version, node_id, source))"); err != nil {
+			return fmt.Errorf("create SQLite catalog embedding table: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 13, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record SQLite catalog embedding migration: %w", err)
+		}
+		version = 13
+	}
+	if version == 13 {
+		rows, err := transaction.QueryContext(ctx, "SELECT DISTINCT workspace, version FROM catalog_embeddings")
+		if err != nil {
+			return fmt.Errorf("read catalog snapshots for vector index: %w", err)
+		}
+		snapshots := make([]storage.Snapshot, 0)
+		for rows.Next() {
+			var snapshot storage.Snapshot
+			if err := rows.Scan(&snapshot.Workspace, &snapshot.Version); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("read catalog snapshot for vector index: %w", err)
+			}
+			snapshots = append(snapshots, snapshot)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close catalog snapshots for vector index: %w", err)
+		}
+		for _, snapshot := range snapshots {
+			if err := copyCatalogEmbeddingVectors(ctx, transaction, snapshot); err != nil {
+				return err
+			}
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 14, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record SQLite catalog vector migration: %w", err)
+		}
+		version = 14
+	}
+	if version == 14 {
+		if _, err := transaction.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS copilot_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, max_ai_credits INTEGER NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, output_tokens_estimate_method TEXT NOT NULL, session_total_nano_aiu INTEGER, session_total_nano_aiu_availability TEXT NOT NULL, session_total_nano_aiu_estimate_method TEXT NOT NULL);
+			CREATE INDEX IF NOT EXISTS copilot_planner_metrics_daily ON copilot_planner_metrics (day, model, max_ai_credits)`); err != nil {
+			return fmt.Errorf("create Copilot planner metrics table: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 15, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record Copilot planner metrics migration: %w", err)
+		}
+		version = 15
+	}
+	if version == 15 {
+		for _, migration := range []struct {
+			column    string
+			statement string
+		}{
+			{"actual_model", "ALTER TABLE copilot_planner_metrics ADD COLUMN actual_model TEXT NOT NULL DEFAULT ''"},
+			{"input_tokens", "ALTER TABLE copilot_planner_metrics ADD COLUMN input_tokens INTEGER"},
+			{"cache_read_tokens", "ALTER TABLE copilot_planner_metrics ADD COLUMN cache_read_tokens INTEGER"},
+			{"cache_write_tokens", "ALTER TABLE copilot_planner_metrics ADD COLUMN cache_write_tokens INTEGER"},
+			{"reasoning_tokens", "ALTER TABLE copilot_planner_metrics ADD COLUMN reasoning_tokens INTEGER"},
+			{"premium_request_credits", "ALTER TABLE copilot_planner_metrics ADD COLUMN premium_request_credits INTEGER"},
+			{"user_requests", "ALTER TABLE copilot_planner_metrics ADD COLUMN user_requests INTEGER"},
+			{"api_duration_ms", "ALTER TABLE copilot_planner_metrics ADD COLUMN api_duration_ms INTEGER"},
+		} {
+			_, err := addColumnIfMissing(ctx, transaction, "copilot_planner_metrics", migration.column, migration.statement)
+			if err != nil {
+				return fmt.Errorf("add Copilot planner usage column: %w", err)
+			}
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 16, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record Copilot planner usage migration: %w", err)
+		}
+		version = 16
+	}
+	if version == 16 {
+		if _, err := transaction.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS claude_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, actual_model TEXT NOT NULL, fallback_model TEXT NOT NULL, max_budget_usd REAL NOT NULL, effort TEXT NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, input_tokens INTEGER, input_tokens_availability TEXT NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, api_duration_ms INTEGER, api_duration_ms_availability TEXT NOT NULL, cost_usd REAL, cost_usd_availability TEXT NOT NULL);
+			CREATE INDEX IF NOT EXISTS claude_planner_metrics_daily ON claude_planner_metrics (day, model, effort)`); err != nil {
+			return fmt.Errorf("create Claude planner metrics table: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 17, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record Claude planner metrics migration: %w", err)
+		}
+	}
+	if version == 17 {
+		if _, err := transaction.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS catalog_tasks (workspace TEXT PRIMARY KEY, graph_version INTEGER NOT NULL, state TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, completed_units INTEGER NOT NULL, total_units INTEGER NOT NULL, changed_paths TEXT NOT NULL, failure TEXT NOT NULL)"); err != nil {
+			return fmt.Errorf("create catalog task table: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 18, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record catalog task migration: %w", err)
+		}
+		version = 18
+	}
+	if version == 18 {
+		if _, err := transaction.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS contribution_catalog_units (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, node_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, owner TEXT NOT NULL, signature TEXT NOT NULL, comments TEXT NOT NULL, identifier_tokens TEXT NOT NULL, PRIMARY KEY (workspace, source_path, valid_from_version, node_id));
+			CREATE TABLE IF NOT EXISTS contribution_catalog_unit_coverage (workspace TEXT NOT NULL, source_path TEXT NOT NULL, valid_from_version INTEGER NOT NULL, valid_to_version INTEGER, PRIMARY KEY (workspace, source_path, valid_from_version));
+		`); err != nil {
+			return fmt.Errorf("create contribution catalog units table: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 19, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record contribution catalog units migration: %w", err)
+		}
+		version = 19
+	}
+	if version == 19 {
+		for _, migration := range []struct {
+			column    string
+			statement string
+		}{
+			{"ollama_synopsis", "ALTER TABLE catalog_entries ADD COLUMN ollama_synopsis TEXT NOT NULL DEFAULT ''"},
+			{"claude_synopsis", "ALTER TABLE catalog_entries ADD COLUMN claude_synopsis TEXT NOT NULL DEFAULT ''"},
+		} {
+			if _, err := addColumnIfMissing(ctx, transaction, "catalog_entries", migration.column, migration.statement); err != nil {
+				return fmt.Errorf("add catalog synopsis provider column: %w", err)
+			}
+		}
+		if _, err := transaction.ExecContext(ctx, "DROP TABLE catalog_search"); err != nil {
+			return fmt.Errorf("replace SQLite catalog lexical index: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `CREATE VIRTUAL TABLE catalog_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis, tokenize = 'unicode61 remove_diacritics 2')`); err != nil {
+			return fmt.Errorf("create SQLite catalog lexical index: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO catalog_search (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+			SELECT workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis
+			FROM catalog_entries`); err != nil {
+			return fmt.Errorf("rebuild SQLite catalog lexical index: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 20, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record catalog synopsis provider migration: %w", err)
 		}
 	}
 
@@ -3747,6 +4984,34 @@ func migrate(ctx context.Context, database *sql.DB) error {
 		return fmt.Errorf("commit SQLite migration: %w", err)
 	}
 	return nil
+}
+
+func addColumnIfMissing(ctx context.Context, transaction *sql.Tx, table, column, statement string) (bool, error) {
+	rows, err := transaction.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var columnID int
+		var name, dataType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&columnID, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return false, rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if _, err := transaction.ExecContext(ctx, statement); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (store *Store) readResolutionData(ctx context.Context, snapshot storage.Snapshot) (map[string]resolutionData, error) {

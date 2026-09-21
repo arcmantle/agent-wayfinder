@@ -106,6 +106,32 @@ func TestExtractProducesTypeAndMethodFacts(t *testing.T) {
 	}
 }
 
+func TestExtractProvidesCatalogUnitSourceData(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/validator.go",
+		Contents:   []byte("package fixture\n\n// ValidateToken checks a signed access token.\nfunc ValidateToken(token string) error { return nil }\n"),
+	})
+	if err != nil {
+		t.Fatalf("extract Go facts: %v", err)
+	}
+
+	units := contribution.CatalogUnits()
+	if len(units) != 1 {
+		t.Fatalf("catalog unit count = %d, want 1", len(units))
+	}
+	unit := units[0]
+	if unit.Name != "ValidateToken" || unit.Kind != FunctionNodeKind || unit.Signature != "func ValidateToken(token string) error" {
+		t.Errorf("catalog unit = %+v, want function source data", unit)
+	}
+	if len(unit.Comments) != 1 || unit.Comments[0] != "ValidateToken checks a signed access token." {
+		t.Errorf("catalog comments = %#v, want one declaration comment", unit.Comments)
+	}
+	if len(unit.IdentifierTokens) != 2 || unit.IdentifierTokens[0] != "validate" || unit.IdentifierTokens[1] != "token" {
+		t.Errorf("catalog identifier tokens = %#v, want validate and token", unit.IdentifierTokens)
+	}
+}
+
 func TestExtractProducesVariableAndLocalReferenceFacts(t *testing.T) {
 	contribution, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",
