@@ -99,14 +99,18 @@
     },
     "model": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9._/:/-]+$"
+      "pattern": "^[A-Za-z0-9._/-]+$"
+    },
+    "ollamaModel": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:/-]+$"
     },
     "ollamaPlanner": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "model": {
-          "$ref": "#/$defs/model"
+          "$ref": "#/$defs/ollamaModel"
         },
         "timeout": {
           "$ref": "#/$defs/timeout"

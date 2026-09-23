@@ -18,7 +18,7 @@ import (
 
 func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *testing.T) {
 	configured := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435"},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"enabled":true,"model":"qwen3-embedding:8b","processLimit":1}}`,
+		".agent-wayfinder/config.json": `{"$schema":"https://example.test/config.schema.json","synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435"},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"enabled":true,"model":"qwen3-embedding:8b","processLimit":1}}`,
 	})
 	configuration, err := readCatalogConfiguration(configured.Root)
 	if err != nil {
@@ -122,6 +122,16 @@ func TestReadCatalogConfigurationRejectsInvalidSynopsisValues(t *testing.T) {
 			name:     "Ollama endpoint",
 			contents: `{"synopsis":{"ollama":{"endpoint":"localhost:11434"}}}`,
 			want:     "invalid catalog Ollama endpoint",
+		},
+		{
+			name:     "embedding process limit too low",
+			contents: `{"embedding":{"processLimit":0}}`,
+			want:     "invalid catalog embedding process limit",
+		},
+		{
+			name:     "embedding process limit too high",
+			contents: `{"embedding":{"processLimit":3}}`,
+			want:     "invalid catalog embedding process limit",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

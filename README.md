@@ -150,11 +150,11 @@ source. The provider is disabled by default.
 {
   "synopsis": {
     "provider": "ollama",
-    "sourceLimit": 8192
-  },
-  "ollama": {
-    "model": "qwen3:8b",
-    "endpoint": "http://127.0.0.1:11434"
+    "sourceLimit": 8192,
+    "ollama": {
+      "model": "qwen3:8b",
+      "endpoint": "http://127.0.0.1:11434"
+    }
   }
 }
 ```
@@ -164,8 +164,9 @@ Put this configuration in the indexed workspace's
 source size in bytes for each synopsis request. It must be a positive integer.
 Use `copilot`, `ollama`, or `claude` for `synopsis.provider`.
 
-`ollama.model` selects the generation model and `ollama.endpoint` sets the
-Ollama HTTP endpoint. This model is separate from `embeddingModel`.
+`synopsis.ollama.model` selects the generation model and
+`synopsis.ollama.endpoint` sets the Ollama HTTP endpoint. This model is
+separate from `embedding.model`.
 
 #### Copilot
 
@@ -173,22 +174,22 @@ Ollama HTTP endpoint. This model is separate from `embeddingModel`.
 {
   "synopsis": {
     "provider": "copilot",
-    "sourceLimit": 4096
-  },
-  "copilot": {
-    "enabled": true,
-    "model": "gpt-5.6-luna",
-    "maxAiCredits": 30,
-    "processLimit": 1,
-    "path": "copilot"
+    "sourceLimit": 4096,
+    "copilot": {
+      "model": "gpt-5.6-luna",
+      "maxAiCredits": 30,
+      "processLimit": 1,
+      "path": "copilot"
+    }
   }
 }
 ```
 
-`copilot.model` selects the model for each catalog synopsis. When omitted,
-Copilot uses its configured default. `copilot.maxAiCredits` is the maximum AI
-credits for each catalog synopsis request. It must be at least `30`; the
-default is `30`. `processLimit` limits concurrent requests. This credit cap is separate from
+`synopsis.copilot.model` selects the model for each catalog synopsis. When
+omitted, Copilot uses its configured default.
+`synopsis.copilot.maxAiCredits` is the maximum AI credits for each catalog
+synopsis request. It must be at least `30`; the default is `30`.
+`synopsis.copilot.processLimit` limits concurrent requests. This credit cap is separate from
 `planning.copilot.maxAiCredits` for question planning.
 
 Use `--catalog-copilot-model` to override the synopsis model for one catalog command.
