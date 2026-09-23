@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -78,7 +77,7 @@ func TestIndexCommandPublishesWorkspaceGraph(t *testing.T) {
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
 
-	command := exec.Command("go", "run", "..", "index", "--database", database, "--format", "json", workspace.Root)
+	command := cliCommand("index", "--database", database, "--format", "json", workspace.Root)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
@@ -229,7 +228,7 @@ func TestIndexCommandWritesConfiguredOllamaEmbeddings(t *testing.T) {
 	t.Setenv("OLLAMA_HOST", server.URL)
 
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"embeddingEnabled":true,"embeddingModel":"qwen3-embedding:8b"}`,
+		".agent-wayfinder/config.json": `{"embedding":{"enabled":true,"model":"qwen3-embedding:8b"}}`,
 		"go.mod":                       "module example.com/fixture\n",
 		"validator/token.go":           "package validator\n\nfunc ValidateToken(token string) error { return nil }\n",
 	})
@@ -276,7 +275,7 @@ func TestIndexCommandUsesWorkspaceLocalDatabaseByDefault(t *testing.T) {
 		"src/main.ts":  "export function main() { return 1; }",
 	})
 
-	command := exec.Command("go", "run", "..", "index", workspace.Root)
+	command := cliCommand("index", workspace.Root)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)

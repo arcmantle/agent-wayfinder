@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion                         = 20
+	CurrentSchemaVersion                         = 21
 	retainedGraphVersions                        = 25
 	defaultMaxDatabaseBytes                int64 = 4 << 30
 	defaultMaxResolverProjectionCacheBytes int64 = 64 << 20
@@ -44,6 +44,7 @@ var errSchemaMismatch = errors.New("SQLite schema mismatch")
 
 type Store struct {
 	database                 *sql.DB
+	now                      func() time.Time
 	maxDatabaseBytes         int64
 	variableLimit            int
 	projectionMu             sync.Mutex
@@ -69,6 +70,7 @@ type cachedProjections struct {
 type Options struct {
 	MaxDatabaseBytes                int64
 	MaxResolverProjectionCacheBytes int64
+	Now                             func() time.Time
 }
 
 type MemoryLimits struct {
@@ -106,6 +108,7 @@ var _ storage.CopilotPlannerDailyMetricsReader = (*Store)(nil)
 var _ storage.ClaudePlannerMetricRecorder = (*Store)(nil)
 var _ storage.ClaudePlannerDailyMetricsReader = (*Store)(nil)
 var _ storage.ClaudePlannerMonthlyMetricsReader = (*Store)(nil)
+var _ storage.SpendReservationStore = (*Store)(nil)
 var _ storage.SnapshotOpener = (*Store)(nil)
 var _ storage.NodeLookup = (*Store)(nil)
 var _ storage.ExactNodeLookup = (*Store)(nil)
@@ -144,6 +147,9 @@ func OpenWithOptions(ctx context.Context, path string, options Options) (*Store,
 	if options.MaxResolverProjectionCacheBytes == 0 {
 		options.MaxResolverProjectionCacheBytes = defaultMaxResolverProjectionCacheBytes
 	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
 
 	database, err := openDatabase(ctx, path)
 	if errors.Is(err, errSchemaMismatch) {
@@ -164,6 +170,7 @@ func OpenWithOptions(ctx context.Context, path string, options Options) (*Store,
 
 	return &Store{
 		database:           database,
+		now:                options.Now,
 		maxDatabaseBytes:   options.MaxDatabaseBytes,
 		variableLimit:      variableLimit,
 		projections:        make(map[projectionCacheKey]cachedProjections),
@@ -2330,6 +2337,76 @@ func (store *Store) RecordClaudePlannerMetric(ctx context.Context, metric storag
 	)
 	if err != nil {
 		return fmt.Errorf("record Claude planner metric: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) ReserveSpend(ctx context.Context, request storage.SpendReservationRequest) (storage.SpendReservation, error) {
+	if request.Provider == "" || request.Unit == "" || request.MaximumAmount < 0 || request.MinimumAmount < 0 || request.MaximumAmount > 0 && request.MinimumAmount > request.MaximumAmount || request.Limits.Daily < 0 || request.Limits.Weekly < 0 || request.Limits.Monthly < 0 {
+		return storage.SpendReservation{}, fmt.Errorf("reserve spend: %w", storage.ErrInvalidRequest)
+	}
+	if request.Limits.Daily == 0 && request.Limits.Weekly == 0 && request.Limits.Monthly == 0 {
+		return storage.SpendReservation{Amount: request.MaximumAmount}, nil
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return storage.SpendReservation{}, fmt.Errorf("reserve spend: %w", err)
+	}
+	defer transaction.Rollback()
+	now := store.now().UTC()
+	limits := []struct {
+		amount float64
+		start  time.Time
+	}{
+		{amount: request.Limits.Daily, start: time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)},
+		{amount: request.Limits.Weekly, start: time.Date(now.Year(), now.Month(), now.Day()-int((now.Weekday()+6)%7), 0, 0, 0, 0, time.UTC)},
+		{amount: request.Limits.Monthly, start: time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)},
+	}
+	amount := request.MaximumAmount
+	if amount == 0 {
+		amount = math.Inf(1)
+	}
+	for _, limit := range limits {
+		if limit.amount == 0 {
+			continue
+		}
+		var used float64
+		if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(SUM(amount), 0) FROM spending_reservations WHERE provider = ? AND unit = ? AND recorded_at >= ?", request.Provider, request.Unit, limit.start.Format(time.RFC3339Nano)).Scan(&used); err != nil {
+			return storage.SpendReservation{}, fmt.Errorf("reserve spend: read usage: %w", err)
+		}
+		amount = min(amount, limit.amount-used)
+	}
+	if amount < request.MinimumAmount || amount <= 0 {
+		return storage.SpendReservation{}, storage.ErrSpendLimitExceeded
+	}
+	result, err := transaction.ExecContext(ctx, "INSERT INTO spending_reservations (recorded_at, provider, unit, amount) VALUES (?, ?, ?, ?)", now.Format(time.RFC3339Nano), request.Provider, request.Unit, amount)
+	if err != nil {
+		return storage.SpendReservation{}, fmt.Errorf("reserve spend: write reservation: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return storage.SpendReservation{}, fmt.Errorf("reserve spend: read reservation identifier: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return storage.SpendReservation{}, fmt.Errorf("reserve spend: commit: %w", err)
+	}
+	return storage.SpendReservation{ID: id, Amount: amount}, nil
+}
+
+func (store *Store) SettleSpend(ctx context.Context, reservationID int64, exactAmount float64) error {
+	if reservationID <= 0 || exactAmount < 0 || math.IsNaN(exactAmount) || math.IsInf(exactAmount, 0) {
+		return fmt.Errorf("settle spend: %w", storage.ErrInvalidRequest)
+	}
+	result, err := store.database.ExecContext(ctx, "UPDATE spending_reservations SET amount = ? WHERE reservation_id = ? AND amount >= ?", exactAmount, reservationID, exactAmount)
+	if err != nil {
+		return fmt.Errorf("settle spend: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("settle spend: read affected rows: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("settle spend: %w", storage.ErrInvalidRequest)
 	}
 	return nil
 }
@@ -4759,7 +4836,7 @@ func migrate(ctx context.Context, database *sql.DB) error {
 	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&version); err != nil {
 		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
-	if version != 0 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 15 && version != 16 && version != 17 && version != 18 && version != 19 && version != CurrentSchemaVersion {
+	if version != 0 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 15 && version != 16 && version != 17 && version != 18 && version != 19 && version != 20 && version != CurrentSchemaVersion {
 		return fmt.Errorf("%w: found version %d, need version %d", errSchemaMismatch, version, CurrentSchemaVersion)
 	}
 
@@ -4789,6 +4866,8 @@ func migrate(ctx context.Context, database *sql.DB) error {
 			CREATE INDEX copilot_planner_metrics_daily ON copilot_planner_metrics (day, model, max_ai_credits);
 			CREATE TABLE claude_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, actual_model TEXT NOT NULL, fallback_model TEXT NOT NULL, max_budget_usd REAL NOT NULL, effort TEXT NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, input_tokens INTEGER, input_tokens_availability TEXT NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, api_duration_ms INTEGER, api_duration_ms_availability TEXT NOT NULL, cost_usd REAL, cost_usd_availability TEXT NOT NULL);
 			CREATE INDEX claude_planner_metrics_daily ON claude_planner_metrics (day, model, effort);
+			CREATE TABLE spending_reservations (reservation_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, provider TEXT NOT NULL, unit TEXT NOT NULL, amount REAL NOT NULL);
+			CREATE INDEX spending_reservations_usage ON spending_reservations (provider, unit, recorded_at);
 			CREATE INDEX contribution_dependencies_visible ON contribution_dependencies (workspace, target_path, valid_from_version, valid_to_version);
 		`); err != nil {
 			return fmt.Errorf("create SQLite normalized graph tables: %w", err)
@@ -4977,6 +5056,17 @@ func migrate(ctx context.Context, database *sql.DB) error {
 		}
 		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 20, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("record catalog synopsis provider migration: %w", err)
+		}
+		version = 20
+	}
+	if version == 20 {
+		if _, err := transaction.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS spending_reservations (reservation_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, provider TEXT NOT NULL, unit TEXT NOT NULL, amount REAL NOT NULL);
+			CREATE INDEX IF NOT EXISTS spending_reservations_usage ON spending_reservations (provider, unit, recorded_at)`); err != nil {
+			return fmt.Errorf("create spending reservation table: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 21, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record spending reservation migration: %w", err)
 		}
 	}
 

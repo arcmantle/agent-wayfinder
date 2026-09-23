@@ -16,7 +16,7 @@ import (
 
 func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 	configured := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"ollama":{"enabled":true,"model":"qwen3:8b","timeout":"12s"}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"ollama","ollama":{"model":"qwen3:8b","timeout":"12s"}}}`,
 	})
 	configuration, err := ReadConfiguration(configured.Root)
 	if err != nil {
@@ -38,7 +38,7 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 	}
 
 	legacy := testkit.NewWorkspace(t, map[string]string{
-		".wayfinder": `{"planning":{"ollama":{"enabled":true,"model":"qwen3:8b"}}}`,
+		".wayfinder": `{"planning":{"provider":"ollama","ollama":{"model":"qwen3:8b"}}}`,
 	})
 	configuration, err = ReadConfiguration(legacy.Root)
 	if err != nil {
@@ -51,7 +51,7 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 
 func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
 	user := testkit.NewWorkspace(t, map[string]string{})
-	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"ollama":{"enabled":true,"model":"user-model","timeout":"7s"}}}`)
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"provider":"ollama","ollama":{"model":"user-model","timeout":"7s"}}}`)
 	t.Setenv("HOME", user.Root)
 	t.Setenv("USERPROFILE", user.Root)
 	workspace := testkit.NewWorkspace(t, map[string]string{

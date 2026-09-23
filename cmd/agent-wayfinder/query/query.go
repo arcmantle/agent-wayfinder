@@ -79,11 +79,6 @@ func run(command *cobra.Command, arguments []string, standardOutput, standardErr
 	if err != nil {
 		return cmd.WriteError(standardError, fmt.Errorf("resolve query workspace path: %w", err))
 	}
-	planning, err := planQuery(command, workspaceRoot, plan, maxDepth, maxNodes, projectIDs)
-	if err != nil {
-		return cmd.WriteError(standardError, err)
-	}
-	plan = planning.Plan
 	database, err := cmd.DatabasePathForCommand(command, workspaceRoot)
 	if err != nil {
 		return cmd.WriteError(standardError, fmt.Errorf("resolve query database path: %w", err))
@@ -93,6 +88,11 @@ func run(command *cobra.Command, arguments []string, standardOutput, standardErr
 		return cmd.WriteError(standardError, fmt.Errorf("open query database: %w", err))
 	}
 	defer store.Close()
+	planning, err := planQuery(command, workspaceRoot, store, plan, maxDepth, maxNodes, projectIDs)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	plan = planning.Plan
 	if planning.CopilotMetric != nil {
 		if err := store.RecordCopilotPlannerMetric(context.Background(), *planning.CopilotMetric); err != nil {
 			return cmd.WriteError(standardError, err)

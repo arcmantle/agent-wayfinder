@@ -249,20 +249,42 @@ func TestRunCatalogSynopsisUsesConfiguredPathForOneUnitWithoutTools(t *testing.T
 		Comments:          []string{"ValidateToken checks a signed access token."},
 	}
 
-	synopsis, err := RunCatalogSynopsis(context.Background(), CatalogConfiguration{Path: "configured-copilot", MaxAICredits: 42}, unit, runner)
+	synopsis, err := RunCatalogSynopsis(context.Background(), CatalogConfiguration{Path: "configured-copilot", Model: "gpt-5.6-luna", MaxAICredits: 42}, unit, runner)
 	if err != nil {
 		t.Fatalf("run Copilot catalog synopsis: %v", err)
 	}
 	if synopsis != "" || gotName != "configured-copilot" {
 		t.Errorf("catalog synopsis = %q, command = %q; want empty configured command output", synopsis, gotName)
 	}
-	if !containsArguments(gotArguments, "--max-ai-credits") || !containsArguments(gotArguments, "42") || !containsArguments(gotArguments, "--available-tools=") || !containsArguments(gotArguments, "--disable-builtin-mcps") || !containsArguments(gotArguments, "--prompt") || !containsArguments(gotArguments, "Do not make claims that the input does not support.") || !containsArguments(gotArguments, "ValidateToken") || !containsArguments(gotArguments, "func ValidateToken(token string) error") || !containsArguments(gotArguments, "return verify(token)") {
+	if !containsArguments(gotArguments, "--model") || !containsArguments(gotArguments, "gpt-5.6-luna") || !containsArguments(gotArguments, "--max-ai-credits") || !containsArguments(gotArguments, "42") || !containsArguments(gotArguments, "--available-tools=") || !containsArguments(gotArguments, "--disable-builtin-mcps") || !containsArguments(gotArguments, "--prompt") || !containsArguments(gotArguments, "Do not make claims that the input does not support.") || !containsArguments(gotArguments, "ValidateToken") || !containsArguments(gotArguments, "func ValidateToken(token string) error") || !containsArguments(gotArguments, "return verify(token)") {
 		t.Errorf("catalog arguments = %q, want an evidence-only prompt with tools disabled and a complete catalog unit", gotArguments)
 	}
 }
 
+func TestRunCatalogSynopsisReportsExactUsage(t *testing.T) {
+	runner := func(_ context.Context, _ string, arguments ...string) *exec.Cmd {
+		for index, argument := range arguments {
+			if argument == "--usage-output-file" && index+1 < len(arguments) {
+				usage := `{"currentModel":"gpt-5","totalPremiumRequestCost":1,"modelMetrics":{"gpt-5":{"usage":{}}}}`
+				if err := os.WriteFile(arguments[index+1], []byte(usage), 0o600); err != nil {
+					t.Fatalf("write Copilot catalog usage report: %v", err)
+				}
+			}
+		}
+		return exec.Command("printf", "%s", "Validates an access token.")
+	}
+
+	run, err := RunCatalogSynopsisWithUsage(context.Background(), CatalogConfiguration{MaxAICredits: 30}, index.CatalogSynopsisInput{Name: "ValidateToken"}, runner)
+	if err != nil {
+		t.Fatalf("run Copilot catalog synopsis with usage: %v", err)
+	}
+	if run.Synopsis != "Validates an access token." || run.PremiumRequestCredits.Availability != storage.MetricValueExact || run.PremiumRequestCredits.Value != 1 {
+		t.Errorf("Copilot catalog synopsis run = %+v, want synopsis and exact one-credit usage", run)
+	}
+}
+
 func TestReadConfigurationReadsWorkspaceAndEnvironment(t *testing.T) {
-	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":true,"model":"gpt-5","maxAiCredits":30,"tokenBudget":2048,"timeout":"12s"}}}`})
+	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{"model":"gpt-5","maxAiCredits":30,"tokenBudget":2048,"timeout":"12s"}}}`})
 	t.Setenv("WAYFINDER_COPILOT_TOKEN_BUDGET", "3072")
 
 	configuration, err := ReadConfiguration(workspace.Root)
@@ -276,7 +298,7 @@ func TestReadConfigurationReadsWorkspaceAndEnvironment(t *testing.T) {
 
 func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
 	user := testkit.NewWorkspace(t, map[string]string{})
-	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"copilot":{"enabled":true,"model":"user-model","maxAiCredits":31,"tokenBudget":2048,"timeout":"7s"}}}`)
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"provider":"copilot","copilot":{"model":"user-model","maxAiCredits":31,"tokenBudget":2048,"timeout":"7s"}}}`)
 	t.Setenv("HOME", user.Root)
 	t.Setenv("USERPROFILE", user.Root)
 	workspace := testkit.NewWorkspace(t, map[string]string{
@@ -312,7 +334,7 @@ func TestReadConfigurationUsesDisabledDefaultsAndIgnoresLegacyKey(t *testing.T) 
 		t.Errorf("Copilot configuration = %+v, want %+v", configuration, want)
 	}
 
-	legacy := testkit.NewWorkspace(t, map[string]string{".wayfinder": `{"planning":{"copilot":{"enabled":true,"model":"gpt-5"}}}`})
+	legacy := testkit.NewWorkspace(t, map[string]string{".wayfinder": `{"planning":{"provider":"copilot","copilot":{"model":"gpt-5"}}}`})
 	configuration, err = ReadConfiguration(legacy.Root)
 	if err != nil || !reflect.DeepEqual(configuration, want) {
 		t.Errorf("legacy Copilot configuration = %+v, %v; want ignored old configuration file", configuration, err)
@@ -381,7 +403,7 @@ func TestReadConfigurationValidatesModelAndBounds(t *testing.T) {
 }
 
 func TestResolveConfigurationUsesFlagPrecedence(t *testing.T) {
-	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":false,"model":"workspace-model","maxAiCredits":30,"tokenBudget":100,"timeout":"5s"}}}`})
+	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{"model":"workspace-model","maxAiCredits":30,"tokenBudget":100,"timeout":"5s"}}}`})
 	t.Setenv("WAYFINDER_COPILOT_ENABLED", "false")
 	t.Setenv("WAYFINDER_COPILOT_MODEL", "environment-model")
 	t.Setenv("WAYFINDER_COPILOT_MAX_AI_CREDITS", "31")

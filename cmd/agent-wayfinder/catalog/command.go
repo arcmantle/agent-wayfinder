@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"agent-wayfinder/cli"
-	"agent-wayfinder/cmd/agent-wayfinder/internal/claude"
 	cmd "agent-wayfinder/cmd/agent-wayfinder/internal/command"
 	"agent-wayfinder/cmd/agent-wayfinder/internal/copilot"
 	"agent-wayfinder/cmd/agent-wayfinder/internal/ollama"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/spending"
 	"agent-wayfinder/index"
 	"agent-wayfinder/storage"
 	"agent-wayfinder/storage/sqlite"
@@ -150,7 +150,7 @@ func refreshCatalog(ctx context.Context, request RefreshRequest) error {
 	if err != nil {
 		return fail(err)
 	}
-	options, err := catalogWriteOptions(configuration, request.Workspace)
+	options, err := catalogWriteOptions(configuration, request.Workspace, store)
 	if err != nil {
 		return fail(err)
 	}
@@ -222,7 +222,7 @@ func runCatalog(command *cobra.Command, arguments []string, standardOutput, stan
 	if err != nil {
 		return fail(err)
 	}
-	options, err := catalogWriteOptions(configuration, workspaceRoot)
+	options, err := catalogWriteOptions(configuration, workspaceRoot, store)
 	if err != nil {
 		return fail(err)
 	}
@@ -278,14 +278,14 @@ func runCatalog(command *cobra.Command, arguments []string, standardOutput, stan
 	return 0
 }
 
-func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot string) (index.CatalogWriteOptions, error) {
+func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot string, store storage.SpendReservationStore) (index.CatalogWriteOptions, error) {
 	embeddingGenerator, err := newCatalogEmbeddingGenerator(configuration, nil)
 	if err != nil {
 		return index.CatalogWriteOptions{}, err
 	}
 	options := index.CatalogWriteOptions{
 		EmbeddingGenerator:    embeddingGenerator,
-		EmbeddingProcessLimit: configuration.EmbeddingProcessLimit,
+		EmbeddingProcessLimit: configuration.Embedding.ProcessLimit,
 		SynopsisProvider:      configuration.Synopsis.Provider,
 		SynopsisSourceLimit:   configuration.Synopsis.SourceLimit,
 	}
@@ -293,19 +293,33 @@ func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot strin
 	case "":
 		return options, nil
 	case index.CatalogSynopsisProviderCopilot:
-		if configuration.Copilot.Enabled {
-			options.SynopsisGenerator = copilot.NewCatalogSynopsisGenerator(configuration.Copilot.Path, configuration.Copilot.MaxAICredits, exec.CommandContext)
-			options.SynopsisProcessLimit = configuration.Copilot.ProcessLimit
-		}
-	case index.CatalogSynopsisProviderOllama:
-		options.SynopsisGenerator = ollama.NewCatalogSynopsisGenerator(ollama.CatalogSynopsisConfiguration{Model: configuration.Ollama.Model, Timeout: 30 * time.Second}, configuration.Ollama.Endpoint, nil)
-	case index.CatalogSynopsisProviderClaude:
-		claudeConfiguration, err := claude.ReadConfiguration(workspaceRoot)
+		spendingConfiguration, err := spending.ReadConfiguration(workspaceRoot)
 		if err != nil {
 			return index.CatalogWriteOptions{}, err
 		}
-		if claudeConfiguration.Enabled {
-			options.SynopsisGenerator = claude.NewCatalogSynopsisGenerator(claudeConfiguration, exec.CommandContext)
+		options.SynopsisGenerator = spendingCatalogSynopsisGenerator{
+			provider:      index.CatalogSynopsisProviderCopilot,
+			configuration: spendingConfiguration,
+			store:         store,
+			copilotConfiguration: copilot.CatalogConfiguration{
+				Path:         configuration.Copilot.Path,
+				Model:        configuration.Copilot.Model,
+				MaxAICredits: configuration.Copilot.MaxAICredits,
+			},
+		}
+		options.SynopsisProcessLimit = configuration.Copilot.ProcessLimit
+	case index.CatalogSynopsisProviderOllama:
+		options.SynopsisGenerator = ollama.NewCatalogSynopsisGenerator(ollama.CatalogSynopsisConfiguration{Model: configuration.Ollama.Model, Timeout: 30 * time.Second}, configuration.Ollama.Endpoint, nil)
+	case index.CatalogSynopsisProviderClaude:
+		spendingConfiguration, err := spending.ReadConfiguration(workspaceRoot)
+		if err != nil {
+			return index.CatalogWriteOptions{}, err
+		}
+		options.SynopsisGenerator = spendingCatalogSynopsisGenerator{
+			provider:            index.CatalogSynopsisProviderClaude,
+			configuration:       spendingConfiguration,
+			store:               store,
+			claudeConfiguration: configuration.Claude,
 		}
 	default:
 		return index.CatalogWriteOptions{}, fmt.Errorf("invalid catalog synopsis provider %q", configuration.Synopsis.Provider)

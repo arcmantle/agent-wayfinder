@@ -76,6 +76,15 @@ excluded. `.wayfinderignore` is not used.
 Catalog configuration controls embeddings and optional catalog synopses. It
 also controls question planning through its `planning` object.
 
+Use the published JSON Schema for completion and validation in any
+`.agent-wayfinder/config.json` file:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/arcmantle/agent-wayfinder/main/schemas/config.schema.json"
+}
+```
+
 ### Embeddings
 
 Catalog embeddings use the local Ollama HTTP API. Agent Wayfinder does not run
@@ -103,9 +112,9 @@ or only a host and port:
 export OLLAMA_HOST=http://localhost:11434
 ```
 
-To enable embeddings for a workspace or use a larger model, set
-`embeddingEnabled` and `embeddingModel` in the indexed workspace's
-`.agent-wayfinder/config.json` file:
+To enable embeddings for a workspace or use a larger model, set the
+`embedding` object in the indexed workspace's `.agent-wayfinder/config.json`
+file:
 
 ```bash
 ollama pull qwen3-embedding:8b
@@ -113,9 +122,11 @@ ollama pull qwen3-embedding:8b
 
 ```json
 {
-  "embeddingEnabled": true,
-  "embeddingModel": "qwen3-embedding:8b",
-  "embeddingProcessLimit": 2
+  "embedding": {
+    "enabled": true,
+    "model": "qwen3-embedding:8b",
+    "processLimit": 2
+  }
 }
 ```
 
@@ -123,7 +134,7 @@ If Ollama or the selected model is unavailable, indexing continues and local
 lexical catalog retrieval remains available. Explicit embedding calls use one
 host thread, a 10-second timeout, and a 4 MiB response limit. Catalog work
 sends up to 32 inputs per request and runs at most two requests concurrently.
-Set `embeddingProcessLimit` to `1` on a constrained host. Catalog work keeps
+Set `embedding.processLimit` to `1` on a constrained host. Catalog work keeps
 the model loaded for one catalog pass and sends `keep_alive: 0` when that pass
 completes. One-off query embeddings unload the model after their request.
 
@@ -166,6 +177,7 @@ Ollama HTTP endpoint. This model is separate from `embeddingModel`.
   },
   "copilot": {
     "enabled": true,
+    "model": "gpt-5.6-luna",
     "maxAiCredits": 30,
     "processLimit": 1,
     "path": "copilot"
@@ -173,10 +185,13 @@ Ollama HTTP endpoint. This model is separate from `embeddingModel`.
 }
 ```
 
-`copilot.maxAiCredits` is the maximum AI credits for each catalog synopsis
-request. It must be at least `30`; the default is `30`. `processLimit` limits
-concurrent requests. This credit cap is separate from
+`copilot.model` selects the model for each catalog synopsis. When omitted,
+Copilot uses its configured default. `copilot.maxAiCredits` is the maximum AI
+credits for each catalog synopsis request. It must be at least `30`; the
+default is `30`. `processLimit` limits concurrent requests. This credit cap is separate from
 `planning.copilot.maxAiCredits` for question planning.
+
+Use `--catalog-copilot-model` to override the synopsis model for one catalog command.
 
 #### Claude
 
@@ -228,6 +243,38 @@ Provider failures do not stop catalog generation. The catalog retains its
 deterministic synopsis and lexical retrieval remains available. When embeddings
 are enabled, Wayfinder embeds stored deterministic and optional synopsis text;
 it does not embed raw declaration source.
+
+### Spending Limits
+
+Set daily, weekly, or monthly limits in the user configuration file to limit
+Copilot planning and synopses by AI credits, and Claude planning and synopses by
+USD:
+
+```json
+{
+  "spending": {
+    "copilot": {
+      "dailyAiCredits": 10000,
+      "weeklyAiCredits": 50000,
+      "monthlyAiCredits": 200000
+    },
+    "claude": {
+      "dailyUsd": 100,
+      "weeklyUsd": 500,
+      "monthlyUsd": 2000
+    }
+  }
+}
+```
+
+Each enabled period limit is independent. Limits use UTC days, weeks that start
+on Monday, and calendar months. Agent Wayfinder reserves the provider's maximum
+per-request amount before it starts planning or synopsis generation. When the
+remaining budget is too small for a request, it skips that provider and uses the
+next configured planner or deterministic output. After the request, it replaces
+the reservation with the exact Copilot premium-request credits or Claude USD
+cost when the provider reports it. If exact usage is unavailable, the maximum
+reservation remains until the period resets.
 
 ## Agent Skill
 

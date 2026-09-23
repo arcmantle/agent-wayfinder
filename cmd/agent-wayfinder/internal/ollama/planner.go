@@ -14,6 +14,7 @@ import (
 	"time"
 
 	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/planning"
 )
 
 const defaultEndpoint = "http://127.0.0.1:11434"
@@ -32,7 +33,6 @@ type Configuration struct {
 }
 
 type configurationFile struct {
-	Enabled *bool           `json:"enabled"`
 	Model   *string         `json:"model"`
 	Timeout json.RawMessage `json:"timeout"`
 }
@@ -47,9 +47,6 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 		if err != nil {
 			return Configuration{}, err
 		}
-		if fileConfiguration.Enabled != nil {
-			configuration.Enabled = *fileConfiguration.Enabled
-		}
 		if fileConfiguration.Model != nil {
 			configuration.Model = *fileConfiguration.Model
 		}
@@ -60,6 +57,11 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 			}
 		}
 	}
+	provider, err := planning.ReadProvider(workspaceRoot)
+	if err != nil {
+		return Configuration{}, err
+	}
+	configuration.Enabled = provider == planning.ProviderOllama
 	if err := validateConfiguration(configuration); err != nil {
 		return Configuration{}, err
 	}

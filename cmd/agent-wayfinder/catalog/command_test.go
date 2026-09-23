@@ -13,11 +13,39 @@ import (
 	"testing"
 	"time"
 
+	"agent-wayfinder/cmd/agent-wayfinder/internal/claude"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/copilot"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/spending"
 	"agent-wayfinder/index"
 	"agent-wayfinder/storage"
 	"agent-wayfinder/storage/sqlite"
 	"agent-wayfinder/testkit"
 )
+
+type limitedSpendStore struct{}
+
+func (limitedSpendStore) ReserveSpend(context.Context, storage.SpendReservationRequest) (storage.SpendReservation, error) {
+	return storage.SpendReservation{}, storage.ErrSpendLimitExceeded
+}
+
+func (limitedSpendStore) SettleSpend(context.Context, int64, float64) error {
+	return nil
+}
+
+type settlementSpendStore struct {
+	settledReservationID int64
+	settledAmount        float64
+}
+
+func (store *settlementSpendStore) ReserveSpend(context.Context, storage.SpendReservationRequest) (storage.SpendReservation, error) {
+	return storage.SpendReservation{ID: 1, Amount: 30}, nil
+}
+
+func (store *settlementSpendStore) SettleSpend(_ context.Context, reservationID int64, amount float64) error {
+	store.settledReservationID = reservationID
+	store.settledAmount = amount
+	return nil
+}
 
 func TestCatalogStatusReportsRefreshFailureWithoutChangingPublishedGraph(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
@@ -77,9 +105,9 @@ func TestCatalogWriteOptionsUseConfiguredSynopsisProvider(t *testing.T) {
 		files         map[string]string
 		copilotConfig catalogCopilotConfiguration
 	}{
-		{name: "Copilot", provider: index.CatalogSynopsisProviderCopilot, files: map[string]string{"package.json": `{"name":"fixture"}`}, copilotConfig: catalogCopilotConfiguration{Enabled: true}},
-		{name: "Ollama", provider: index.CatalogSynopsisProviderOllama, files: map[string]string{".agent-wayfinder/config.json": `{"planning":{"ollama":{"enabled":true}}}`}},
-		{name: "Claude", provider: index.CatalogSynopsisProviderClaude, files: map[string]string{".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":true}}}`}},
+		{name: "Copilot", provider: index.CatalogSynopsisProviderCopilot, files: map[string]string{"package.json": `{"name":"fixture"}`}, copilotConfig: catalogCopilotConfiguration{}},
+		{name: "Ollama", provider: index.CatalogSynopsisProviderOllama, files: map[string]string{}},
+		{name: "Claude", provider: index.CatalogSynopsisProviderClaude, files: map[string]string{}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			workspace := testkit.NewWorkspace(t, testCase.files)
@@ -89,7 +117,7 @@ func TestCatalogWriteOptionsUseConfiguredSynopsisProvider(t *testing.T) {
 					Provider:    testCase.provider,
 					SourceLimit: 512,
 				},
-			}, workspace.Root)
+			}, workspace.Root, nil)
 			if err != nil {
 				t.Fatalf("create catalog write options: %v", err)
 			}
@@ -97,6 +125,66 @@ func TestCatalogWriteOptionsUseConfiguredSynopsisProvider(t *testing.T) {
 				t.Errorf("catalog write options = %+v, want configured %s synopsis provider", options, testCase.provider)
 			}
 		})
+	}
+}
+
+func TestCatalogSynopsisGeneratorSkipsProviderWhenSpendingLimitIsReached(t *testing.T) {
+	generator := spendingCatalogSynopsisGenerator{
+		provider:             index.CatalogSynopsisProviderCopilot,
+		configuration:        spending.Configuration{Copilot: spending.Limits{Daily: 30}},
+		store:                limitedSpendStore{},
+		copilotConfiguration: copilot.CatalogConfiguration{MaxAICredits: 30},
+	}
+	if _, err := generator.GenerateCatalogSynopsis(context.Background(), index.CatalogSynopsisInput{Name: "ValidateToken"}); !errors.Is(err, storage.ErrSpendLimitExceeded) {
+		t.Errorf("generate limited Copilot synopsis error = %v, want spend limit exceeded", err)
+	}
+}
+
+func TestCatalogSynopsisGeneratorSettlesExactCopilotCredits(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "copilot")
+	script := "#!/bin/sh\nusage_file=''\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--usage-output-file\" ]; then usage_file=$2; shift 2; continue; fi\n  shift\ndone\nprintf '%s' 'Validates an access token.'\nprintf '{\"currentModel\":\"gpt-5\",\"totalPremiumRequestCost\":1,\"modelMetrics\":{\"gpt-5\":{\"usage\":{}}}}' > \"$usage_file\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write Copilot synopsis script: %v", err)
+	}
+	store := &settlementSpendStore{}
+	generator := spendingCatalogSynopsisGenerator{
+		provider:             index.CatalogSynopsisProviderCopilot,
+		configuration:        spending.Configuration{Copilot: spending.Limits{Daily: 30}},
+		store:                store,
+		copilotConfiguration: copilot.CatalogConfiguration{Path: path, MaxAICredits: 30},
+	}
+	synopsis, err := generator.GenerateCatalogSynopsis(context.Background(), index.CatalogSynopsisInput{Name: "ValidateToken"})
+	if err != nil {
+		t.Fatalf("generate Copilot synopsis: %v", err)
+	}
+	if synopsis != "Validates an access token." || store.settledReservationID != 1 || store.settledAmount != 1 {
+		t.Errorf("catalog synopsis = %q, settlement = %+v; want synopsis and one-credit settlement", synopsis, store)
+	}
+}
+
+func TestCatalogSynopsisGeneratorSettlesExactClaudeCost(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "claude")
+	script := `#!/bin/sh
+printf '%s\n' '{"result":"Validates an access token.","total_cost_usd":1.5}'
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write Claude synopsis script: %v", err)
+	}
+	store := &settlementSpendStore{}
+	generator := spendingCatalogSynopsisGenerator{
+		provider:            index.CatalogSynopsisProviderClaude,
+		configuration:       spending.Configuration{Claude: spending.Limits{Daily: 30}},
+		store:               store,
+		claudeConfiguration: claude.Configuration{Path: path, Model: "sonnet", MaxBudgetUSD: 30, Timeout: time.Second},
+	}
+	synopsis, err := generator.GenerateCatalogSynopsis(context.Background(), index.CatalogSynopsisInput{Name: "ValidateToken"})
+	if err != nil {
+		t.Fatalf("generate Claude synopsis: %v", err)
+	}
+	if synopsis != "Validates an access token." || store.settledReservationID != 1 || store.settledAmount != 1.5 {
+		t.Errorf("catalog synopsis = %q, settlement = %+v; want synopsis and $1.50 settlement", synopsis, store)
 	}
 }
 
@@ -124,7 +212,7 @@ func TestCatalogWriteOptionsUseConfiguredOllamaSynopsisModelAndEndpoint(t *testi
 			SourceLimit: 512,
 		},
 		Ollama: catalogOllamaConfiguration{Model: "catalog-generation:8b", Endpoint: server.URL},
-	}, t.TempDir())
+	}, t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("create Ollama catalog synopsis options: %v", err)
 	}
@@ -138,7 +226,7 @@ func TestCatalogWriteOptionsUseConfiguredOllamaSynopsisModelAndEndpoint(t *testi
 
 func TestCatalogStatusReportsFailedRefreshAfterCancellation(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"embeddingEnabled":true}`,
+		".agent-wayfinder/config.json": `{"embedding":{"enabled":true}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/token.ts":                 "export function validateAccessToken(token: string) { return token.length > 0; }",
 	})

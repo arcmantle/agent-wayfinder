@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,11 +23,38 @@ import (
 	"agent-wayfinder/testkit"
 )
 
+var cliBinary string
+
 func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "agent-wayfinder-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("HOME", home); err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("USERPROFILE", home); err != nil {
+		panic(err)
+	}
 	if err := os.Chdir(".."); err != nil {
 		panic(err)
 	}
-	os.Exit(m.Run())
+	binaryDirectory, err := os.MkdirTemp("", "agent-wayfinder-test-cli-")
+	if err != nil {
+		panic(err)
+	}
+	cliBinary = filepath.Join(binaryDirectory, "agent-wayfinder")
+	if output, err := exec.Command("go", "build", "-o", cliBinary, ".").CombinedOutput(); err != nil {
+		panic(string(output))
+	}
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	_ = os.RemoveAll(binaryDirectory)
+	os.Exit(code)
+}
+
+func cliCommand(arguments ...string) *exec.Cmd {
+	return exec.Command(cliBinary, arguments...)
 }
 
 func runQueryCommand(t *testing.T, arguments []string, standardOutput, standardError *strings.Builder) int {
@@ -63,19 +91,19 @@ func TestQueryCommandHelpDescribesQuestionAndTermModes(t *testing.T) {
 
 func TestCopilotQueryExecutesValidatedPlanAgainstPublishedGraph(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/helper.ts":                "export function helper() { return 1; }",
 		"src/main.ts":                  "import { helper } from './helper'; export function main() { return helper(); }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 
 	installCopilotPlanner(t, `{"schemaVersion":1,"intent":"calls","entities":["main"]}`)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code invokes main?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code invokes main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with Copilot planner: %v\n%s", err, output)
 	}
@@ -105,15 +133,89 @@ func TestCopilotQueryExecutesValidatedPlanAgainstPublishedGraph(t *testing.T) {
 	}
 }
 
-func TestQueryUsesOllamaPlanBeforeCopilotFallback(t *testing.T) {
+func TestQueryUsesDeterministicPlanAfterDailyCopilotCreditLimit(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"ollama":{"enabled":true},"copilot":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{"maxAiCredits":30}},"spending":{"copilot":{"dailyAiCredits":30}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/helper.ts":                "export function helper() { return 1; }",
 		"src/main.ts":                  "import { helper } from './helper'; export function main() { return helper(); }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+	installCopilotPlanner(t, `{"schemaVersion":1,"intent":"calls","entities":["main"]}`)
+
+	for request := 0; request < 2; request++ {
+		output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code invokes main?").CombinedOutput()
+		if err != nil {
+			t.Fatalf("query request %d: %v\n%s", request+1, err, output)
+		}
+		var result struct {
+			Result struct {
+				Planning struct {
+					Method string `json:"method"`
+				} `json:"planning"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(output, &result); err != nil {
+			t.Fatalf("decode query request %d: %v\n%s", request+1, err, output)
+		}
+		if request == 0 && result.Result.Planning.Method != "copilot" {
+			t.Errorf("first planning method = %q, want copilot", result.Result.Planning.Method)
+		}
+		if request == 1 && result.Result.Planning.Method != "fallback" {
+			t.Errorf("second planning method = %q, want fallback after daily limit", result.Result.Planning.Method)
+		}
+	}
+}
+
+func TestQueryUsesDeterministicPlanAfterDailyClaudeDollarLimit(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{}},"spending":{"claude":{"dailyUsd":1}}}`,
+		"package.json":                 `{"name":"fixture"}`,
+		"src/helper.ts":                "export function helper() { return 1; }",
+		"src/main.ts":                  "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("index workspace: %v\n%s", err, output)
+	}
+	installClaudePlanner(t, `{"schemaVersion":1,"intent":"calls","entities":["main"]}`)
+
+	for request := 0; request < 2; request++ {
+		output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code invokes main?").CombinedOutput()
+		if err != nil {
+			t.Fatalf("query request %d: %v\n%s", request+1, err, output)
+		}
+		var result struct {
+			Result struct {
+				Planning struct {
+					Method string `json:"method"`
+				} `json:"planning"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(output, &result); err != nil {
+			t.Fatalf("decode query request %d: %v\n%s", request+1, err, output)
+		}
+		if request == 0 && result.Result.Planning.Method != "claude" {
+			t.Errorf("first planning method = %q, want claude", result.Result.Planning.Method)
+		}
+		if request == 1 && result.Result.Planning.Method != "fallback" {
+			t.Errorf("second planning method = %q, want fallback after daily limit", result.Result.Planning.Method)
+		}
+	}
+}
+
+func TestQueryUsesOllamaPlanBeforeCopilotFallback(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agent-wayfinder/config.json": `{"planning":{"provider":"ollama","ollama":{}}}`,
+		"package.json":                 `{"name":"fixture"}`,
+		"src/helper.ts":                "export function helper() { return 1; }",
+		"src/main.ts":                  "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "graph.db")
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -123,7 +225,7 @@ func TestQueryUsesOllamaPlanBeforeCopilotFallback(t *testing.T) {
 	t.Setenv("OLLAMA_HOST", server.URL)
 	installFailingCopilotPlanner(t)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code invokes helper?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code invokes helper?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with Ollama planner: %v\n%s", err, output)
 	}
@@ -154,19 +256,19 @@ func TestQueryUsesOllamaPlanBeforeCopilotFallback(t *testing.T) {
 
 func TestQueryUsesClaudePlanBeforeCopilotFallback(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":true},"copilot":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/helper.ts":                "export function helper() { return 1; }",
 		"src/main.ts":                  "import { helper } from './helper'; export function main() { return helper(); }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	installClaudePlanner(t, `{"schemaVersion":1,"intent":"called_by","entities":["helper"]}`)
 	installFailingCopilotPlanner(t)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code invokes helper?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code invokes helper?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with Claude planner: %v\n%s", err, output)
 	}
@@ -194,17 +296,17 @@ func TestQueryUsesClaudePlanBeforeCopilotFallback(t *testing.T) {
 
 func TestQueryPreservesFallbackAfterRejectedClaudePlan(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	installClaudePlanner(t, `{"schemaVersion":1,"intent":"delete","entities":["main"]}`)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with rejected Claude plan: %v\n%s", err, output)
 	}
@@ -229,17 +331,17 @@ func TestQueryPreservesFallbackAfterRejectedClaudePlan(t *testing.T) {
 
 func TestQueryDoesNotCallClaudeForDeterministicPlan(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	installFailingClaudePlanner(t)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with deterministic plan: %v\n%s", err, output)
 	}
@@ -260,12 +362,12 @@ func TestQueryDoesNotCallClaudeForDeterministicPlan(t *testing.T) {
 
 func TestQueryDoesNotCallOllamaForDeterministicPlan(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"ollama":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"ollama","ollama":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
@@ -274,7 +376,7 @@ func TestQueryDoesNotCallOllamaForDeterministicPlan(t *testing.T) {
 	defer server.Close()
 	t.Setenv("OLLAMA_HOST", server.URL)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with deterministic plan: %v\n%s", err, output)
 	}
@@ -304,12 +406,12 @@ func TestQueryPreservesFallbackForRejectedOllamaPlan(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			workspace := testkit.NewWorkspace(t, map[string]string{
-				".agent-wayfinder/config.json": `{"planning":{"ollama":{"enabled":true,"timeout":"1s"}}}`,
+				".agent-wayfinder/config.json": `{"planning":{"provider":"ollama","ollama":{"timeout":"1s"}}}`,
 				"package.json":                 `{"name":"fixture"}`,
 				"src/main.ts":                  "export function main() { return 1; }",
 			})
 			database := filepath.Join(t.TempDir(), "graph.db")
-			if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+			if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 				t.Fatalf("index workspace: %v\n%s", err, output)
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
@@ -318,7 +420,7 @@ func TestQueryPreservesFallbackForRejectedOllamaPlan(t *testing.T) {
 			defer server.Close()
 			t.Setenv("OLLAMA_HOST", server.URL)
 
-			output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput()
+			output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput()
 			if err != nil {
 				t.Fatalf("query with rejected local plan: %v\n%s", err, output)
 			}
@@ -345,19 +447,19 @@ func TestQueryPreservesFallbackForRejectedOllamaPlan(t *testing.T) {
 
 func TestCopilotQueryOutputJSONSeparatesPlannerMetadataFromEvidence(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 
 	const plannerResponse = `{"schemaVersion":1,"intent":"lookup","entities":["main"]}`
 	installCopilotPlanner(t, plannerResponse)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code locates main?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code locates main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with Copilot planner: %v\n%s", err, output)
 	}
@@ -401,17 +503,17 @@ func TestCopilotQueryOutputJSONSeparatesPlannerMetadataFromEvidence(t *testing.T
 
 func TestCopilotQueryOutputTextReportsPlannerAvailability(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	installCopilotPlanner(t, `{"schemaVersion":1,"intent":"lookup","entities":["main"]}`)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, workspace.Root, "Which code locates main?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, workspace.Root, "Which code locates main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with Copilot planner: %v\n%s", err, output)
 	}
@@ -427,11 +529,11 @@ func TestQueryCommandReturnsRankedSeedsAndBoundedEvidence(t *testing.T) {
 		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	command := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "1", workspace.Root, "main")
+	command := cliCommand("query", "--database", database, "--format", "json", "--max-depth", "1", workspace.Root, "main")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run query command: %v\n%s", err, output)
@@ -486,11 +588,11 @@ func TestQueryCommandSelectsQuestionModeAndReturnsPlan(t *testing.T) {
 		"src/main.ts":  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "1", "--max-nodes", "25", workspace.Root, "Where is main?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", "--max-depth", "1", "--max-nodes", "25", workspace.Root, "Where is main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run question query: %v\n%s", err, output)
 	}
@@ -567,7 +669,7 @@ func TestQueryCommandSelectsQuestionModeAndReturnsPlan(t *testing.T) {
 		t.Errorf("named-unit catalog result = %+v, want graph-only lookup", result.Result.Catalog)
 	}
 
-	repeatedOutput, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "1", "--max-nodes", "25", workspace.Root, "Where is main?").CombinedOutput()
+	repeatedOutput, err := cliCommand("query", "--database", database, "--format", "json", "--max-depth", "1", "--max-nodes", "25", workspace.Root, "Where is main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("repeat question query: %v\n%s", err, repeatedOutput)
 	}
@@ -575,7 +677,7 @@ func TestQueryCommandSelectsQuestionModeAndReturnsPlan(t *testing.T) {
 		t.Errorf("repeated question JSON differs\nfirst: %s\nsecond: %s", output, repeatedOutput)
 	}
 
-	textOutput, err := exec.Command("go", "run", ".", "query", "--show-plan", "--database", database, workspace.Root, "Where is main?").CombinedOutput()
+	textOutput, err := cliCommand("query", "--show-plan", "--database", database, workspace.Root, "Where is main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run text question query: %v\n%s", err, textOutput)
 	}
@@ -590,14 +692,14 @@ func TestQueryCommandRoutesCapabilityQuestionToCatalog(t *testing.T) {
 		"src/token.ts": "export function validateAccessToken(token: string) { return token.length > 0; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
-	if output, err := exec.Command("go", "run", ".", "catalog", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("catalog", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run catalog command: %v\n%s", err, output)
 	}
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Does this workspace validate access tokens?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Does this workspace validate access tokens?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run capability question: %v\n%s", err, output)
 	}
@@ -628,7 +730,7 @@ func TestQueryCommandRoutesCapabilityQuestionToCatalog(t *testing.T) {
 		t.Errorf("catalog evidence = %+v, want one deterministic synopsis", result.Result.Catalog.Matches)
 	}
 
-	textOutput, err := exec.Command("go", "run", ".", "query", "--database", database, workspace.Root, "Does this workspace validate access tokens?").CombinedOutput()
+	textOutput, err := cliCommand("query", "--database", database, workspace.Root, "Does this workspace validate access tokens?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run capability text query: %v\n%s", err, textOutput)
 	}
@@ -643,12 +745,12 @@ func TestQueryCommandReportsLowConfidenceEmptyQuestionWithoutAnAnswerClaim(t *te
 		"src/main.ts":  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
 	question := "Why do lunar widgets shimmer?"
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, question).CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, question).CombinedOutput()
 	if err != nil {
 		t.Fatalf("run low-confidence question: %v\n%s", err, output)
 	}
@@ -679,7 +781,7 @@ func TestQueryCommandReportsLowConfidenceEmptyQuestionWithoutAnAnswerClaim(t *te
 		t.Errorf("low-confidence evidence groups = %+v, want labeled graph and catalog results", result.Result.EvidenceGroups)
 	}
 
-	textOutput, err := exec.Command("go", "run", ".", "query", "--database", database, workspace.Root, question).CombinedOutput()
+	textOutput, err := cliCommand("query", "--database", database, workspace.Root, question).CombinedOutput()
 	if err != nil {
 		t.Fatalf("run low-confidence text question: %v\n%s", err, textOutput)
 	}
@@ -713,11 +815,11 @@ func TestQueryCommandReportsAmbiguousExplainWithoutNeighborhoodEvidence(t *testi
 		"src/second.ts": "export function helper() { return 2; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Explain helper").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Explain helper").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run explain question: %v\n%s", err, output)
 	}
@@ -755,11 +857,11 @@ func TestQueryCommandReturnsDirectedPathEvidenceForAQuestion(t *testing.T) {
 		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "How does src/main.ts::main reach src/helper.ts::helper?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "How does src/main.ts::main reach src/helper.ts::helper?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run path question: %v\n%s", err, output)
 	}
@@ -814,10 +916,10 @@ func TestQueryCommandModeFlagsPreserveTermsAndRejectConflict(t *testing.T) {
 		"src/main.ts":  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
-	output, err := exec.Command("go", "run", ".", "query", "--terms", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
+	output, err := cliCommand("query", "--terms", "--database", database, "--format", "json", workspace.Root, "Where is main?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("run explicit terms query: %v\n%s", err, output)
 	}
@@ -847,11 +949,11 @@ func TestQueryCommandReportsLimitsAndFilteredEvidence(t *testing.T) {
 		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	command := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "0", "--relation", "typescript:calls", workspace.Root, "src/main.ts::main")
+	command := cliCommand("query", "--database", database, "--format", "json", "--max-depth", "0", "--relation", "typescript:calls", workspace.Root, "src/main.ts::main")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run query command: %v\n%s", err, output)
@@ -894,17 +996,17 @@ func TestQueryCommandReportsLimitsAndFilteredEvidence(t *testing.T) {
 
 func TestQueryPreservesDeterministicFallbackAfterCopilotFailure(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":true}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	installFailingCopilotPlanner(t)
 
-	output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput()
+	output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query with failed Copilot planner: %v\n%s", err, output)
 	}
@@ -944,16 +1046,16 @@ func TestQueryPreservesDeterministicFallbackAfterCopilotFailure(t *testing.T) {
 
 func TestQueryPersistsCopilotTimeoutMetric(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"copilot":{"enabled":true,"timeout":"10ms"}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"copilot","copilot":{"timeout":"10ms"}}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/main.ts":                  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "graph.db")
-	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := cliCommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("index workspace: %v\n%s", err, output)
 	}
 	installBlockingCopilotPlanner(t)
-	if output, err := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput(); err != nil {
+	if output, err := cliCommand("query", "--database", database, "--format", "json", workspace.Root, "Which code handles main work?").CombinedOutput(); err != nil {
 		t.Fatalf("query with timed out Copilot planner: %v\n%s", err, output)
 	}
 	store, err := sqlite.Open(context.Background(), database)
@@ -990,6 +1092,21 @@ func installCopilotPlanner(t *testing.T, response string) {
 	plannerScript := "#!/bin/sh\nprintf '%s\\n' '" + string(event) + "' '{\"type\":\"session.idle\",\"data\":{\"outputTokens\":12,\"totalNanoAiu\":80}}'\n"
 	if err := os.WriteFile(plannerPath, []byte(plannerScript), 0o755); err != nil {
 		t.Fatalf("write Copilot planner: %v", err)
+	}
+	t.Setenv("PATH", plannerDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func installCopilotPlannerWithUsage(t *testing.T, response string, credits int) {
+	t.Helper()
+	plannerDirectory := t.TempDir()
+	plannerPath := filepath.Join(plannerDirectory, "copilot")
+	event, err := json.Marshal(map[string]any{"type": "assistant.message", "data": map[string]string{"content": response}})
+	if err != nil {
+		t.Fatalf("encode Copilot planner event: %v", err)
+	}
+	plannerScript := "#!/bin/sh\nusage_file=''\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--usage-output-file\" ]; then usage_file=$2; shift 2; continue; fi\n  shift\ndone\nprintf '%s\\n' '" + string(event) + "'\nprintf '{\"currentModel\":\"gpt-5\",\"totalPremiumRequestCost\":" + strconv.Itoa(credits) + ",\"modelMetrics\":{\"gpt-5\":{\"usage\":{}}}}' > \"$usage_file\"\n"
+	if err := os.WriteFile(plannerPath, []byte(plannerScript), 0o755); err != nil {
+		t.Fatalf("write Copilot planner with usage: %v", err)
 	}
 	t.Setenv("PATH", plannerDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

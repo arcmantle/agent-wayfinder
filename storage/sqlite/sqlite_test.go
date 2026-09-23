@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +41,206 @@ func TestOpenMigratesNewDatabaseAndReopensIt(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close migrated database: %v", err)
+	}
+}
+
+func TestReserveSpendAppliesPeriodLimits(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		limits storage.SpendLimits
+	}{
+		{name: "daily", limits: storage.SpendLimits{Daily: 30}},
+		{name: "weekly", limits: storage.SpendLimits{Weekly: 30}},
+		{name: "monthly", limits: storage.SpendLimits{Monthly: 30}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+			if err != nil {
+				t.Fatalf("open database: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			request := storage.SpendReservationRequest{Provider: "copilot", Unit: "ai_credits", MaximumAmount: 30, MinimumAmount: 30, Limits: testCase.limits}
+			if reservation, err := store.ReserveSpend(context.Background(), request); err != nil || reservation.Amount != 30 {
+				t.Fatalf("reserve first request: reservation %+v, error %v; want 30 and no error", reservation, err)
+			}
+			if _, err := store.ReserveSpend(context.Background(), request); !errors.Is(err, storage.ErrSpendLimitExceeded) {
+				t.Errorf("reserve second request error = %v, want spend limit exceeded", err)
+			}
+		})
+	}
+}
+
+func TestReserveSpendUsesTheMostRestrictiveActivePeriod(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	request := storage.SpendReservationRequest{
+		Provider:      "claude",
+		Unit:          "usd",
+		MaximumAmount: 30,
+		MinimumAmount: 1,
+		Limits:        storage.SpendLimits{Daily: 30, Weekly: 20, Monthly: 10},
+	}
+	if reservation, err := store.ReserveSpend(context.Background(), request); err != nil || reservation.Amount != 10 {
+		t.Fatalf("reserve first request: reservation %+v, error %v; want 10 and no error", reservation, err)
+	}
+	if _, err := store.ReserveSpend(context.Background(), request); !errors.Is(err, storage.ErrSpendLimitExceeded) {
+		t.Errorf("reserve second request error = %v, want spend limit exceeded", err)
+	}
+}
+
+func TestReserveSpendResetsAtUTCBoundaries(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		start  time.Time
+		next   time.Time
+		limits storage.SpendLimits
+	}{
+		{
+			name:   "daily",
+			start:  time.Date(2026, time.September, 23, 23, 59, 59, 0, time.UTC),
+			next:   time.Date(2026, time.September, 24, 0, 0, 0, 0, time.UTC),
+			limits: storage.SpendLimits{Daily: 30},
+		},
+		{
+			name:   "Monday weekly",
+			start:  time.Date(2026, time.September, 27, 23, 59, 59, 0, time.UTC),
+			next:   time.Date(2026, time.September, 28, 0, 0, 0, 0, time.UTC),
+			limits: storage.SpendLimits{Weekly: 30},
+		},
+		{
+			name:   "monthly",
+			start:  time.Date(2026, time.September, 30, 23, 59, 59, 0, time.UTC),
+			next:   time.Date(2026, time.October, 1, 0, 0, 0, 0, time.UTC),
+			limits: storage.SpendLimits{Monthly: 30},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			currentTime := testCase.start
+			store, err := sqlite.OpenWithOptions(context.Background(), filepath.Join(t.TempDir(), "graph.db"), sqlite.Options{
+				Now: func() time.Time { return currentTime },
+			})
+			if err != nil {
+				t.Fatalf("open database: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			request := storage.SpendReservationRequest{
+				Provider:      "copilot",
+				Unit:          "ai_credits",
+				MaximumAmount: 30,
+				MinimumAmount: 30,
+				Limits:        testCase.limits,
+			}
+			if _, err := store.ReserveSpend(context.Background(), request); err != nil {
+				t.Fatalf("reserve before boundary: %v", err)
+			}
+			currentTime = testCase.next
+			if reservation, err := store.ReserveSpend(context.Background(), request); err != nil || reservation.Amount != 30 {
+				t.Errorf("reserve after boundary: reservation %+v, error %v; want 30 and no error", reservation, err)
+			}
+		})
+	}
+}
+
+func TestReserveSpendDoesNotExceedLimitForConcurrentRequests(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	request := storage.SpendReservationRequest{
+		Provider:      "copilot",
+		Unit:          "ai_credits",
+		MaximumAmount: 30,
+		MinimumAmount: 30,
+		Limits:        storage.SpendLimits{Daily: 30},
+	}
+	start := make(chan struct{})
+	errorsByRequest := make(chan error, 3)
+	var requests sync.WaitGroup
+	for range 3 {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			<-start
+			_, err := store.ReserveSpend(context.Background(), request)
+			errorsByRequest <- err
+		}()
+	}
+	close(start)
+	requests.Wait()
+	close(errorsByRequest)
+
+	successes := 0
+	for err := range errorsByRequest {
+		if err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(err, storage.ErrSpendLimitExceeded) {
+			t.Errorf("concurrent reservation error = %v, want spend limit exceeded", err)
+		}
+	}
+	if successes != 1 {
+		t.Errorf("successful concurrent reservations = %d, want 1", successes)
+	}
+}
+
+func TestSettleSpendReleasesUnusedReservedAmount(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	request := storage.SpendReservationRequest{
+		Provider:      "claude",
+		Unit:          "usd",
+		MaximumAmount: 30,
+		MinimumAmount: 1,
+		Limits:        storage.SpendLimits{Daily: 30},
+	}
+	reservation, err := store.ReserveSpend(context.Background(), request)
+	if err != nil {
+		t.Fatalf("reserve spend: %v", err)
+	}
+	if err := store.SettleSpend(context.Background(), reservation.ID, 1); err != nil {
+		t.Fatalf("settle spend: %v", err)
+	}
+	request.MaximumAmount = 30
+	if reservation, err := store.ReserveSpend(context.Background(), request); err != nil || reservation.Amount != 29 {
+		t.Errorf("reserve after settlement: reservation %+v, error %v; want 29 and no error", reservation, err)
+	}
+}
+
+func TestSettleSpendRejectsInvalidOrIncreasedAmounts(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	request := storage.SpendReservationRequest{
+		Provider:      "claude",
+		Unit:          "usd",
+		MaximumAmount: 30,
+		MinimumAmount: 1,
+		Limits:        storage.SpendLimits{Daily: 30},
+	}
+	reservation, err := store.ReserveSpend(context.Background(), request)
+	if err != nil {
+		t.Fatalf("reserve spend: %v", err)
+	}
+	for _, amount := range []float64{-1, math.Inf(1), math.NaN(), 31} {
+		if err := store.SettleSpend(context.Background(), reservation.ID, amount); !errors.Is(err, storage.ErrInvalidRequest) {
+			t.Errorf("settle spend amount %v error = %v, want invalid request", amount, err)
+		}
+	}
+	if err := store.SettleSpend(context.Background(), 0, 1); !errors.Is(err, storage.ErrInvalidRequest) {
+		t.Errorf("settle spend zero reservation ID error = %v, want invalid request", err)
+	}
+	if _, err := store.ReserveSpend(context.Background(), request); !errors.Is(err, storage.ErrSpendLimitExceeded) {
+		t.Errorf("reserve after rejected settlement error = %v, want spend limit exceeded", err)
 	}
 }
 

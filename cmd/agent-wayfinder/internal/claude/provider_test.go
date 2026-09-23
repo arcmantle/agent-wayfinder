@@ -18,7 +18,7 @@ import (
 )
 
 func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
-	configured := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":true,"path":"/opt/bin/claude","model":"opus","fallbackModel":"haiku","maxBudgetUsd":0.75,"effort":"high","timeout":"12s"}}}`})
+	configured := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{"path":"/opt/bin/claude","model":"opus","fallbackModel":"haiku","maxBudgetUsd":0.75,"effort":"high","timeout":"12s"}}}`})
 	configuration, err := ReadConfiguration(configured.Root)
 	if err != nil {
 		t.Fatalf("read configured Claude planner configuration: %v", err)
@@ -36,7 +36,7 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 		t.Errorf("default Claude planner configuration = %+v, want disabled defaults", configuration)
 	}
 
-	legacy := testkit.NewWorkspace(t, map[string]string{".wayfinder": `{"planning":{"claude":{"enabled":true,"path":"/opt/bin/claude","model":"opus"}}}`})
+	legacy := testkit.NewWorkspace(t, map[string]string{".wayfinder": `{"planning":{"provider":"claude","claude":{"path":"/opt/bin/claude","model":"opus"}}}`})
 	configuration, err = ReadConfiguration(legacy.Root)
 	if err != nil {
 		t.Fatalf("read legacy Claude planner configuration: %v", err)
@@ -48,7 +48,7 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 
 func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
 	user := testkit.NewWorkspace(t, map[string]string{})
-	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"claude":{"enabled":true,"path":"user-claude","model":"user-model","fallbackModel":"user-fallback","maxBudgetUsd":0.5,"effort":"medium","timeout":"7s"}}}`)
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"provider":"claude","claude":{"path":"user-claude","model":"user-model","fallbackModel":"user-fallback","maxBudgetUsd":0.5,"effort":"medium","timeout":"7s"}}}`)
 	t.Setenv("HOME", user.Root)
 	t.Setenv("USERPROFILE", user.Root)
 	workspace := testkit.NewWorkspace(t, map[string]string{
@@ -74,7 +74,7 @@ func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
 }
 
 func TestResolveConfigurationUsesFlagPrecedence(t *testing.T) {
-	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":false,"path":"workspace-claude","model":"workspace-model","fallbackModel":"workspace-fallback","maxBudgetUsd":0.25,"effort":"low","timeout":"5s"}}}`})
+	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{"path":"workspace-claude","model":"workspace-model","fallbackModel":"workspace-fallback","maxBudgetUsd":0.25,"effort":"low","timeout":"5s"}}}`})
 	t.Setenv("WAYFINDER_CLAUDE_ENABLED", "false")
 	t.Setenv("WAYFINDER_CLAUDE_PATH", "environment-claude")
 	t.Setenv("WAYFINDER_CLAUDE_MODEL", "environment-model")
@@ -99,7 +99,7 @@ func TestResolveConfigurationUsesFlagPrecedence(t *testing.T) {
 }
 
 func TestResolveConfigurationReportTracksSettingSources(t *testing.T) {
-	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":false,"path":"workspace-claude","model":"workspace-model","fallbackModel":"workspace-fallback","maxBudgetUsd":0.25,"effort":"low","timeout":"5s"}}}`})
+	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"provider":"claude","claude":{"path":"workspace-claude","model":"workspace-model","fallbackModel":"workspace-fallback","maxBudgetUsd":0.25,"effort":"low","timeout":"5s"}}}`})
 	t.Setenv("WAYFINDER_CLAUDE_PATH", "environment-claude")
 	t.Setenv("WAYFINDER_CLAUDE_MODEL", "environment-model")
 	command := newConfigurationCommand()
@@ -234,6 +234,22 @@ func TestRunReportsProviderUsageMetadataAndBuildsMetric(t *testing.T) {
 	metric := NewPlannerMetric(configuration, run, storage.ClaudePlannerOutcomeSuccess)
 	if metric.ActualModel != "haiku" || metric.FallbackModel != "haiku" || metric.MaxBudgetUSD != 0.75 || metric.Effort != "high" || metric.InputTokens.Value != 15667 || metric.OutputTokens.Value != 12 || metric.APIDurationMilliseconds.Value != 1500 || metric.CostUSD.Value != 0.012 {
 		t.Errorf("Claude planner metric = %+v, want provider metric fields", metric)
+	}
+}
+
+func TestRunCatalogSynopsisReportsExactCost(t *testing.T) {
+	envelope, err := json.Marshal(map[string]any{"result": "Validates an access token.", "total_cost_usd": 0.012})
+	if err != nil {
+		t.Fatalf("encode Claude catalog result: %v", err)
+	}
+	run, err := RunCatalogSynopsis(context.Background(), Configuration{Model: "sonnet", Timeout: time.Second}, index.CatalogSynopsisInput{Name: "ValidateToken"}, func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.Command("printf", "%s\n", string(envelope))
+	})
+	if err != nil {
+		t.Fatalf("run Claude catalog synopsis with cost: %v", err)
+	}
+	if run.Synopsis != "Validates an access token." || run.CostUSD.Availability != storage.MetricValueExact || run.CostUSD.Value != 0.012 {
+		t.Errorf("Claude catalog synopsis run = %+v, want synopsis and exact cost", run)
 	}
 }
 

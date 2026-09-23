@@ -14,6 +14,7 @@ var (
 	ErrGraphVersionNotFound = errors.New("storage graph version not found")
 	ErrGraphVersionPruned   = errors.New("storage graph version pruned")
 	ErrInvalidRequest       = errors.New("storage invalid request")
+	ErrSpendLimitExceeded   = errors.New("storage spend limit exceeded")
 )
 
 type GraphVersion uint64
@@ -317,6 +318,30 @@ type CatalogSearcher interface {
 }
 
 type CopilotPlannerOutcome string
+
+type SpendLimits struct {
+	Daily   float64
+	Weekly  float64
+	Monthly float64
+}
+
+type SpendReservationRequest struct {
+	Provider      string
+	Unit          string
+	MaximumAmount float64
+	MinimumAmount float64
+	Limits        SpendLimits
+}
+
+type SpendReservation struct {
+	ID     int64
+	Amount float64
+}
+
+type SpendReservationStore interface {
+	ReserveSpend(context.Context, SpendReservationRequest) (SpendReservation, error)
+	SettleSpend(context.Context, int64, float64) error
+}
 
 const (
 	CopilotPlannerOutcomeSuccess  CopilotPlannerOutcome = "success"

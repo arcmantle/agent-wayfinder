@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"agent-wayfinder/extractor"
 	"agent-wayfinder/index"
@@ -17,13 +18,13 @@ import (
 
 func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *testing.T) {
 	configured := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"synopsis":{"provider":"copilot","sourceLimit":512},"copilot":{"enabled":true,"maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435"},"embeddingEnabled":true,"embeddingModel":"qwen3-embedding:8b","embeddingProcessLimit":1}`,
+		".agent-wayfinder/config.json": `{"synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435"},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"enabled":true,"model":"qwen3-embedding:8b","processLimit":1}}`,
 	})
 	configuration, err := readCatalogConfiguration(configured.Root)
 	if err != nil {
 		t.Fatalf("read configured catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 512 || !configuration.Copilot.Enabled || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "/opt/bin/copilot" || configuration.Ollama.Model != "catalog-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.EmbeddingEnabled || configuration.EmbeddingModel != "qwen3-embedding:8b" || configuration.EmbeddingProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 512 || configuration.Copilot.Model != "gpt-5.6-luna" || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "/opt/bin/copilot" || configuration.Ollama.Model != "catalog-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Claude.Path != "/opt/bin/claude" || configuration.Claude.Model != "sonnet" || configuration.Claude.FallbackModel != "haiku" || configuration.Claude.MaxBudgetUSD != 0.25 || configuration.Claude.Effort != "high" || configuration.Claude.Timeout != 12*time.Second || !configuration.Embedding.Enabled || configuration.Embedding.Model != "qwen3-embedding:8b" || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("configured catalog configuration = %+v, want workspace values", configuration)
 	}
 
@@ -34,32 +35,32 @@ func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *te
 	if err != nil {
 		t.Fatalf("read default catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != "" || configuration.Synopsis.SourceLimit != extractor.DefaultCatalogDeclarationSourceLimit || configuration.Copilot.Enabled || configuration.Copilot.MaxAICredits != 30 || configuration.Copilot.ProcessLimit != 1 || configuration.Copilot.Path != "" || configuration.Ollama.Model != "qwen3:8b" || configuration.Ollama.Endpoint != index.DefaultOllamaHost || configuration.EmbeddingEnabled || configuration.EmbeddingModel != "qwen3-embedding:4b" || configuration.EmbeddingProcessLimit != index.MaximumEmbeddingProcessLimit {
+	if configuration.Synopsis.Provider != "" || configuration.Synopsis.SourceLimit != extractor.DefaultCatalogDeclarationSourceLimit || configuration.Copilot.Model != "" || configuration.Copilot.MaxAICredits != 30 || configuration.Copilot.ProcessLimit != 1 || configuration.Copilot.Path != "" || configuration.Ollama.Model != "qwen3:8b" || configuration.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Embedding.Enabled || configuration.Embedding.Model != "qwen3-embedding:4b" || configuration.Embedding.ProcessLimit != index.MaximumEmbeddingProcessLimit {
 		t.Errorf("default catalog configuration = %+v, want disabled Copilot and default embedding model", configuration)
 	}
 }
 
 func TestReadCatalogConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
 	user := testkit.NewWorkspace(t, map[string]string{})
-	user.WriteFile(t, ".agent-wayfinder/config.json", `{"synopsis":{"provider":"copilot","sourceLimit":512},"copilot":{"enabled":true,"maxAiCredits":42,"processLimit":3,"path":"user-copilot"},"ollama":{"model":"user-model","endpoint":"http://localhost:11435"},"embeddingEnabled":true,"embeddingModel":"user-embedding","embeddingProcessLimit":1}`)
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"maxAiCredits":42,"processLimit":3,"path":"user-copilot"},"ollama":{"model":"user-model","endpoint":"http://localhost:11435"}},"embedding":{"enabled":true,"model":"user-embedding","processLimit":1}}`)
 	t.Setenv("HOME", user.Root)
 	t.Setenv("USERPROFILE", user.Root)
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"synopsis":{"sourceLimit":1024},"copilot":{"path":"workspace-copilot"},"ollama":{"model":"workspace-model"},"embeddingModel":"workspace-embedding"}`,
+		".agent-wayfinder/config.json": `{"synopsis":{"sourceLimit":1024,"copilot":{"path":"workspace-copilot"},"ollama":{"model":"workspace-model"}},"embedding":{"model":"workspace-embedding"}}`,
 	})
 
 	configuration, err := readCatalogConfiguration(workspace.Root)
 	if err != nil {
 		t.Fatalf("read layered catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 1024 || !configuration.Copilot.Enabled || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "workspace-copilot" || configuration.Ollama.Model != "workspace-model" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.EmbeddingEnabled || configuration.EmbeddingModel != "workspace-embedding" || configuration.EmbeddingProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "workspace-copilot" || configuration.Ollama.Model != "workspace-model" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.Embedding.Enabled || configuration.Embedding.Model != "workspace-embedding" || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("catalog configuration = %+v, want workspace values to override user values", configuration)
 	}
 }
 
 func TestCatalogFlagsOverrideWorkspaceConfiguration(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"synopsis":{"provider":"copilot","sourceLimit":512},"copilot":{"enabled":true,"maxAiCredits":42,"processLimit":2,"path":"workspace-copilot"}}`,
+		".agent-wayfinder/config.json": `{"synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"workspace-model","maxAiCredits":42,"processLimit":2,"path":"workspace-copilot"}}}`,
 	})
 	command := &cobra.Command{}
 	ConfigureFlags(command)
@@ -67,6 +68,7 @@ func TestCatalogFlagsOverrideWorkspaceConfiguration(t *testing.T) {
 		"catalog-synopsis-provider":       "claude",
 		"catalog-synopsis-source-limit":   "1024",
 		"catalog-copilot":                 "false",
+		"catalog-copilot-model":           "flag-model",
 		"catalog-copilot-max-ai-credits":  "60",
 		"catalog-copilot-process-limit":   "4",
 		"catalog-copilot-path":            "flag-copilot",
@@ -85,7 +87,7 @@ func TestCatalogFlagsOverrideWorkspaceConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderClaude || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.Enabled || configuration.Copilot.MaxAICredits != 60 || configuration.Copilot.ProcessLimit != 4 || configuration.Copilot.Path != "flag-copilot" || configuration.Ollama.Model != "flag-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.EmbeddingEnabled || configuration.EmbeddingModel != "qwen3-embedding:8b" || configuration.EmbeddingProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderClaude || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.Model != "flag-model" || configuration.Copilot.MaxAICredits != 60 || configuration.Copilot.ProcessLimit != 4 || configuration.Copilot.Path != "flag-copilot" || configuration.Ollama.Model != "flag-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.Embedding.Enabled || configuration.Embedding.Model != "qwen3-embedding:8b" || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("catalog configuration = %+v, want flag overrides", configuration)
 	}
 }
@@ -108,17 +110,17 @@ func TestReadCatalogConfigurationRejectsInvalidSynopsisValues(t *testing.T) {
 		},
 		{
 			name:     "Copilot max AI credits",
-			contents: `{"copilot":{"maxAiCredits":29}}`,
+			contents: `{"synopsis":{"copilot":{"maxAiCredits":29}}}`,
 			want:     "invalid catalog Copilot max AI credits",
 		},
 		{
 			name:     "Ollama model",
-			contents: `{"ollama":{"model":" "}}`,
+			contents: `{"synopsis":{"ollama":{"model":" "}}}`,
 			want:     "invalid catalog Ollama model",
 		},
 		{
 			name:     "Ollama endpoint",
-			contents: `{"ollama":{"endpoint":"localhost:11434"}}`,
+			contents: `{"synopsis":{"ollama":{"endpoint":"localhost:11434"}}}`,
 			want:     "invalid catalog Ollama endpoint",
 		},
 	} {
@@ -176,7 +178,7 @@ func TestNewCatalogEmbeddingGeneratorUsesConfiguredModelAndOllamaHost(t *testing
 	t.Cleanup(server.Close)
 	t.Setenv("OLLAMA_HOST", server.URL)
 
-	generator, err := newCatalogEmbeddingGenerator(catalogConfiguration{EmbeddingEnabled: true, EmbeddingModel: "qwen3-embedding:8b"}, server.Client())
+	generator, err := newCatalogEmbeddingGenerator(catalogConfiguration{Embedding: catalogEmbeddingConfiguration{Enabled: true, Model: "qwen3-embedding:8b"}}, server.Client())
 	if err != nil {
 		t.Fatalf("create catalog embedding generator: %v", err)
 	}

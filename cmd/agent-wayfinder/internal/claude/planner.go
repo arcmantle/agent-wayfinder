@@ -125,11 +125,11 @@ func Run(parent context.Context, configuration Configuration, question string, r
 	}
 
 	var result struct {
-		Result        string  `json:"result"`
-		IsError       bool    `json:"is_error"`
-		Model         string  `json:"model"`
-		DurationAPIMS int64   `json:"duration_api_ms"`
-		TotalCostUSD  float64 `json:"total_cost_usd"`
+		Result        string   `json:"result"`
+		IsError       bool     `json:"is_error"`
+		Model         string   `json:"model"`
+		DurationAPIMS int64    `json:"duration_api_ms"`
+		TotalCostUSD  *float64 `json:"total_cost_usd"`
 		Usage         struct {
 			InputTokens  int64 `json:"input_tokens"`
 			OutputTokens int64 `json:"output_tokens"`
@@ -177,8 +177,8 @@ func Run(parent context.Context, configuration Configuration, question string, r
 	if result.DurationAPIMS > 0 {
 		run.APIDurationMilliseconds = storage.ExactMetricValue(result.DurationAPIMS)
 	}
-	if result.TotalCostUSD > 0 {
-		run.CostUSD = storage.DollarValue{Value: result.TotalCostUSD, Availability: storage.MetricValueExact}
+	if result.TotalCostUSD != nil {
+		run.CostUSD = storage.DollarValue{Value: *result.TotalCostUSD, Availability: storage.MetricValueExact}
 	}
 	if strings.TrimSpace(result.Result) == "" {
 		return run, fmt.Errorf("parse Claude planner response: missing result")

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/planning"
 
 	"github.com/spf13/cobra"
 )
@@ -112,7 +113,6 @@ func ResolveConfiguration(command *cobra.Command, workspaceRoot string) (Configu
 }
 
 type configurationFile struct {
-	Enabled      *bool           `json:"enabled"`
 	Model        *string         `json:"model"`
 	MaxAICredits *int            `json:"maxAiCredits"`
 	TokenBudget  *int            `json:"tokenBudget"`
@@ -136,6 +136,11 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 			return Configuration{}, err
 		}
 	}
+	provider, err := planning.ReadProvider(workspaceRoot)
+	if err != nil {
+		return Configuration{}, err
+	}
+	configuration.Enabled = provider == planning.ProviderCopilot
 	if err := applyEnvironment(&configuration); err != nil {
 		return Configuration{}, err
 	}
@@ -147,6 +152,11 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 
 func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 	sources := ConfigurationSources{Enabled: "default", Model: "default", MaxAICredits: "default", TokenBudget: "default", Timeout: "default"}
+	providerSource, err := planning.ReadProviderSource(workspaceRoot)
+	if err != nil {
+		return ConfigurationSources{}, err
+	}
+	sources.Enabled = providerSource
 	paths := configpath.Paths(workspaceRoot)
 	for index, path := range paths {
 		configuration, err := readConfigurationFile(path)
@@ -156,9 +166,6 @@ func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 		source := "user"
 		if index == len(paths)-1 {
 			source = "workspace"
-		}
-		if configuration.Enabled != nil {
-			sources.Enabled = source
 		}
 		if configuration.Model != nil {
 			sources.Model = source
@@ -188,9 +195,6 @@ func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 }
 
 func applyFileConfiguration(configuration *Configuration, file configurationFile) error {
-	if file.Enabled != nil {
-		configuration.Enabled = *file.Enabled
-	}
 	if file.Model != nil {
 		configuration.Model = *file.Model
 	}

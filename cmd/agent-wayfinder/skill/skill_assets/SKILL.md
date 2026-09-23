@@ -50,7 +50,7 @@ Use the CLI when the required MCP tool is not available. Always use the CLI for
 ## Procedure
 
 1. Resolve the workspace to an absolute repository root.
-2. For `query`, `path`, `explain`, or `export`, use the matching MCP tool when it is available. Otherwise, prefer `agent-wayfinder`. Use `a-wayfinder` if only that alias is installed. In the Agent Wayfinder source repository, use `go run ./cmd/agent-wayfinder` when no installed command is available.
+2. For `query`, `path`, `explain`, or `export`, use the matching MCP tool when it is available. Otherwise, prefer `agent-wayfinder`. Use `a-wayfinder` if only that alias is installed. In the Agent Wayfinder source repository, use `make run ARGS='...'` when no installed command is available.
 3. Check for `<WORKSPACE>/.agent-wayfinder/graph.db`, unless the user gave `--database`.
 4. If no published graph is available, run `index WORKSPACE --format json` before a graph query.
 5. For questions about recent edits, refresh with `index`. Do not assume that the current `indexer start` command updates the graph.

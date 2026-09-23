@@ -1,12 +1,16 @@
 .PHONY: build run test acceptance lint check
 
 AGENT_WAYFINDER_PACKAGES := $(shell go list -e ./... | grep -v '^agent-wayfinder/reference')
+AGENT_WAYFINDER_BINARY := agent-wayfinder
+AGENT_WAYFINDER_SOURCES := $(shell find cmd configuration extractor extractors graph index indexer query storage workspace -name '*.go') go.mod
 
-build:
-	CGO_ENABLED=1 go build ./cmd/agent-wayfinder
+build: $(AGENT_WAYFINDER_BINARY)
 
-run:
-	CGO_ENABLED=1 go run ./cmd/agent-wayfinder $(ARGS)
+$(AGENT_WAYFINDER_BINARY): $(AGENT_WAYFINDER_SOURCES)
+	CGO_ENABLED=1 go build -o $@ ./cmd/agent-wayfinder
+
+run: $(AGENT_WAYFINDER_BINARY)
+	./$(AGENT_WAYFINDER_BINARY) $(ARGS)
 
 test:
 	CGO_ENABLED=1 go test $(AGENT_WAYFINDER_PACKAGES)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/planning"
 
 	"github.com/spf13/cobra"
 )
@@ -25,7 +26,6 @@ const (
 var modelPattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
 type configurationFile struct {
-	Enabled       *bool           `json:"enabled"`
 	Path          *string         `json:"path"`
 	Model         *string         `json:"model"`
 	FallbackModel *string         `json:"fallbackModel"`
@@ -79,10 +79,15 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 			}
 		}
 	}
+	provider, err := planning.ReadProvider(workspaceRoot)
+	if err != nil {
+		return Configuration{}, err
+	}
+	configuration.Enabled = provider == planning.ProviderClaude
 	if err := applyEnvironment(&configuration); err != nil {
 		return Configuration{}, err
 	}
-	if err := validateConfiguration(configuration); err != nil {
+	if err := ValidateConfiguration(configuration); err != nil {
 		return Configuration{}, err
 	}
 	return configuration, nil
@@ -141,16 +146,13 @@ func ResolveConfigurationReport(command *cobra.Command, workspaceRoot string) (C
 	if err != nil {
 		return ConfigurationReport{}, err
 	}
-	if err := validateConfiguration(configuration); err != nil {
+	if err := ValidateConfiguration(configuration); err != nil {
 		return ConfigurationReport{}, err
 	}
 	return ConfigurationReport{Enabled: configuration.Enabled, Path: configuration.Path, Model: configuration.Model, FallbackModel: configuration.FallbackModel, MaxBudgetUSD: configuration.MaxBudgetUSD, Effort: configuration.Effort, Timeout: configuration.Timeout.String(), Sources: sources}, nil
 }
 
 func applyFileConfiguration(configuration *Configuration, file configurationFile) {
-	if file.Enabled != nil {
-		configuration.Enabled = *file.Enabled
-	}
 	if file.Path != nil {
 		configuration.Path = *file.Path
 	}
@@ -170,6 +172,11 @@ func applyFileConfiguration(configuration *Configuration, file configurationFile
 
 func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 	sources := ConfigurationSources{Enabled: "default", Path: "default", Model: "default", FallbackModel: "default", MaxBudgetUSD: "default", Effort: "default", Timeout: "default"}
+	providerSource, err := planning.ReadProviderSource(workspaceRoot)
+	if err != nil {
+		return ConfigurationSources{}, err
+	}
+	sources.Enabled = providerSource
 	paths := configpath.Paths(workspaceRoot)
 	for index, path := range paths {
 		configuration, err := readConfigurationFile(path)
@@ -179,9 +186,6 @@ func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 		source := "user"
 		if index == len(paths)-1 {
 			source = "workspace"
-		}
-		if configuration.Enabled != nil {
-			sources.Enabled = source
 		}
 		if configuration.Path != nil {
 			sources.Path = source
@@ -313,7 +317,7 @@ func parseTimeout(value string) (time.Duration, error) {
 	return duration, nil
 }
 
-func validateConfiguration(configuration Configuration) error {
+func ValidateConfiguration(configuration Configuration) error {
 	if strings.TrimSpace(configuration.Path) == "" {
 		return fmt.Errorf("invalid Claude planner path")
 	}
