@@ -2,21 +2,15 @@ package catalog
 
 import (
 	"net/http"
-	"os"
-	"strings"
 
 	"agent-wayfinder/index"
 )
 
 func newCatalogEmbeddingGenerator(configuration catalogConfiguration, client *http.Client) (index.CatalogEmbeddingGenerator, error) {
-	if !configuration.Embedding.Enabled {
+	if configuration.Embedding.Provider == "" {
 		return nil, nil
 	}
-	endpoint := strings.TrimSpace(os.Getenv("OLLAMA_HOST"))
-	if endpoint != "" && !strings.Contains(endpoint, "://") {
-		endpoint = "http://" + endpoint
-	}
-	return index.NewOllamaCatalogEmbeddingGenerator(configuration.Embedding.Model, endpoint, client)
+	return index.NewOllamaCatalogEmbeddingGenerator(configuration.Embedding.Ollama.Model, configuration.Embedding.Ollama.Endpoint, configuration.Embedding.Ollama.Timeout, client)
 }
 
 func NewEmbeddingGenerator(workspaceRoot string, client *http.Client) (index.CatalogEmbeddingGenerator, error) {

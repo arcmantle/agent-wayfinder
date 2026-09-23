@@ -48,23 +48,24 @@ type CatalogEmbeddingBatchGenerator interface {
 }
 
 const (
-	DefaultOllamaCatalogEmbeddingModel = "qwen3-embedding:4b"
-	DefaultOllamaHost                  = "http://127.0.0.1:11434"
-	ollamaEmbeddingTimeout             = 10 * time.Second
-	ollamaEmbeddingThreadLimit         = 1
-	ollamaEmbeddingBatchSize           = 32
-	ollamaEmbeddingKeepAlive           = "5m"
-	ollamaEmbeddingMaxResponseBytes    = 4 * 1024 * 1024
-	MaximumEmbeddingProcessLimit       = 2
+	DefaultOllamaCatalogEmbeddingModel   = "qwen3-embedding:4b"
+	DefaultOllamaHost                    = "http://127.0.0.1:11434"
+	DefaultOllamaCatalogEmbeddingTimeout = 10 * time.Second
+	ollamaEmbeddingThreadLimit           = 1
+	ollamaEmbeddingBatchSize             = 32
+	ollamaEmbeddingKeepAlive             = "5m"
+	ollamaEmbeddingMaxResponseBytes      = 4 * 1024 * 1024
+	MaximumEmbeddingProcessLimit         = 2
 )
 
 type OllamaCatalogEmbeddingGenerator struct {
 	model    string
 	endpoint string
+	timeout  time.Duration
 	client   *http.Client
 }
 
-func NewOllamaCatalogEmbeddingGenerator(model, endpoint string, client *http.Client) (*OllamaCatalogEmbeddingGenerator, error) {
+func NewOllamaCatalogEmbeddingGenerator(model, endpoint string, timeout time.Duration, client *http.Client) (*OllamaCatalogEmbeddingGenerator, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		model = DefaultOllamaCatalogEmbeddingModel
@@ -73,6 +74,9 @@ func NewOllamaCatalogEmbeddingGenerator(model, endpoint string, client *http.Cli
 	if endpoint == "" {
 		endpoint = DefaultOllamaHost
 	}
+	if timeout <= 0 {
+		timeout = DefaultOllamaCatalogEmbeddingTimeout
+	}
 	parsed, err := url.ParseRequestURI(endpoint)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("create Ollama embedding generator: endpoint must be an absolute URL")
@@ -80,7 +84,7 @@ func NewOllamaCatalogEmbeddingGenerator(model, endpoint string, client *http.Cli
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &OllamaCatalogEmbeddingGenerator{model: model, endpoint: strings.TrimRight(endpoint, "/"), client: client}, nil
+	return &OllamaCatalogEmbeddingGenerator{model: model, endpoint: strings.TrimRight(endpoint, "/"), timeout: timeout, client: client}, nil
 }
 
 func (generator *OllamaCatalogEmbeddingGenerator) GenerateCatalogEmbedding(ctx context.Context, text string) ([]float32, error) {
@@ -96,7 +100,7 @@ func (generator *OllamaCatalogEmbeddingGenerator) GenerateCatalogEmbeddings(ctx 
 }
 
 func (generator *OllamaCatalogEmbeddingGenerator) ReleaseCatalogEmbeddingModel(ctx context.Context) error {
-	requestContext, cancel := context.WithTimeout(ctx, ollamaEmbeddingTimeout)
+	requestContext, cancel := context.WithTimeout(ctx, generator.timeout)
 	defer cancel()
 	contents, err := json.Marshal(struct {
 		Model     string `json:"model"`
@@ -130,7 +134,7 @@ func (generator *OllamaCatalogEmbeddingGenerator) generateCatalogEmbeddings(ctx 
 			return nil, fmt.Errorf("generate Ollama embedding: text is required")
 		}
 	}
-	requestContext, cancel := context.WithTimeout(ctx, ollamaEmbeddingTimeout)
+	requestContext, cancel := context.WithTimeout(ctx, generator.timeout)
 	defer cancel()
 	contents, err := json.Marshal(struct {
 		Model   string   `json:"model"`
@@ -286,9 +290,7 @@ func generateCatalogEmbeddings(ctx context.Context, generator CatalogEmbeddingGe
 		return embeddings
 	}
 	defer func() {
-		releaseContext, cancel := context.WithTimeout(context.Background(), ollamaEmbeddingTimeout)
-		defer cancel()
-		if err := batchGenerator.ReleaseCatalogEmbeddingModel(releaseContext); err != nil {
+		if err := batchGenerator.ReleaseCatalogEmbeddingModel(context.Background()); err != nil {
 			result.EmbeddingUnavailableReason = "Catalog embedding model release is unavailable"
 		}
 	}()

@@ -77,7 +77,7 @@ func RunCatalogSynopsisWithUsage(parent context.Context, configuration CatalogCo
 		"--silent",
 		"--output-format", "text",
 		"--max-ai-credits", strconv.Itoa(maxAICredits),
-		"--available-tools=",
+		"--available-tools",
 		"--disable-builtin-mcps",
 		"--no-ask-user",
 		"--no-custom-instructions",

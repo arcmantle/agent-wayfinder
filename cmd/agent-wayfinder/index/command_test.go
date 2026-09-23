@@ -225,10 +225,8 @@ func TestIndexCommandWritesConfiguredOllamaEmbeddings(t *testing.T) {
 		_, _ = writer.Write([]byte(`{"embeddings":[[0.25,0.75]]}`))
 	}))
 	defer server.Close()
-	t.Setenv("OLLAMA_HOST", server.URL)
-
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"embedding":{"enabled":true,"model":"qwen3-embedding:8b"}}`,
+		".agent-wayfinder/config.json": `{"embedding":{"provider":"ollama","ollama":{"model":"qwen3-embedding:8b","endpoint":"` + server.URL + `"}}}`,
 		"go.mod":                       "module example.com/fixture\n",
 		"validator/token.go":           "package validator\n\nfunc ValidateToken(token string) error { return nil }\n",
 	})

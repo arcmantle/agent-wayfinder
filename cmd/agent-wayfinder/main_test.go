@@ -1,16 +1,15 @@
 package main
 
 import (
-	"os/exec"
 	"strings"
 	"testing"
 )
 
 func TestCommandRuns(t *testing.T) {
-	command := exec.Command("go", "run", ".")
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run command: %v\n%s", err, output)
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+	if exitCode := run(nil, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run command: exit code %d, error %s", exitCode, standardError.String())
 	}
 }
 

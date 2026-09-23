@@ -409,7 +409,7 @@ func TestOllamaCatalogEmbeddingGeneratorUsesConfiguredLocalModel(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	generator, err := index.NewOllamaCatalogEmbeddingGenerator("qwen3-embedding:4b", server.URL, server.Client())
+	generator, err := index.NewOllamaCatalogEmbeddingGenerator("qwen3-embedding:4b", server.URL, time.Second, server.Client())
 	if err != nil {
 		t.Fatalf("create Ollama embedding generator: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestOllamaCatalogEmbeddingGeneratorBatchesInputsAndReleasesModel(t *testing
 	}))
 	t.Cleanup(server.Close)
 
-	generator, err := index.NewOllamaCatalogEmbeddingGenerator("qwen3-embedding:4b", server.URL, server.Client())
+	generator, err := index.NewOllamaCatalogEmbeddingGenerator("qwen3-embedding:4b", server.URL, time.Second, server.Client())
 	if err != nil {
 		t.Fatalf("create Ollama embedding generator: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestOllamaCatalogEmbeddingGeneratorRejectsOversizedResponse(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	generator, err := index.NewOllamaCatalogEmbeddingGenerator("qwen3-embedding:4b", server.URL, server.Client())
+	generator, err := index.NewOllamaCatalogEmbeddingGenerator("qwen3-embedding:4b", server.URL, time.Second, server.Client())
 	if err != nil {
 		t.Fatalf("create Ollama embedding generator: %v", err)
 	}

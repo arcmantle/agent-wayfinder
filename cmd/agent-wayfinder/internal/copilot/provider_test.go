@@ -88,7 +88,7 @@ func TestRunPlannerUsesOnlyConfiguredArguments(t *testing.T) {
 		t.Errorf("usage output file = %q, stat error %v, want removal", usageOutputFile, err)
 	}
 	filteredArguments := removeArgument(gotArguments, "--usage-output-file")
-	wantArguments := []string{"--silent", "--output-format", "json", "--available-tools=", "--disable-builtin-mcps", "--no-ask-user", "--no-custom-instructions", "--model", "gpt-5", "--max-ai-credits", "30", "--prompt", Prompt("which functions call runQuery?")}
+	wantArguments := []string{"--silent", "--output-format", "json", "--available-tools", "--disable-builtin-mcps", "--no-ask-user", "--no-custom-instructions", "--model", "gpt-5", "--max-ai-credits", "30", "--prompt", Prompt("which functions call runQuery?")}
 	if !reflect.DeepEqual(filteredArguments, wantArguments) {
 		t.Errorf("planner arguments = %q, want %q", filteredArguments, wantArguments)
 	}
@@ -109,6 +109,9 @@ func TestRunPlannerOmitsAutomaticModelOverride(t *testing.T) {
 		if argument == "--model" {
 			t.Errorf("planner arguments = %q, must omit automatic model override", gotArguments)
 		}
+	}
+	if reasoningEffort := argumentValue(gotArguments, "--reasoning-effort"); reasoningEffort != "" {
+		t.Errorf("planner reasoning effort = %q, want Copilot default", reasoningEffort)
 	}
 }
 
@@ -256,7 +259,7 @@ func TestRunCatalogSynopsisUsesConfiguredPathForOneUnitWithoutTools(t *testing.T
 	if synopsis != "" || gotName != "configured-copilot" {
 		t.Errorf("catalog synopsis = %q, command = %q; want empty configured command output", synopsis, gotName)
 	}
-	if !containsArguments(gotArguments, "--model") || !containsArguments(gotArguments, "gpt-5.6-luna") || !containsArguments(gotArguments, "--max-ai-credits") || !containsArguments(gotArguments, "42") || !containsArguments(gotArguments, "--available-tools=") || !containsArguments(gotArguments, "--disable-builtin-mcps") || !containsArguments(gotArguments, "--prompt") || !containsArguments(gotArguments, "Do not make claims that the input does not support.") || !containsArguments(gotArguments, "ValidateToken") || !containsArguments(gotArguments, "func ValidateToken(token string) error") || !containsArguments(gotArguments, "return verify(token)") {
+	if !containsArguments(gotArguments, "--model") || !containsArguments(gotArguments, "gpt-5.6-luna") || !containsArguments(gotArguments, "--max-ai-credits") || !containsArguments(gotArguments, "42") || !containsArguments(gotArguments, "--available-tools") || !containsArguments(gotArguments, "--disable-builtin-mcps") || !containsArguments(gotArguments, "--prompt") || !containsArguments(gotArguments, "Do not make claims that the input does not support.") || !containsArguments(gotArguments, "ValidateToken") || !containsArguments(gotArguments, "func ValidateToken(token string) error") || !containsArguments(gotArguments, "return verify(token)") {
 		t.Errorf("catalog arguments = %q, want an evidence-only prompt with tools disabled and a complete catalog unit", gotArguments)
 	}
 }

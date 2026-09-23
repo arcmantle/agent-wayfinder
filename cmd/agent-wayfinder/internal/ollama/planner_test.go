@@ -15,14 +15,19 @@ import (
 )
 
 func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
+	user := testkit.NewWorkspace(t, map[string]string{})
+	t.Setenv("HOME", user.Root)
+	t.Setenv("USERPROFILE", user.Root)
+	t.Setenv("OLLAMA_HOST", "")
+
 	configured := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"planning":{"provider":"ollama","ollama":{"model":"qwen3:8b","timeout":"12s"}}}`,
+		".agent-wayfinder/config.json": `{"planning":{"provider":"ollama","ollama":{"model":"qwen3:8b","endpoint":"http://localhost:11435","timeout":"12s"}}}`,
 	})
 	configuration, err := ReadConfiguration(configured.Root)
 	if err != nil {
 		t.Fatalf("read configured Ollama planner configuration: %v", err)
 	}
-	if !configuration.Enabled || configuration.Model != "qwen3:8b" || configuration.Timeout != 12*time.Second {
+	if !configuration.Enabled || configuration.Model != "qwen3:8b" || configuration.Endpoint != "http://localhost:11435" || configuration.Timeout != 12*time.Second {
 		t.Errorf("Ollama planner configuration = %+v, want workspace values", configuration)
 	}
 
@@ -33,7 +38,7 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read default Ollama planner configuration: %v", err)
 	}
-	if configuration.Enabled || configuration.Model != "qwen3:8b" || configuration.Timeout != 30*time.Second {
+	if configuration.Enabled || configuration.Model != "qwen3:8b" || configuration.Endpoint != defaultEndpoint || configuration.Timeout != 30*time.Second {
 		t.Errorf("default Ollama planner configuration = %+v, want disabled qwen3:8b defaults", configuration)
 	}
 
@@ -44,7 +49,7 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read legacy Ollama planner configuration: %v", err)
 	}
-	if configuration.Enabled || configuration.Model != "qwen3:8b" {
+	if configuration.Enabled || configuration.Model != "qwen3:8b" || configuration.Endpoint != defaultEndpoint || configuration.Timeout != 30*time.Second {
 		t.Errorf("legacy Ollama configuration = %+v, want ignored old configuration file", configuration)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -27,20 +28,22 @@ const (
 )
 
 type Configuration struct {
-	Enabled bool
-	Model   string
-	Timeout time.Duration
+	Enabled  bool
+	Model    string
+	Endpoint string
+	Timeout  time.Duration
 }
 
 type configurationFile struct {
-	Model   *string         `json:"model"`
-	Timeout json.RawMessage `json:"timeout"`
+	Model    *string         `json:"model"`
+	Endpoint *string         `json:"endpoint"`
+	Timeout  json.RawMessage `json:"timeout"`
 }
 
 var modelPattern = regexp.MustCompile(`^[A-Za-z0-9._:/-]+$`)
 
 func ReadConfiguration(workspaceRoot string) (Configuration, error) {
-	configuration := Configuration{Model: "qwen3:8b", Timeout: 30 * time.Second}
+	configuration := Configuration{Model: "qwen3:8b", Endpoint: DefaultEndpoint(), Timeout: 30 * time.Second}
 	paths := configpath.Paths(workspaceRoot)
 	for _, path := range paths {
 		fileConfiguration, err := readConfigurationFile(path)
@@ -49,6 +52,9 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 		}
 		if fileConfiguration.Model != nil {
 			configuration.Model = *fileConfiguration.Model
+		}
+		if fileConfiguration.Endpoint != nil {
+			configuration.Endpoint = *fileConfiguration.Endpoint
 		}
 		if len(fileConfiguration.Timeout) > 0 {
 			configuration.Timeout, err = parseJSONTimeout(fileConfiguration.Timeout)
@@ -128,13 +134,21 @@ func parseTimeout(value string) (time.Duration, error) {
 }
 
 func validateConfiguration(configuration Configuration) error {
-	if strings.TrimSpace(configuration.Model) == "" || !modelPattern.MatchString(configuration.Model) {
+	if !ValidModel(configuration.Model) {
 		return fmt.Errorf("invalid Ollama planner model %q", configuration.Model)
+	}
+	endpoint, err := url.ParseRequestURI(configuration.Endpoint)
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return fmt.Errorf("invalid Ollama planner endpoint: use an absolute URL")
 	}
 	if configuration.Timeout <= 0 || configuration.Timeout > 30*time.Second {
 		return fmt.Errorf("invalid Ollama planner timeout: use a duration from 1ns through 30s")
 	}
 	return nil
+}
+
+func ValidModel(model string) bool {
+	return strings.TrimSpace(model) != "" && modelPattern.MatchString(model)
 }
 
 type plannerRequest struct {
@@ -239,6 +253,14 @@ func Endpoint() string {
 	endpoint := strings.TrimSpace(os.Getenv("OLLAMA_HOST"))
 	if endpoint != "" && !strings.Contains(endpoint, "://") {
 		return "http://" + endpoint
+	}
+	return endpoint
+}
+
+func DefaultEndpoint() string {
+	endpoint := Endpoint()
+	if endpoint == "" {
+		return defaultEndpoint
 	}
 	return endpoint
 }

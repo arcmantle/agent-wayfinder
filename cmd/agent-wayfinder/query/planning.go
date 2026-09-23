@@ -79,7 +79,7 @@ func planQuery(command *cobra.Command, workspaceRoot string, store storage.Spend
 
 	result.Metadata.Method = "fallback"
 	if ollamaConfiguration.Enabled {
-		response, err := ollama.Run(context.Background(), ollamaConfiguration, plan.Question, ollama.Endpoint(), http.DefaultClient)
+		response, err := ollama.Run(context.Background(), ollamaConfiguration, plan.Question, ollamaConfiguration.Endpoint, http.DefaultClient)
 		if err != nil {
 			result.OllamaMetadata.UnavailableReason = ollamaFallbackReason(err)
 		} else if planned, err := query.ParseLocalPlannerResponse(response); err != nil {

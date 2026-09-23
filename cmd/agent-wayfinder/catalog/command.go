@@ -309,7 +309,7 @@ func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot strin
 		}
 		options.SynopsisProcessLimit = configuration.Copilot.ProcessLimit
 	case index.CatalogSynopsisProviderOllama:
-		options.SynopsisGenerator = ollama.NewCatalogSynopsisGenerator(ollama.CatalogSynopsisConfiguration{Model: configuration.Ollama.Model, Timeout: 30 * time.Second}, configuration.Ollama.Endpoint, nil)
+		options.SynopsisGenerator = ollama.NewCatalogSynopsisGenerator(ollama.CatalogSynopsisConfiguration{Model: configuration.Ollama.Model, Timeout: configuration.Ollama.Timeout}, configuration.Ollama.Endpoint, nil)
 	case index.CatalogSynopsisProviderClaude:
 		spendingConfiguration, err := spending.ReadConfiguration(workspaceRoot)
 		if err != nil {

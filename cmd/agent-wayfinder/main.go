@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"agent-wayfinder/cmd/agent-wayfinder/internal/root"
+
 	"github.com/spf13/cobra"
 )
 

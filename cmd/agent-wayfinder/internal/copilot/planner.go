@@ -126,7 +126,7 @@ func runPlannerAttempt(parent context.Context, configuration Configuration, ques
 	arguments := []string{
 		"--silent",
 		"--output-format", "json",
-		"--available-tools=",
+		"--available-tools",
 		"--disable-builtin-mcps",
 		"--no-ask-user",
 		"--no-custom-instructions",

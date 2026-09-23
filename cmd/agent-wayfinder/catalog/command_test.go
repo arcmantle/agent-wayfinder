@@ -211,7 +211,7 @@ func TestCatalogWriteOptionsUseConfiguredOllamaSynopsisModelAndEndpoint(t *testi
 			Provider:    index.CatalogSynopsisProviderOllama,
 			SourceLimit: 512,
 		},
-		Ollama: catalogOllamaConfiguration{Model: "catalog-generation:8b", Endpoint: server.URL},
+		Ollama: catalogOllamaConfiguration{Model: "catalog-generation:8b", Endpoint: server.URL, Timeout: time.Second},
 	}, t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("create Ollama catalog synopsis options: %v", err)
@@ -226,7 +226,7 @@ func TestCatalogWriteOptionsUseConfiguredOllamaSynopsisModelAndEndpoint(t *testi
 
 func TestCatalogStatusReportsFailedRefreshAfterCancellation(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"embedding":{"enabled":true}}`,
+		".agent-wayfinder/config.json": `{"embedding":{"provider":"ollama"}}`,
 		"package.json":                 `{"name":"fixture"}`,
 		"src/token.ts":                 "export function validateAccessToken(token: string) { return token.length > 0; }",
 	})

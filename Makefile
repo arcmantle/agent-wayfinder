@@ -2,7 +2,7 @@
 
 AGENT_WAYFINDER_PACKAGES := $(shell go list -e ./... | grep -v '^agent-wayfinder/reference')
 AGENT_WAYFINDER_BINARY := agent-wayfinder
-AGENT_WAYFINDER_SOURCES := $(shell find cmd configuration extractor extractors graph index indexer query storage workspace -name '*.go') go.mod
+AGENT_WAYFINDER_SOURCES := $(shell find benchmark cli cmd configuration extractor extractors graph index indexer query storage workspace -name '*.go') Makefile go.mod go.sum go.work
 
 build: $(AGENT_WAYFINDER_BINARY)
 

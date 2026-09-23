@@ -105,13 +105,6 @@ default `qwen3-embedding:4b` model:
 agent-wayfinder index --catalog-embeddings /path/to/workspace
 ```
 
-Set `OLLAMA_HOST` to use another Ollama host. The value can include a scheme,
-or only a host and port:
-
-```bash
-export OLLAMA_HOST=http://localhost:11434
-```
-
 To enable embeddings for a workspace or use a larger model, set the
 `embedding` object in the indexed workspace's `.agent-wayfinder/config.json`
 file:
@@ -123,16 +116,25 @@ ollama pull qwen3-embedding:8b
 ```json
 {
   "embedding": {
-    "enabled": true,
-    "model": "qwen3-embedding:8b",
+    "provider": "ollama",
+    "ollama": {
+      "model": "qwen3-embedding:8b",
+      "endpoint": "http://127.0.0.1:11434",
+      "timeout": "10s"
+    },
     "processLimit": 2
   }
 }
 ```
 
+`embedding.ollama.model` selects the model, `embedding.ollama.endpoint` sets
+the Ollama HTTP endpoint, and `embedding.ollama.timeout` bounds each embedding
+request. These fields use the same shape as `planning.ollama` and
+`synopsis.ollama`.
+
 If Ollama or the selected model is unavailable, indexing continues and local
 lexical catalog retrieval remains available. Explicit embedding calls use one
-host thread, a 10-second timeout, and a 4 MiB response limit. Catalog work
+host thread and a 4 MiB response limit. Catalog work
 sends up to 32 inputs per request and runs at most two requests concurrently.
 Set `embedding.processLimit` to `1` on a constrained host. Catalog work keeps
 the model loaded for one catalog pass and sends `keep_alive: 0` when that pass
@@ -153,7 +155,8 @@ source. The provider is disabled by default.
     "sourceLimit": 8192,
     "ollama": {
       "model": "qwen3:8b",
-      "endpoint": "http://127.0.0.1:11434"
+      "endpoint": "http://127.0.0.1:11434",
+      "timeout": "30s"
     }
   }
 }
@@ -164,9 +167,10 @@ Put this configuration in the indexed workspace's
 source size in bytes for each synopsis request. It must be a positive integer.
 Use `copilot`, `ollama`, or `claude` for `synopsis.provider`.
 
-`synopsis.ollama.model` selects the generation model and
-`synopsis.ollama.endpoint` sets the Ollama HTTP endpoint. This model is
-separate from `embedding.model`.
+`synopsis.ollama.model` selects the generation model,
+`synopsis.ollama.endpoint` sets the Ollama HTTP endpoint, and
+`synopsis.ollama.timeout` bounds each synopsis request. These fields match
+`planning.ollama`. This model is separate from `embedding.ollama.model`.
 
 #### Copilot
 
@@ -472,7 +476,10 @@ be greater than zero and no more than 30 seconds. Unknown settings inside
 return an error. The catalog command accepts the `planning` object and ignores
 it because it is only used by query planning.
 
-The Ollama planner is disabled by default. When enabled, it uses a fixed
+The Ollama planner is disabled by default. `planning.ollama.model` selects the
+generation model, `planning.ollama.endpoint` sets the Ollama HTTP endpoint, and
+`planning.ollama.timeout` bounds each planning request. The default endpoint is
+`OLLAMA_HOST` when set, otherwise `http://127.0.0.1:11434`. When enabled, it uses a fixed
 512-token context, 128-token output limit, one host thread, no reasoning, and
 an 8 KiB response limit. It uses `keep_alive: 0` so Ollama unloads the model
 when the request completes.

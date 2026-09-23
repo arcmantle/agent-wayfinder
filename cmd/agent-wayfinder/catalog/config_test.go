@@ -18,13 +18,13 @@ import (
 
 func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *testing.T) {
 	configured := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"$schema":"https://example.test/config.schema.json","synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435"},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"enabled":true,"model":"qwen3-embedding:8b","processLimit":1}}`,
+		".agent-wayfinder/config.json": `{"$schema":"https://example.test/config.schema.json","synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435","timeout":"12s"},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"provider":"ollama","ollama":{"model":"qwen3-embedding:8b","endpoint":"http://localhost:11435","timeout":"12s"},"processLimit":1}}`,
 	})
 	configuration, err := readCatalogConfiguration(configured.Root)
 	if err != nil {
 		t.Fatalf("read configured catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 512 || configuration.Copilot.Model != "gpt-5.6-luna" || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "/opt/bin/copilot" || configuration.Ollama.Model != "catalog-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Claude.Path != "/opt/bin/claude" || configuration.Claude.Model != "sonnet" || configuration.Claude.FallbackModel != "haiku" || configuration.Claude.MaxBudgetUSD != 0.25 || configuration.Claude.Effort != "high" || configuration.Claude.Timeout != 12*time.Second || !configuration.Embedding.Enabled || configuration.Embedding.Model != "qwen3-embedding:8b" || configuration.Embedding.ProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 512 || configuration.Copilot.Model != "gpt-5.6-luna" || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "/opt/bin/copilot" || configuration.Ollama.Model != "catalog-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Ollama.Timeout != 12*time.Second || configuration.Claude.Path != "/opt/bin/claude" || configuration.Claude.Model != "sonnet" || configuration.Claude.FallbackModel != "haiku" || configuration.Claude.MaxBudgetUSD != 0.25 || configuration.Claude.Effort != "high" || configuration.Claude.Timeout != 12*time.Second || configuration.Embedding.Provider != "ollama" || configuration.Embedding.Ollama.Model != "qwen3-embedding:8b" || configuration.Embedding.Ollama.Endpoint != "http://localhost:11435" || configuration.Embedding.Ollama.Timeout != 12*time.Second || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("configured catalog configuration = %+v, want workspace values", configuration)
 	}
 
@@ -35,25 +35,25 @@ func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *te
 	if err != nil {
 		t.Fatalf("read default catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != "" || configuration.Synopsis.SourceLimit != extractor.DefaultCatalogDeclarationSourceLimit || configuration.Copilot.Model != "" || configuration.Copilot.MaxAICredits != 30 || configuration.Copilot.ProcessLimit != 1 || configuration.Copilot.Path != "" || configuration.Ollama.Model != "qwen3:8b" || configuration.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Embedding.Enabled || configuration.Embedding.Model != "qwen3-embedding:4b" || configuration.Embedding.ProcessLimit != index.MaximumEmbeddingProcessLimit {
+	if configuration.Synopsis.Provider != "" || configuration.Synopsis.SourceLimit != extractor.DefaultCatalogDeclarationSourceLimit || configuration.Copilot.Model != "" || configuration.Copilot.MaxAICredits != 30 || configuration.Copilot.ProcessLimit != 1 || configuration.Copilot.Path != "" || configuration.Ollama.Model != "qwen3:8b" || configuration.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Ollama.Timeout != 30*time.Second || configuration.Embedding.Provider != "" || configuration.Embedding.Ollama.Model != "qwen3-embedding:4b" || configuration.Embedding.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Embedding.Ollama.Timeout != index.DefaultOllamaCatalogEmbeddingTimeout || configuration.Embedding.ProcessLimit != index.MaximumEmbeddingProcessLimit {
 		t.Errorf("default catalog configuration = %+v, want disabled Copilot and default embedding model", configuration)
 	}
 }
 
 func TestReadCatalogConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
 	user := testkit.NewWorkspace(t, map[string]string{})
-	user.WriteFile(t, ".agent-wayfinder/config.json", `{"synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"maxAiCredits":42,"processLimit":3,"path":"user-copilot"},"ollama":{"model":"user-model","endpoint":"http://localhost:11435"}},"embedding":{"enabled":true,"model":"user-embedding","processLimit":1}}`)
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"maxAiCredits":42,"processLimit":3,"path":"user-copilot"},"ollama":{"model":"user-model","endpoint":"http://localhost:11435"}},"embedding":{"provider":"ollama","ollama":{"model":"user-embedding","endpoint":"http://localhost:11436","timeout":"12s"},"processLimit":1}}`)
 	t.Setenv("HOME", user.Root)
 	t.Setenv("USERPROFILE", user.Root)
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"synopsis":{"sourceLimit":1024,"copilot":{"path":"workspace-copilot"},"ollama":{"model":"workspace-model"}},"embedding":{"model":"workspace-embedding"}}`,
+		".agent-wayfinder/config.json": `{"synopsis":{"sourceLimit":1024,"copilot":{"path":"workspace-copilot"},"ollama":{"model":"workspace-model"}},"embedding":{"ollama":{"model":"workspace-embedding"}}}`,
 	})
 
 	configuration, err := readCatalogConfiguration(workspace.Root)
 	if err != nil {
 		t.Fatalf("read layered catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "workspace-copilot" || configuration.Ollama.Model != "workspace-model" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.Embedding.Enabled || configuration.Embedding.Model != "workspace-embedding" || configuration.Embedding.ProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "workspace-copilot" || configuration.Ollama.Model != "workspace-model" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Embedding.Provider != "ollama" || configuration.Embedding.Ollama.Model != "workspace-embedding" || configuration.Embedding.Ollama.Endpoint != "http://localhost:11436" || configuration.Embedding.Ollama.Timeout != 12*time.Second || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("catalog configuration = %+v, want workspace values to override user values", configuration)
 	}
 }
@@ -76,6 +76,8 @@ func TestCatalogFlagsOverrideWorkspaceConfiguration(t *testing.T) {
 		"catalog-ollama-endpoint":         "http://localhost:11435",
 		"catalog-embeddings":              "true",
 		"catalog-embedding-model":         "qwen3-embedding:8b",
+		"catalog-embedding-endpoint":      "http://localhost:11436",
+		"catalog-embedding-timeout":       "12s",
 		"catalog-embedding-process-limit": "1",
 	} {
 		if err := command.Flags().Set(name, value); err != nil {
@@ -87,7 +89,7 @@ func TestCatalogFlagsOverrideWorkspaceConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderClaude || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.Model != "flag-model" || configuration.Copilot.MaxAICredits != 60 || configuration.Copilot.ProcessLimit != 4 || configuration.Copilot.Path != "flag-copilot" || configuration.Ollama.Model != "flag-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.Embedding.Enabled || configuration.Embedding.Model != "qwen3-embedding:8b" || configuration.Embedding.ProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderClaude || configuration.Synopsis.SourceLimit != 1024 || configuration.Copilot.Model != "flag-model" || configuration.Copilot.MaxAICredits != 60 || configuration.Copilot.ProcessLimit != 4 || configuration.Copilot.Path != "flag-copilot" || configuration.Ollama.Model != "flag-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Embedding.Provider != "ollama" || configuration.Embedding.Ollama.Model != "qwen3-embedding:8b" || configuration.Embedding.Ollama.Endpoint != "http://localhost:11436" || configuration.Embedding.Ollama.Timeout != 12*time.Second || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("catalog configuration = %+v, want flag overrides", configuration)
 	}
 }
@@ -119,9 +121,34 @@ func TestReadCatalogConfigurationRejectsInvalidSynopsisValues(t *testing.T) {
 			want:     "invalid catalog Ollama model",
 		},
 		{
+			name:     "Ollama model pattern",
+			contents: `{"synopsis":{"ollama":{"model":"invalid model"}}}`,
+			want:     "invalid catalog Ollama model",
+		},
+		{
 			name:     "Ollama endpoint",
 			contents: `{"synopsis":{"ollama":{"endpoint":"localhost:11434"}}}`,
 			want:     "invalid catalog Ollama endpoint",
+		},
+		{
+			name:     "embedding provider",
+			contents: `{"embedding":{"provider":"unknown"}}`,
+			want:     "invalid catalog embedding provider",
+		},
+		{
+			name:     "embedding Ollama model",
+			contents: `{"embedding":{"ollama":{"model":"invalid model"}}}`,
+			want:     "invalid catalog embedding Ollama configuration",
+		},
+		{
+			name:     "embedding Ollama endpoint",
+			contents: `{"embedding":{"ollama":{"endpoint":"localhost:11434"}}}`,
+			want:     "invalid catalog embedding Ollama configuration",
+		},
+		{
+			name:     "embedding Ollama timeout",
+			contents: `{"embedding":{"ollama":{"timeout":"31s"}}}`,
+			want:     "invalid catalog embedding Ollama configuration",
 		},
 		{
 			name:     "embedding process limit too low",
@@ -171,7 +198,7 @@ func TestCatalogFlagsRejectInvalidSynopsisValues(t *testing.T) {
 	}
 }
 
-func TestNewCatalogEmbeddingGeneratorUsesConfiguredModelAndOllamaHost(t *testing.T) {
+func TestNewCatalogEmbeddingGeneratorUsesConfiguredOllamaSettings(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/embed" {
 			t.Errorf("Ollama request path = %q, want /api/embed", request.URL.Path)
@@ -186,9 +213,7 @@ func TestNewCatalogEmbeddingGeneratorUsesConfiguredModelAndOllamaHost(t *testing
 		_, _ = response.Write([]byte(`{"embeddings":[[0.1,0.2]]}`))
 	}))
 	t.Cleanup(server.Close)
-	t.Setenv("OLLAMA_HOST", server.URL)
-
-	generator, err := newCatalogEmbeddingGenerator(catalogConfiguration{Embedding: catalogEmbeddingConfiguration{Enabled: true, Model: "qwen3-embedding:8b"}}, server.Client())
+	generator, err := newCatalogEmbeddingGenerator(catalogConfiguration{Embedding: catalogEmbeddingConfiguration{Provider: "ollama", Ollama: catalogOllamaConfiguration{Model: "qwen3-embedding:8b", Endpoint: server.URL, Timeout: time.Second}}}, server.Client())
 	if err != nil {
 		t.Fatalf("create catalog embedding generator: %v", err)
 	}

@@ -7,12 +7,12 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"agent-wayfinder/cmd/agent-wayfinder/internal/claude"
 	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
 	"agent-wayfinder/cmd/agent-wayfinder/internal/copilot"
+	"agent-wayfinder/cmd/agent-wayfinder/internal/ollama"
 	"agent-wayfinder/extractor"
 	"agent-wayfinder/index"
 
@@ -37,6 +37,7 @@ type catalogCopilotConfiguration struct {
 type catalogOllamaConfiguration struct {
 	Model    string
 	Endpoint string
+	Timeout  time.Duration
 }
 
 type catalogSynopsisConfiguration struct {
@@ -45,12 +46,13 @@ type catalogSynopsisConfiguration struct {
 }
 
 type catalogEmbeddingConfiguration struct {
-	Enabled      bool
-	Model        string
+	Provider     string
+	Ollama       catalogOllamaConfiguration
 	ProcessLimit int
 }
 
 type catalogConfigurationFileContents struct {
+	Schema    *string                                    `json:"$schema"`
 	Planning  json.RawMessage                            `json:"planning"`
 	Spending  json.RawMessage                            `json:"spending"`
 	Sources   json.RawMessage                            `json:"sources"`
@@ -66,8 +68,9 @@ type catalogCopilotConfigurationFileContents struct {
 }
 
 type catalogOllamaConfigurationFileContents struct {
-	Model    *string `json:"model"`
-	Endpoint *string `json:"endpoint"`
+	Model    *string         `json:"model"`
+	Endpoint *string         `json:"endpoint"`
+	Timeout  json.RawMessage `json:"timeout"`
 }
 
 type catalogSynopsisConfigurationFileContents struct {
@@ -88,18 +91,21 @@ type catalogClaudeConfigurationFileContents struct {
 }
 
 type catalogEmbeddingConfigurationFileContents struct {
-	Enabled      *bool   `json:"enabled"`
-	Model        *string `json:"model"`
-	ProcessLimit *int    `json:"processLimit"`
+	Provider     *string                                 `json:"provider"`
+	Ollama       *catalogOllamaConfigurationFileContents `json:"ollama"`
+	ProcessLimit *int                                    `json:"processLimit"`
 }
 
 func readCatalogConfiguration(workspaceRoot string) (catalogConfiguration, error) {
 	configuration := catalogConfiguration{
-		Copilot:   catalogCopilotConfiguration{MaxAICredits: copilot.DefaultAICredits, ProcessLimit: 1},
-		Ollama:    catalogOllamaConfiguration{Model: "qwen3:8b", Endpoint: index.DefaultOllamaHost},
-		Claude:    claude.Configuration{Path: claude.DefaultPlannerPath, Model: claude.DefaultPlannerModel, Timeout: 30 * time.Second},
-		Synopsis:  catalogSynopsisConfiguration{SourceLimit: extractor.DefaultCatalogDeclarationSourceLimit},
-		Embedding: catalogEmbeddingConfiguration{Model: index.DefaultOllamaCatalogEmbeddingModel, ProcessLimit: index.MaximumEmbeddingProcessLimit},
+		Copilot:  catalogCopilotConfiguration{MaxAICredits: copilot.DefaultAICredits, ProcessLimit: 1},
+		Ollama:   catalogOllamaConfiguration{Model: "qwen3:8b", Endpoint: ollama.DefaultEndpoint(), Timeout: 30 * time.Second},
+		Claude:   claude.Configuration{Path: claude.DefaultPlannerPath, Model: claude.DefaultPlannerModel, Timeout: 30 * time.Second},
+		Synopsis: catalogSynopsisConfiguration{SourceLimit: extractor.DefaultCatalogDeclarationSourceLimit},
+		Embedding: catalogEmbeddingConfiguration{
+			Ollama:       catalogOllamaConfiguration{Model: index.DefaultOllamaCatalogEmbeddingModel, Endpoint: ollama.DefaultEndpoint(), Timeout: index.DefaultOllamaCatalogEmbeddingTimeout},
+			ProcessLimit: index.MaximumEmbeddingProcessLimit,
+		},
 	}
 	paths := configpath.Paths(workspaceRoot)
 	for _, path := range paths {
@@ -126,8 +132,8 @@ func readCatalogConfiguration(workspaceRoot string) (catalogConfiguration, error
 	if err := claude.ValidateConfiguration(configuration.Claude); err != nil {
 		return catalogConfiguration{}, fmt.Errorf("invalid catalog Claude configuration: %w", err)
 	}
-	if configuration.Embedding.ProcessLimit <= 0 || configuration.Embedding.ProcessLimit > index.MaximumEmbeddingProcessLimit {
-		return catalogConfiguration{}, fmt.Errorf("invalid catalog embedding process limit: use an integer from 1 through %d", index.MaximumEmbeddingProcessLimit)
+	if err := validateCatalogEmbeddingConfiguration(configuration.Embedding); err != nil {
+		return catalogConfiguration{}, err
 	}
 	return configuration, nil
 }
@@ -178,6 +184,13 @@ func applyCatalogConfiguration(configuration *catalogConfiguration, fileConfigur
 			if fileConfiguration.Synopsis.Ollama.Endpoint != nil {
 				configuration.Ollama.Endpoint = *fileConfiguration.Synopsis.Ollama.Endpoint
 			}
+			if len(fileConfiguration.Synopsis.Ollama.Timeout) != 0 {
+				timeout, err := parseCatalogTimeout(fileConfiguration.Synopsis.Ollama.Timeout)
+				if err != nil {
+					return fmt.Errorf("invalid synopsis.ollama.timeout: %w", err)
+				}
+				configuration.Ollama.Timeout = timeout
+			}
 		}
 		if fileConfiguration.Synopsis.Claude != nil {
 			if fileConfiguration.Synopsis.Claude.Path != nil {
@@ -196,7 +209,7 @@ func applyCatalogConfiguration(configuration *catalogConfiguration, fileConfigur
 				configuration.Claude.Effort = *fileConfiguration.Synopsis.Claude.Effort
 			}
 			if len(fileConfiguration.Synopsis.Claude.Timeout) != 0 {
-				timeout, err := parseCatalogClaudeTimeout(fileConfiguration.Synopsis.Claude.Timeout)
+				timeout, err := parseCatalogTimeout(fileConfiguration.Synopsis.Claude.Timeout)
 				if err != nil {
 					return fmt.Errorf("invalid synopsis.claude.timeout: %w", err)
 				}
@@ -205,11 +218,23 @@ func applyCatalogConfiguration(configuration *catalogConfiguration, fileConfigur
 		}
 	}
 	if fileConfiguration.Embedding != nil {
-		if fileConfiguration.Embedding.Enabled != nil {
-			configuration.Embedding.Enabled = *fileConfiguration.Embedding.Enabled
+		if fileConfiguration.Embedding.Provider != nil {
+			configuration.Embedding.Provider = *fileConfiguration.Embedding.Provider
 		}
-		if fileConfiguration.Embedding.Model != nil {
-			configuration.Embedding.Model = *fileConfiguration.Embedding.Model
+		if fileConfiguration.Embedding.Ollama != nil {
+			if fileConfiguration.Embedding.Ollama.Model != nil {
+				configuration.Embedding.Ollama.Model = *fileConfiguration.Embedding.Ollama.Model
+			}
+			if fileConfiguration.Embedding.Ollama.Endpoint != nil {
+				configuration.Embedding.Ollama.Endpoint = *fileConfiguration.Embedding.Ollama.Endpoint
+			}
+			if len(fileConfiguration.Embedding.Ollama.Timeout) != 0 {
+				timeout, err := parseCatalogTimeout(fileConfiguration.Embedding.Ollama.Timeout)
+				if err != nil {
+					return fmt.Errorf("invalid embedding.ollama.timeout: %w", err)
+				}
+				configuration.Embedding.Ollama.Timeout = timeout
+			}
 		}
 		if fileConfiguration.Embedding.ProcessLimit != nil {
 			configuration.Embedding.ProcessLimit = *fileConfiguration.Embedding.ProcessLimit
@@ -218,7 +243,7 @@ func applyCatalogConfiguration(configuration *catalogConfiguration, fileConfigur
 	return nil
 }
 
-func parseCatalogClaudeTimeout(value json.RawMessage) (time.Duration, error) {
+func parseCatalogTimeout(value json.RawMessage) (time.Duration, error) {
 	var duration string
 	if err := json.Unmarshal(value, &duration); err == nil {
 		return time.ParseDuration(duration)
@@ -242,6 +267,8 @@ func ConfigureFlags(command *cobra.Command) {
 	command.Flags().String("catalog-ollama-endpoint", "", "Ollama endpoint for catalog synopses")
 	command.Flags().Bool("catalog-embeddings", false, "enable local Ollama catalog embeddings")
 	command.Flags().String("catalog-embedding-model", "", "Ollama model for catalog embeddings")
+	command.Flags().String("catalog-embedding-endpoint", "", "Ollama endpoint for catalog embeddings")
+	command.Flags().Duration("catalog-embedding-timeout", 0, "Ollama request timeout for catalog embeddings")
 	command.Flags().Int("catalog-embedding-process-limit", 0, "maximum concurrent Ollama catalog embedding requests")
 }
 
@@ -287,10 +314,22 @@ func resolveCatalogConfiguration(command *cobra.Command, workspaceRoot string) (
 		configuration.Ollama.Endpoint, err = flags.GetString("catalog-ollama-endpoint")
 	}
 	if err == nil && flags.Changed("catalog-embeddings") {
-		configuration.Embedding.Enabled, err = flags.GetBool("catalog-embeddings")
+		var enabled bool
+		enabled, err = flags.GetBool("catalog-embeddings")
+		if enabled {
+			configuration.Embedding.Provider = "ollama"
+		} else {
+			configuration.Embedding.Provider = ""
+		}
 	}
 	if err == nil && flags.Changed("catalog-embedding-model") {
-		configuration.Embedding.Model, err = flags.GetString("catalog-embedding-model")
+		configuration.Embedding.Ollama.Model, err = flags.GetString("catalog-embedding-model")
+	}
+	if err == nil && flags.Changed("catalog-embedding-endpoint") {
+		configuration.Embedding.Ollama.Endpoint, err = flags.GetString("catalog-embedding-endpoint")
+	}
+	if err == nil && flags.Changed("catalog-embedding-timeout") {
+		configuration.Embedding.Ollama.Timeout, err = flags.GetDuration("catalog-embedding-timeout")
 	}
 	if err == nil && flags.Changed("catalog-embedding-process-limit") {
 		configuration.Embedding.ProcessLimit, err = flags.GetInt("catalog-embedding-process-limit")
@@ -310,8 +349,8 @@ func resolveCatalogConfiguration(command *cobra.Command, workspaceRoot string) (
 	if err := validateCatalogOllamaConfiguration(configuration.Ollama); err != nil {
 		return catalogConfiguration{}, err
 	}
-	if configuration.Embedding.ProcessLimit <= 0 || configuration.Embedding.ProcessLimit > index.MaximumEmbeddingProcessLimit {
-		return catalogConfiguration{}, fmt.Errorf("invalid catalog embedding process limit %s: use an integer from 1 through %d", strconv.Itoa(configuration.Embedding.ProcessLimit), index.MaximumEmbeddingProcessLimit)
+	if err := validateCatalogEmbeddingConfiguration(configuration.Embedding); err != nil {
+		return catalogConfiguration{}, err
 	}
 	return configuration, nil
 }
@@ -329,12 +368,30 @@ func validateCatalogSynopsisConfiguration(configuration catalogSynopsisConfigura
 }
 
 func validateCatalogOllamaConfiguration(configuration catalogOllamaConfiguration) error {
-	if strings.TrimSpace(configuration.Model) == "" {
-		return fmt.Errorf("invalid catalog Ollama model: use a nonempty model name")
+	if !ollama.ValidModel(configuration.Model) {
+		return fmt.Errorf("invalid catalog Ollama model %q", configuration.Model)
 	}
 	endpoint, err := url.ParseRequestURI(configuration.Endpoint)
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
 		return fmt.Errorf("invalid catalog Ollama endpoint: use an absolute URL")
+	}
+	if configuration.Timeout <= 0 || configuration.Timeout > 30*time.Second {
+		return fmt.Errorf("invalid catalog Ollama timeout: use a duration from 1ns through 30s")
+	}
+	return nil
+}
+
+func validateCatalogEmbeddingConfiguration(configuration catalogEmbeddingConfiguration) error {
+	switch configuration.Provider {
+	case "", "ollama":
+	default:
+		return fmt.Errorf("invalid catalog embedding provider %q: use ollama", configuration.Provider)
+	}
+	if err := validateCatalogOllamaConfiguration(configuration.Ollama); err != nil {
+		return fmt.Errorf("invalid catalog embedding Ollama configuration: %w", err)
+	}
+	if configuration.ProcessLimit <= 0 || configuration.ProcessLimit > index.MaximumEmbeddingProcessLimit {
+		return fmt.Errorf("invalid catalog embedding process limit: use an integer from 1 through %d", index.MaximumEmbeddingProcessLimit)
 	}
 	return nil
 }
