@@ -11,17 +11,14 @@ import (
 	"time"
 
 	"agent-wayfinder/extractor"
-	goextractor "agent-wayfinder/extractors/go"
-	"agent-wayfinder/extractors/javascript"
 	"agent-wayfinder/extractors/registry"
-	"agent-wayfinder/extractors/typescript"
 	"agent-wayfinder/graph"
 	"agent-wayfinder/storage"
 	"agent-wayfinder/workspace"
 )
 
-type contributionExtractor func(string, workspace.Source, registry.Registry, *typescript.Worker) (extractedSource, error)
-type contributionWorkerFactory func() (*typescript.Worker, error)
+type contributionExtractor func(string, workspace.Source, registry.Registry, *extractionWorkers) (extractedSource, error)
+type contributionWorkerFactory func() (*extractionWorkers, error)
 
 type contributionExtractionResult struct {
 	index                int
@@ -120,7 +117,7 @@ func (pipeline *InitialIndexPipeline) extractAndWriteContributions(ctx context.C
 		extractSource = extractDiscoveredSource
 	}
 	if newWorker == nil {
-		newWorker = typescript.NewWorker
+		newWorker = newExtractionWorkers
 	}
 	started := time.Now()
 	run := pipeline.startExtraction(ctx, session, extractSource, newWorker)
@@ -167,19 +164,19 @@ func (pipeline *InitialIndexPipeline) startExtraction(ctx context.Context, sessi
 
 func (pipeline *InitialIndexPipeline) runExtractionWorker(run *contributionExtractionRun, extractSource contributionExtractor, newWorker contributionWorkerFactory) {
 	defer run.workers.Done()
-	typescriptWorker, err := newWorker()
+	workers, err := newWorker()
 	if err != nil {
 		run.cancel()
 		run.results <- contributionExtractionResult{
-			err:                  fmt.Errorf("create TypeScript extraction worker: %w", err),
+			err:                  fmt.Errorf("create extraction workers: %w", err),
 			workerInitialization: true,
 		}
 		return
 	}
-	defer typescriptWorker.Close()
+	defer workers.Close()
 	for job := range run.jobs {
 		extractionStarted := time.Now()
-		extracted, err := extractSource(pipeline.root, job.source, pipeline.registered, typescriptWorker)
+		extracted, err := extractSource(pipeline.root, job.source, pipeline.registered, workers)
 		run.metricsMu.Lock()
 		run.extractorBusy += time.Since(extractionStarted)
 		run.metricsMu.Unlock()
@@ -470,23 +467,11 @@ func (pipeline *InitialIndexPipeline) resolveProjectionPages(ctx context.Context
 }
 
 func resolveInitialProjectionPage(ctx context.Context, root, projectID, language string, contributions []extractor.Contribution, index extractor.ResolverIndex) (graph.Facts, []extractor.Diagnostic, error) {
-	switch language {
-	case "typescript":
-		resolution, err := typescript.ResolvePage(ctx, contributions, projectID, index)
-		return resolution.Facts(), resolution.Diagnostics(), err
-	case "javascript":
-		resolution, err := javascript.ResolvePage(ctx, contributions, projectID, index)
-		return resolution.Facts(), resolution.Diagnostics(), err
-	case "go":
-		view, err := goResolverFileView(root, projectID)
-		if err != nil {
-			return graph.Facts{}, nil, err
-		}
-		resolution, err := goextractor.ResolvePage(ctx, contributions, projectID, index, view)
-		return resolution.Facts(), resolution.Diagnostics(), err
-	default:
+	definition, found := indexLanguages[language]
+	if !found || definition.resolveProjectionPage == nil {
 		return graph.Facts{}, nil, fmt.Errorf("unsupported resolver %q", language)
 	}
+	return definition.resolveProjectionPage(ctx, root, projectID, contributions, index)
 }
 
 func (pipeline *InitialIndexPipeline) commit(ctx context.Context, session storage.ContributionSession, summary contributionExtractionSummary, workspaceFacts storage.FactCounts, diagnostics []extractor.Diagnostic) (Result, error) {

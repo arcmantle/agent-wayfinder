@@ -9,6 +9,8 @@ import (
 
 	"agent-wayfinder/extractor"
 	"agent-wayfinder/graph"
+
+	"golang.org/x/mod/modfile"
 )
 
 const (
@@ -35,33 +37,34 @@ func (resolution Resolution) Diagnostics() []extractor.Diagnostic {
 }
 
 func ResolverVocabulary() (graph.Vocabulary, error) {
+	resolverNodeKinds := []graph.NodeKind{TypeNodeKind, StructNodeKind, InterfaceNodeKind, TypeAliasNodeKind, ConstantNodeKind, FunctionNodeKind, MethodNodeKind, VariableNodeKind}
+	importEndpoints := []graph.EndpointRule{{Source: "file", Target: "file"}}
+	for _, kind := range resolverNodeKinds {
+		importEndpoints = append(importEndpoints, graph.EndpointRule{Source: "file", Target: kind})
+	}
 	return graph.NewVocabulary(graph.VocabularyDefinition{
-		NodeKinds: []graph.NodeKind{"file", TypeNodeKind, FunctionNodeKind, MethodNodeKind, VariableNodeKind},
+		NodeKinds: append([]graph.NodeKind{"file"}, resolverNodeKinds...),
 		Relations: []graph.RelationDefinition{
 			{
-				Kind: ImportsFromRelation,
-				Endpoints: []graph.EndpointRule{
-					{Source: "file", Target: "file"},
-					{Source: "file", Target: TypeNodeKind},
-					{Source: "file", Target: FunctionNodeKind},
-					{Source: "file", Target: MethodNodeKind},
-					{Source: "file", Target: VariableNodeKind},
-				},
+				Kind:      ImportsFromRelation,
+				Endpoints: importEndpoints,
 			},
-			{Kind: ImplementsRelation, Endpoints: []graph.EndpointRule{{Source: TypeNodeKind, Target: TypeNodeKind}}},
-			{Kind: EmbedsRelation, Endpoints: []graph.EndpointRule{{Source: TypeNodeKind, Target: TypeNodeKind}}},
+			{Kind: ImplementsRelation, Endpoints: []graph.EndpointRule{{Source: TypeNodeKind, Target: InterfaceNodeKind}, {Source: StructNodeKind, Target: InterfaceNodeKind}}},
+			{Kind: EmbedsRelation, Endpoints: []graph.EndpointRule{{Source: InterfaceNodeKind, Target: InterfaceNodeKind}}},
 			{Kind: CallsRelation, Endpoints: []graph.EndpointRule{
 				{Source: FunctionNodeKind, Target: FunctionNodeKind},
 				{Source: FunctionNodeKind, Target: MethodNodeKind},
+				{Source: FunctionNodeKind, Target: VariableNodeKind},
 				{Source: MethodNodeKind, Target: FunctionNodeKind},
 				{Source: MethodNodeKind, Target: MethodNodeKind},
+				{Source: MethodNodeKind, Target: VariableNodeKind},
 			}},
 		},
 	})
 }
 
 func ResolveWithFileView(contributions []extractor.Contribution, view extractor.ResolverFileView) (Resolution, error) {
-	modulePath, _ := modulePath(view)
+	modules := newGoModuleResolver(view)
 
 	files := make(map[string]graph.Node, len(contributions))
 	nodes := make(map[string]graph.Node)
@@ -98,9 +101,9 @@ func ResolveWithFileView(contributions []extractor.Contribution, view extractor.
 	for _, sourcePath := range paths {
 		contribution := contributionForPath(contributions, sourcePath)
 		for _, reference := range contribution.UnresolvedReferences() {
-			targetPaths := packageFiles(reference.Target, modulePath, files, packages)
+			targetPaths := packageFiles(reference.Target, modules, files, packages)
 			if len(targetPaths) == 0 {
-				if strings.HasPrefix(reference.Target, modulePath+"/") || reference.Target == modulePath {
+				if _, local := modules.packagePath(reference.Target); local {
 					resolution.diagnostics = append(resolution.diagnostics, extractor.Diagnostic{Severity: extractor.DiagnosticWarning, Message: fmt.Sprintf("Go package %q from %q is not indexed", reference.Target, sourcePath)})
 				}
 				continue
@@ -113,7 +116,7 @@ func ResolveWithFileView(contributions []extractor.Contribution, view extractor.
 			}
 		}
 	}
-	appendPackageCallFacts(contributions, modulePath, files, packages, surfaces, &resolution)
+	appendPackageCallFacts(contributions, modules, files, packages, surfaces, &resolution)
 	appendLocalMethodCallFacts(contributions, &resolution)
 	appendImplementationFacts(contributions, &resolution)
 
@@ -138,7 +141,7 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 		return Resolution{}, fmt.Errorf("resolve Go page: project and resolver index are required")
 	}
 	index = extractor.NewPageResolverIndex(index)
-	modulePath, _ := modulePath(view)
+	modules := newGoModuleResolver(view)
 	files := make(map[string]graph.Node, len(contributions))
 	byPath := make(map[string]extractor.Contribution, len(contributions))
 	nodes := make(map[string]graph.Node)
@@ -162,10 +165,11 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 	sort.Strings(paths)
 	resolution := Resolution{}
 	appendLocalCallFacts(contributions, &resolution)
+	appendLocalMethodCallFacts(contributions, &resolution)
 	for _, sourcePath := range paths {
 		contribution := byPath[sourcePath]
 		for _, reference := range contribution.UnresolvedReferences() {
-			packagePath, found := modulePackagePath(reference.Target, modulePath)
+			packagePath, found := modules.packagePath(reference.Target)
 			if !found {
 				continue
 			}
@@ -204,13 +208,16 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 			}
 			matches := make([]string, 0)
 			matchingImport := false
+			resolvedPackage := false
 			for _, imported := range contribution.UnresolvedReferences() {
-				if path.Base(imported.Target) != packageName {
-					continue
+				if importHasLocalBinding(imported, packageName) {
+					matchingImport = true
 				}
-				matchingImport = true
-				packagePath, found := modulePackagePath(imported.Target, modulePath)
+				packagePath, found := modules.packagePath(imported.Target)
 				if !found {
+					if path.Base(imported.Target) == packageName {
+						matchingImport = true
+					}
 					continue
 				}
 				err := visitPackageTargets(ctx, index, projectID, packagePath, func(target extractor.ResolverTarget) error {
@@ -219,6 +226,11 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 							nodes[node.ID] = node
 						}
 					}
+					if !importMatchesPackage(imported, packageName, packageNameForNodes(target.Nodes)) {
+						return nil
+					}
+					matchingImport = true
+					resolvedPackage = true
 					for _, surface := range target.ExportedSurfaces {
 						if surface.Name == symbolName && callableTargetSurface(surface.NodeID, target.Nodes) {
 							matches = append(matches, surface.NodeID)
@@ -230,17 +242,24 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 					return Resolution{}, err
 				}
 			}
-			if !matchingImport || len(matches) != 1 {
+			if !matchingImport {
+				resolution.diagnostics = append(resolution.diagnostics, extractor.Diagnostic{Severity: extractor.DiagnosticWarning, Message: fmt.Sprintf("Go call %q from %q is unsupported or ambiguous", reference.Target, sourcePath)})
+				continue
+			}
+			if !resolvedPackage {
+				continue
+			}
+			if len(matches) != 1 {
 				resolution.diagnostics = append(resolution.diagnostics, extractor.Diagnostic{Severity: extractor.DiagnosticWarning, Message: fmt.Sprintf("Go call %q from %q is unsupported or ambiguous", reference.Target, sourcePath)})
 				continue
 			}
 			resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{SourceID: reference.SourceID, TargetID: matches[0], Relation: CallsRelation, Evidence: reference.Evidence})
 		}
 	}
-	if err := appendImportedMethodCallFacts(ctx, index, projectID, modulePath, contributions, &resolution); err != nil {
+	if err := appendImportedMethodCallFacts(ctx, index, projectID, modules, contributions, &resolution); err != nil {
 		return Resolution{}, err
 	}
-	if err := appendPageImplementationFacts(ctx, index, projectID, modulePath, contributions, nodes, &resolution); err != nil {
+	if err := appendPageImplementationFacts(ctx, index, projectID, modules, contributions, nodes, &resolution); err != nil {
 		return Resolution{}, err
 	}
 	resolution.facts.Nodes = make([]graph.Node, 0, len(nodes))
@@ -277,11 +296,15 @@ func appendLocalCallFacts(contributions []extractor.Contribution, resolution *Re
 }
 
 func appendLocalMethodCallFacts(contributions []extractor.Contribution, resolution *Resolution) {
-	methodsByName := make(map[string][]string)
+	methodsByType := make(map[string]map[string][]string)
 	for _, contribution := range contributions {
 		for _, node := range contribution.Facts().Nodes {
 			if node.Kind == MethodNodeKind {
-				methodsByName[node.Label] = append(methodsByName[node.Label], node.ID)
+				receiverType := receiverTypeFromQualifiedName(node.QualifiedName)
+				if methodsByType[receiverType] == nil {
+					methodsByType[receiverType] = make(map[string][]string)
+				}
+				methodsByType[receiverType][node.Label] = append(methodsByType[receiverType][node.Label], node.ID)
 			}
 		}
 	}
@@ -289,6 +312,11 @@ func appendLocalMethodCallFacts(contributions []extractor.Contribution, resoluti
 		importedPackages := make(map[string]struct{})
 		for _, imported := range contribution.UnresolvedReferences() {
 			importedPackages[path.Base(imported.Target)] = struct{}{}
+			for _, binding := range imported.Bindings {
+				if binding.ImportedName == "*" && binding.LocalName != "" {
+					importedPackages[binding.LocalName] = struct{}{}
+				}
+			}
 		}
 		for _, reference := range contribution.SymbolReferences() {
 			if reference.Relation != CallsRelation {
@@ -301,19 +329,25 @@ func appendLocalMethodCallFacts(contributions []extractor.Contribution, resoluti
 			if _, imported := importedPackages[receiver]; imported {
 				continue
 			}
-			for _, targetID := range methodsByName[method] {
-				resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
-					SourceID: reference.SourceID,
-					TargetID: targetID,
-					Relation: CallsRelation,
-					Evidence: reference.Evidence,
+			matches := methodsByType[reference.ReceiverType][method]
+			if reference.ReceiverType == "" || len(matches) != 1 {
+				resolution.diagnostics = append(resolution.diagnostics, extractor.Diagnostic{
+					Severity: extractor.DiagnosticWarning,
+					Message:  fmt.Sprintf("Go call %q from %q is unsupported or ambiguous", reference.Target, contribution.SourcePath()),
 				})
+				continue
 			}
+			resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
+				SourceID: reference.SourceID,
+				TargetID: matches[0],
+				Relation: CallsRelation,
+				Evidence: reference.Evidence,
+			})
 		}
 	}
 }
 
-func appendImportedMethodCallFacts(ctx context.Context, index extractor.ResolverIndex, projectID, modulePath string, contributions []extractor.Contribution, resolution *Resolution) error {
+func appendImportedMethodCallFacts(ctx context.Context, index extractor.ResolverIndex, projectID string, modules goModuleResolver, contributions []extractor.Contribution, resolution *Resolution) error {
 	for _, contribution := range contributions {
 		importedPackages := make(map[string]struct{})
 		for _, imported := range contribution.UnresolvedReferences() {
@@ -327,12 +361,12 @@ func appendImportedMethodCallFacts(ctx context.Context, index extractor.Resolver
 			if !found {
 				continue
 			}
-			if _, imported := importedPackages[receiver]; imported {
+			if _, imported := importedPackages[receiver]; !imported {
 				continue
 			}
 			seen := make(map[string]struct{})
 			for _, imported := range contribution.UnresolvedReferences() {
-				packagePath, inModule := modulePackagePath(imported.Target, modulePath)
+				packagePath, inModule := modules.packagePath(imported.Target)
 				if !inModule {
 					continue
 				}
@@ -389,16 +423,6 @@ func visitPackageTargets(ctx context.Context, index extractor.ResolverIndex, pro
 	}
 }
 
-func modulePackagePath(importPath, modulePath string) (string, bool) {
-	if modulePath == "" || (importPath != modulePath && !strings.HasPrefix(importPath, modulePath+"/")) {
-		return "", false
-	}
-	if importPath == modulePath {
-		return ".", true
-	}
-	return strings.TrimPrefix(importPath, modulePath+"/"), true
-}
-
 func callableTargetSurface(nodeID string, nodes []graph.Node) bool {
 	for _, node := range nodes {
 		if node.ID == nodeID {
@@ -408,7 +432,7 @@ func callableTargetSurface(nodeID string, nodes []graph.Node) bool {
 	return false
 }
 
-func appendPageImplementationFacts(ctx context.Context, index extractor.ResolverIndex, projectID, modulePath string, contributions []extractor.Contribution, nodes map[string]graph.Node, resolution *Resolution) error {
+func appendPageImplementationFacts(ctx context.Context, index extractor.ResolverIndex, projectID string, modules goModuleResolver, contributions []extractor.Contribution, nodes map[string]graph.Node, resolution *Resolution) error {
 	for _, contribution := range contributions {
 		packageName := packageName(contribution.Facts().Nodes)
 		if packageName == "" {
@@ -416,7 +440,13 @@ func appendPageImplementationFacts(ctx context.Context, index extractor.Resolver
 		}
 		packagePath := path.Dir(contribution.SourcePath())
 		for _, current := range contribution.Facts().Nodes {
-			if current.Kind != TypeNodeKind {
+			if current.Kind == InterfaceNodeKind {
+				if err := appendEmbeddedInterfaces(ctx, index, projectID, packagePath, packageName, current, contribution.SymbolReferences(), nodes, resolution); err != nil {
+					return err
+				}
+				continue
+			}
+			if !isImplementationNodeKind(current.Kind) {
 				continue
 			}
 			methods, err := packageMethods(ctx, index, projectID, packagePath, packageName, current.Label, nodes)
@@ -426,10 +456,7 @@ func appendPageImplementationFacts(ctx context.Context, index extractor.Resolver
 			if err := appendImplementedInterfaces(ctx, index, projectID, packagePath, packageName, current, methods, nodes, resolution); err != nil {
 				return err
 			}
-			if err := appendEmbeddedInterfaces(ctx, index, projectID, packagePath, packageName, current, contribution.SymbolReferences(), nodes, resolution); err != nil {
-				return err
-			}
-			if err := appendImportedInterfaceImplementations(ctx, index, projectID, modulePath, contribution, current, methods, nodes, resolution); err != nil {
+			if err := appendImportedInterfaceImplementations(ctx, index, projectID, modules, contribution, current, methods, nodes, resolution); err != nil {
 				return err
 			}
 		}
@@ -437,10 +464,10 @@ func appendPageImplementationFacts(ctx context.Context, index extractor.Resolver
 	return nil
 }
 
-func appendImportedInterfaceImplementations(ctx context.Context, index extractor.ResolverIndex, projectID, modulePath string, contribution extractor.Contribution, current graph.Node, methods map[string]struct{}, nodes map[string]graph.Node, resolution *Resolution) error {
+func appendImportedInterfaceImplementations(ctx context.Context, index extractor.ResolverIndex, projectID string, modules goModuleResolver, contribution extractor.Contribution, current graph.Node, methods map[string]struct{}, nodes map[string]graph.Node, resolution *Resolution) error {
 	seen := make(map[string]struct{})
 	for _, imported := range contribution.UnresolvedReferences() {
-		packagePath, found := modulePackagePath(imported.Target, modulePath)
+		packagePath, found := modules.packagePath(imported.Target)
 		if !found {
 			continue
 		}
@@ -505,7 +532,7 @@ func appendImplementedInterfaces(ctx context.Context, index extractor.ResolverIn
 			if isResolverNodeKind(node.Kind) {
 				nodes[node.ID] = node
 			}
-			if node.Kind != TypeNodeKind || node.ID == current.ID {
+			if node.Kind != InterfaceNodeKind || node.ID == current.ID {
 				continue
 			}
 			requirements := relationReferencesForSource(target.SymbolReferences, node.ID, ImplementsRelation)
@@ -530,7 +557,7 @@ func appendEmbeddedInterfaces(ctx context.Context, index extractor.ResolverIndex
 			if isResolverNodeKind(node.Kind) {
 				nodes[node.ID] = node
 			}
-			if node.Kind != TypeNodeKind || node.ID == current.ID {
+			if node.Kind != InterfaceNodeKind || node.ID == current.ID {
 				continue
 			}
 			for _, reference := range references {
@@ -571,7 +598,7 @@ func targetFile(nodes []graph.Node) (graph.Node, bool) {
 	return graph.Node{}, false
 }
 
-func appendPackageCallFacts(contributions []extractor.Contribution, modulePath string, files map[string]graph.Node, packages map[string]string, surfaces map[string][]extractor.ExportedSurface, resolution *Resolution) {
+func appendPackageCallFacts(contributions []extractor.Contribution, modules goModuleResolver, files map[string]graph.Node, packages map[string]string, surfaces map[string][]extractor.ExportedSurface, resolution *Resolution) {
 	for _, contribution := range contributions {
 		for _, reference := range contribution.SymbolReferences() {
 			if reference.Relation != CallsRelation {
@@ -585,16 +612,22 @@ func appendPackageCallFacts(contributions []extractor.Contribution, modulePath s
 			matchingImport := false
 			resolvedPackage := false
 			for _, imported := range contribution.UnresolvedReferences() {
-				if path.Base(imported.Target) != packageName {
-					continue
+				if importHasLocalBinding(imported, packageName) {
+					matchingImport = true
 				}
-				matchingImport = true
-				targetPaths := packageFiles(imported.Target, modulePath, files, packages)
+				targetPaths := packageFiles(imported.Target, modules, files, packages)
 				if len(targetPaths) == 0 {
+					if _, local := modules.packagePath(imported.Target); !local && path.Base(imported.Target) == packageName {
+						matchingImport = true
+					}
 					continue
 				}
-				resolvedPackage = true
 				for _, targetPath := range targetPaths {
+					if !importMatchesPackage(imported, packageName, packages[targetPath]) {
+						continue
+					}
+					matchingImport = true
+					resolvedPackage = true
 					for _, surface := range surfaces[targetPath] {
 						if surface.Name == symbolName && callableSurface(surface.NodeID, contributions) {
 							matches = append(matches, surface.NodeID)
@@ -629,6 +662,31 @@ func appendPackageCallFacts(contributions []extractor.Contribution, modulePath s
 	}
 }
 
+func importHasLocalBinding(reference extractor.UnresolvedReference, localName string) bool {
+	for _, binding := range reference.Bindings {
+		if binding.ImportedName == "*" && binding.LocalName == localName {
+			return true
+		}
+	}
+	return false
+}
+
+func importMatchesPackage(reference extractor.UnresolvedReference, localName, targetPackageName string) bool {
+	if importHasLocalBinding(reference, localName) {
+		return true
+	}
+	return len(reference.Bindings) == 0 && localName == targetPackageName
+}
+
+func packageNameForNodes(nodes []graph.Node) string {
+	for _, node := range nodes {
+		if node.Kind == PackageNodeKind {
+			return node.Label
+		}
+	}
+	return ""
+}
+
 func callableSurface(nodeID string, contributions []extractor.Contribution) bool {
 	for _, contribution := range contributions {
 		for _, node := range contribution.Facts().Nodes {
@@ -653,7 +711,7 @@ func appendImplementationFacts(contributions []extractor.Contribution, resolutio
 			if node.Kind == PackageNodeKind {
 				packageName = node.Label
 			}
-			if node.Kind == TypeNodeKind {
+			if isImplementationNodeKind(node.Kind) || node.Kind == InterfaceNodeKind {
 				typesByPackage[packageName] = append(typesByPackage[packageName], node)
 				packageByNodeID[node.ID] = packageName
 			}
@@ -677,6 +735,9 @@ func appendImplementationFacts(contributions []extractor.Contribution, resolutio
 
 	for _, types := range typesByPackage {
 		for _, contract := range types {
+			if contract.Kind != InterfaceNodeKind {
+				continue
+			}
 			references, isInterface := interfaces[contract.ID]
 			if !isInterface {
 				continue
@@ -684,7 +745,7 @@ func appendImplementationFacts(contributions []extractor.Contribution, resolutio
 			requirements := relationReferences(references, ImplementsRelation)
 			for _, implementation := range types {
 				key := packageByNodeID[implementation.ID] + "\x00" + implementation.Label
-				if implementation.ID == contract.ID || !implementsAll(methodsByType[key], requirements) {
+				if !isImplementationNodeKind(implementation.Kind) || implementation.ID == contract.ID || !implementsAll(methodsByType[key], requirements) {
 					continue
 				}
 				resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
@@ -696,7 +757,7 @@ func appendImplementationFacts(contributions []extractor.Contribution, resolutio
 			}
 			for _, reference := range relationReferences(references, EmbedsRelation) {
 				for _, target := range types {
-					if target.Label != reference.Target {
+					if target.Kind != InterfaceNodeKind || target.Label != reference.Target {
 						continue
 					}
 					resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{
@@ -723,11 +784,15 @@ func relationReferences(references []extractor.SymbolReference, relation graph.R
 
 func isResolverNodeKind(kind graph.NodeKind) bool {
 	switch kind {
-	case "file", TypeNodeKind, FunctionNodeKind, MethodNodeKind, VariableNodeKind:
+	case "file", TypeNodeKind, StructNodeKind, InterfaceNodeKind, TypeAliasNodeKind, ConstantNodeKind, FunctionNodeKind, MethodNodeKind, VariableNodeKind:
 		return true
 	default:
 		return false
 	}
+}
+
+func isImplementationNodeKind(kind graph.NodeKind) bool {
+	return kind == TypeNodeKind || kind == StructNodeKind
 }
 
 func implementsAll(methods map[string]struct{}, requirements []extractor.SymbolReference) bool {
@@ -750,30 +815,102 @@ func receiverTypeFromQualifiedName(qualifiedName string) string {
 	return parts[len(parts)-2]
 }
 
-func modulePath(view extractor.ResolverFileView) (string, bool) {
+type goModuleMapping struct {
+	path      string
+	directory string
+}
+
+type goModuleResolver struct {
+	mappings []goModuleMapping
+}
+
+func newGoModuleResolver(view extractor.ResolverFileView) goModuleResolver {
+	resolver := goModuleResolver{}
 	contents, found := view.File("go.mod")
+	if found {
+		resolver.addModuleFile("go.mod", contents, ".")
+	}
+
+	workContents, found := view.File("go.work")
+	if !found {
+		return resolver
+	}
+	work, err := modfile.ParseWork("go.work", workContents, nil)
+	if err != nil {
+		return resolver
+	}
+	for _, use := range work.Use {
+		directory, local := localModuleDirectory(use.Path)
+		if !local {
+			continue
+		}
+		contents, found := view.File(path.Join(directory, "go.mod"))
+		if found {
+			resolver.addWorkspaceModule(path.Join(directory, "go.mod"), contents, directory)
+		}
+	}
+	return resolver
+}
+
+func (resolver *goModuleResolver) addModuleFile(filePath string, contents []byte, directory string) {
+	file, err := modfile.Parse(filePath, contents, nil)
+	if err != nil || file.Module == nil {
+		return
+	}
+	resolver.mappings = append(resolver.mappings, goModuleMapping{path: file.Module.Mod.Path, directory: directory})
+	for _, replacement := range file.Replace {
+		replacementDirectory, local := localModuleDirectory(replacement.New.Path)
+		if !local || replacement.New.Version != "" {
+			continue
+		}
+		resolver.mappings = append(resolver.mappings, goModuleMapping{path: replacement.Old.Path, directory: path.Join(directory, replacementDirectory)})
+	}
+}
+
+func (resolver *goModuleResolver) addWorkspaceModule(filePath string, contents []byte, directory string) {
+	file, err := modfile.Parse(filePath, contents, nil)
+	if err != nil || file.Module == nil {
+		return
+	}
+	resolver.mappings = append(resolver.mappings, goModuleMapping{path: file.Module.Mod.Path, directory: directory})
+}
+
+func localModuleDirectory(value string) (string, bool) {
+	directory := path.Clean(strings.TrimSpace(value))
+	if directory == "." {
+		return directory, true
+	}
+	if path.IsAbs(directory) || directory == ".." || strings.HasPrefix(directory, "../") {
+		return "", false
+	}
+	return directory, true
+}
+
+func (resolver goModuleResolver) packagePath(importPath string) (string, bool) {
+	best := goModuleMapping{}
+	found := false
+	for _, mapping := range resolver.mappings {
+		if importPath != mapping.path && !strings.HasPrefix(importPath, mapping.path+"/") {
+			continue
+		}
+		if !found || len(mapping.path) > len(best.path) {
+			best = mapping
+			found = true
+		}
+	}
 	if !found {
 		return "", false
 	}
-	for _, line := range strings.Split(string(contents), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[0] == "module" {
-			return fields[1], true
-		}
+	if importPath == best.path {
+		return best.directory, true
 	}
-	return "", false
+	return path.Join(best.directory, strings.TrimPrefix(importPath, best.path+"/")), true
 }
 
-func packageFiles(importPath, modulePath string, files map[string]graph.Node, packages map[string]string) []string {
-	if modulePath == "" {
+func packageFiles(importPath string, modules goModuleResolver, files map[string]graph.Node, packages map[string]string) []string {
+	directory, found := modules.packagePath(importPath)
+	if !found {
 		return nil
-	}
-	if importPath != modulePath && !strings.HasPrefix(importPath, modulePath+"/") {
-		return nil
-	}
-	directory := "."
-	if importPath != modulePath {
-		directory = strings.TrimPrefix(importPath, modulePath+"/")
 	}
 	paths := make([]string, 0)
 	for sourcePath := range files {

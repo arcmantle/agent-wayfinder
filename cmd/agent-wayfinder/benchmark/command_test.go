@@ -261,11 +261,11 @@ func TestBenchmarkCommandWritesIncrementalUpdateCPUProfile(t *testing.T) {
 
 func TestBenchmarkCommandMeasuresGoWorkspace(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".wayfinderignore": "reference/\n",
-		"go.mod":           "module example.com/fixture\n\ngo 1.24\n",
-		"cmd/main.go":      "package main\n\nimport \"example.com/fixture/service\"\n\nfunc main() { service.Run() }\n",
-		"service/run.go":   "package service\n\nfunc Run() {}\n",
-		"reference/api.ts": "export function incompatible(name: string): string { return \"\"; }\n",
+		".agent-wayfinder/config.json": `{"sources":{"exclude":["reference/**"]}}`,
+		"go.mod":                       "module example.com/fixture\n\ngo 1.24\n",
+		"cmd/main.go":                  "package main\n\nimport \"example.com/fixture/service\"\n\nfunc main() { service.Run() }\n",
+		"service/run.go":               "package service\n\nfunc Run() {}\n",
+		"reference/api.ts":             "export function incompatible(name: string): string { return \"\"; }\n",
 	})
 	updatePath := filepath.Join(workspace.Root, "cmd", "main.go")
 	baseline, err := os.ReadFile(updatePath)

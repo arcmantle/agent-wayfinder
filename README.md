@@ -37,12 +37,44 @@ When a direct Go command is necessary, use:
 CGO_ENABLED=1 go run ./cmd/agent-wayfinder query . "where is the query.go file" --format json
 ```
 
+## Configuration Precedence
+
+Agent Wayfinder reads configuration in this order:
+
+1. Built-in defaults.
+2. User configuration in `~/.agent-wayfinder/config.json`.
+3. Workspace configuration in `.agent-wayfinder/config.json`.
+4. Environment variables.
+5. Command flags.
+
+Each later value overrides the same earlier setting. Put shared defaults in the
+user file and project-specific values in the workspace file. Both files use the
+same JSON object.
+
+### Source Selection
+
+Use `sources.include` and `sources.exclude` to select source files. Patterns use
+TypeScript-style glob syntax, including `**` for recursive directories.
+
+```json
+{
+  "sources": {
+    "include": ["src/**/*.ts", "packages/*/src/**/*.ts"],
+    "exclude": ["**/*.test.ts", "**/generated/**"]
+  }
+}
+```
+
+When `include` is absent, Agent Wayfinder discovers all supported source files.
+An empty `include` selects no source files. An empty `exclude` disables only
+configuration exclusions. Workspace `include` and `exclude` arrays each replace
+the corresponding user array. Git ignore rules and internal directories remain
+excluded. `.wayfinderignore` is not used.
+
 ## Catalog Configuration
 
-Catalog configuration is in the indexed workspace's
-`.agent-wayfinder/config.json` file. It controls embeddings and optional
-catalog synopses. It also controls question planning through its `planning`
-object. The file is the only workspace configuration file for these features.
+Catalog configuration controls embeddings and optional catalog synopses. It
+also controls question planning through its `planning` object.
 
 ### Embeddings
 
@@ -346,8 +378,8 @@ claim.
 ### Question Planner Configuration
 
 Question planner settings are non-secret. The query command reads them from the
-workspace `.agent-wayfinder/config.json` file and from environment variables. Ollama,
-Claude, and Copilot planners have separate configuration sections.
+user and workspace configuration files, then from environment variables.
+Ollama, Claude, and Copilot planners have separate configuration sections.
 
 ```json
 {

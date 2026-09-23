@@ -1,5 +1,5 @@
 graphify-*
 reference/
-.agent-wayfinder/
+.agent-wayfinder/*.db
 npm/vscode-mcp-provider/dist/
 npm/vscode-mcp-provider/node_modules/

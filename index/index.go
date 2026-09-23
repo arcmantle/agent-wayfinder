@@ -299,7 +299,7 @@ func extractChangedSources(root string, paths []string, sourcesByPath map[string
 		if !supported {
 			continue
 		}
-		vocabulary, err := language.Vocabulary()
+		vocabulary, err := vocabularyForLanguage(language.Metadata().Name)
 		if err != nil {
 			return nil, nil, fmt.Errorf("get vocabulary for deleted source %q: %w", sourcePath, err)
 		}
@@ -334,7 +334,7 @@ func mergeSources(stored []storage.SourceContribution, updated []extractedSource
 		if !found {
 			return nil, fmt.Errorf("restore source %q: no registered extractor", source.SourcePath)
 		}
-		vocabulary, err := language.Vocabulary()
+		vocabulary, err := vocabularyForLanguage(language.Metadata().Name)
 		if err != nil {
 			return nil, fmt.Errorf("restore source %q: get vocabulary: %w", source.SourcePath, err)
 		}
@@ -489,17 +489,17 @@ func extractDiscoveredSourcesWithProgress(root string, sources []workspace.Sourc
 	for range workerCount {
 		go func() {
 			defer workers.Done()
-			typescriptWorker, err := typescript.NewWorker()
+			extractionWorkers, err := newExtractionWorkers()
 			if err != nil {
 				for sourceIndex := range jobs {
-					results[sourceIndex].err = fmt.Errorf("create TypeScript extraction worker: %w", err)
+					results[sourceIndex].err = fmt.Errorf("create extraction workers: %w", err)
 					completed <- struct{}{}
 				}
 				return
 			}
-			defer typescriptWorker.Close()
+			defer extractionWorkers.Close()
 			for sourceIndex := range jobs {
-				results[sourceIndex].source, results[sourceIndex].err = extractDiscoveredSource(root, sources[sourceIndex], registered, typescriptWorker)
+				results[sourceIndex].source, results[sourceIndex].err = extractDiscoveredSource(root, sources[sourceIndex], registered, extractionWorkers)
 				completed <- struct{}{}
 			}
 		}()
@@ -529,7 +529,7 @@ func extractDiscoveredSourcesWithProgress(root string, sources []workspace.Sourc
 	return extracted, nil
 }
 
-func extractDiscoveredSource(root string, source workspace.Source, registered registry.Registry, typescriptWorker *typescript.Worker) (extractedSource, error) {
+func extractDiscoveredSource(root string, source workspace.Source, registered registry.Registry, workers *extractionWorkers) (extractedSource, error) {
 	contents, err := os.ReadFile(filepath.Join(root, source.Path))
 	if err != nil {
 		return extractedSource{}, fmt.Errorf("read source %q: %w", source.Path, err)
@@ -542,7 +542,7 @@ func extractDiscoveredSource(root string, source workspace.Source, registered re
 		ProjectID:  source.ProjectID,
 		SourcePath: source.Path,
 		Contents:   contents,
-	}, typescriptWorker)
+	}, workers)
 	if err != nil {
 		return extractedSource{}, fmt.Errorf("extract source %q: %w", source.Path, err)
 	}
@@ -675,35 +675,16 @@ func resolveWorkspaceFacts(root string, sources []extractedSource) (graph.Facts,
 	var facts graph.Facts
 	for _, key := range keys {
 		group := groups[key]
-		switch group.language {
-		case "go":
-			view, err := goResolverFileView(root, group.projectID)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			resolution, err := goextractor.ResolveWithFileView(group.contributions, view)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			facts.Edges = append(facts.Edges, resolution.Facts().Edges...)
-			diagnostics = append(diagnostics, resolution.Diagnostics()...)
-		case "javascript":
-			resolution, err := javascript.Resolve(group.contributions)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			facts.Edges = append(facts.Edges, resolution.Facts().Edges...)
-			diagnostics = append(diagnostics, resolution.Diagnostics()...)
-		case "typescript":
-			resolution, err := typescript.Resolve(group.contributions)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			facts.Edges = append(facts.Edges, resolution.Facts().Edges...)
-			diagnostics = append(diagnostics, resolution.Diagnostics()...)
-		default:
+		definition, found := indexLanguages[group.language]
+		if !found || definition.resolveWorkspace == nil {
 			return graph.Facts{}, nil, fmt.Errorf("unsupported resolver %q", group.language)
 		}
+		groupFacts, groupDiagnostics, err := definition.resolveWorkspace(root, group.projectID, group.contributions)
+		if err != nil {
+			return graph.Facts{}, nil, err
+		}
+		facts.Edges = append(facts.Edges, groupFacts.Edges...)
+		diagnostics = append(diagnostics, groupDiagnostics...)
 	}
 	return facts, diagnostics, nil
 }
@@ -737,33 +718,16 @@ func resolveIncrementalWorkspaceFacts(ctx context.Context, root string, store re
 	diagnostics := make([]extractor.Diagnostic, 0)
 	for _, key := range keys {
 		projectID, language, _ := strings.Cut(key, "\x00")
-		switch language {
-		case "typescript":
-			groupFacts, groupDiagnostics, err := resolveTypeScriptProjectionPages(ctx, store, snapshot, projectID, overrides, deleted)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			facts.Edges = append(facts.Edges, groupFacts.Edges...)
-			diagnostics = append(diagnostics, groupDiagnostics...)
-		case "javascript":
-			groupFacts, groupDiagnostics, err := resolveJavaScriptProjectionPages(ctx, store, snapshot, projectID, overrides, deleted)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			facts.Edges = append(facts.Edges, groupFacts.Edges...)
-			diagnostics = append(diagnostics, groupDiagnostics...)
-		case "go":
-			view, err := goResolverFileView(root, projectID)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			groupFacts, groupDiagnostics, err := resolveGoProjectionPages(ctx, store, snapshot, projectID, overrides, deleted, view)
-			if err != nil {
-				return graph.Facts{}, nil, err
-			}
-			facts.Edges = append(facts.Edges, groupFacts.Edges...)
-			diagnostics = append(diagnostics, groupDiagnostics...)
+		definition, found := indexLanguages[language]
+		if !found || definition.resolveIncrementalProjections == nil {
+			return graph.Facts{}, nil, fmt.Errorf("unsupported resolver %q", language)
 		}
+		groupFacts, groupDiagnostics, err := definition.resolveIncrementalProjections(ctx, root, store, snapshot, projectID, overrides, deleted)
+		if err != nil {
+			return graph.Facts{}, nil, err
+		}
+		facts.Edges = append(facts.Edges, groupFacts.Edges...)
+		diagnostics = append(diagnostics, groupDiagnostics...)
 	}
 	return facts, diagnostics, nil
 }
@@ -980,20 +944,9 @@ func resolverTargetFromContribution(source extractedSource) extractor.ResolverTa
 }
 
 func projectionContribution(projection extractor.ResolverProjection) (extractor.Contribution, error) {
-	var err error
-	var vocabulary graph.Vocabulary
-	switch projection.Metadata.Name {
-	case "typescript":
-		vocabulary, err = typescript.New().Vocabulary()
-	case "javascript":
-		vocabulary, err = javascript.New().Vocabulary()
-	case "go":
-		vocabulary, err = goextractor.New().Vocabulary()
-	default:
-		return extractor.Contribution{}, fmt.Errorf("create resolver projection %q: unsupported language %q", projection.SourcePath, projection.Metadata.Name)
-	}
+	vocabulary, err := vocabularyForLanguage(projection.Metadata.Name)
 	if err != nil {
-		return extractor.Contribution{}, err
+		return extractor.Contribution{}, fmt.Errorf("create resolver projection %q: %w", projection.SourcePath, err)
 	}
 	return extractor.NewContribution(vocabulary, extractor.ContributionInput{
 		ProjectID:            projection.ProjectID,
@@ -1018,20 +971,4 @@ func goResolverFileView(root, projectID string) (extractor.ResolverFileView, err
 		return extractor.ResolverFileView{}, fmt.Errorf("read Go module for %q: %w", projectID, err)
 	}
 	return extractor.NewResolverFileView(projectRoot, map[string][]byte{"go.mod": contents})
-}
-
-func extract(registered extractor.Extractor, source extractor.Source, typescriptWorker *typescript.Worker) (extractor.Contribution, error) {
-	switch registered.Metadata().Name {
-	case "go":
-		return goextractor.Extract(source)
-	case "javascript":
-		return javascript.Extract(source)
-	case "typescript":
-		if typescriptWorker != nil {
-			return typescriptWorker.Extract(source)
-		}
-		return typescript.Extract(source)
-	default:
-		return extractor.Contribution{}, fmt.Errorf("unsupported extractor %q", registered.Metadata().Name)
-	}
 }

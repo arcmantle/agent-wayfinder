@@ -49,6 +49,24 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 	}
 }
 
+func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
+	user := testkit.NewWorkspace(t, map[string]string{})
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"ollama":{"enabled":true,"model":"user-model","timeout":"7s"}}}`)
+	t.Setenv("HOME", user.Root)
+	t.Setenv("USERPROFILE", user.Root)
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agent-wayfinder/config.json": `{"planning":{"ollama":{"model":"workspace-model","timeout":"8s"}}}`,
+	})
+
+	configuration, err := ReadConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read layered Ollama configuration: %v", err)
+	}
+	if !configuration.Enabled || configuration.Model != "workspace-model" || configuration.Timeout != 8*time.Second {
+		t.Errorf("Ollama configuration = %+v, want workspace values to override user values", configuration)
+	}
+}
+
 func TestRunSendsStructuredQuestionRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/chat" {

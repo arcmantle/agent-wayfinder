@@ -43,6 +43,7 @@ func CatalogUnitsForSource(source Source, facts graph.Facts) []CatalogUnit {
 func isCatalogKind(kind graph.NodeKind) bool {
 	return strings.HasSuffix(string(kind), ":function") ||
 		strings.HasSuffix(string(kind), ":type") ||
+		strings.HasSuffix(string(kind), ":struct") ||
 		strings.HasSuffix(string(kind), ":class") ||
 		strings.HasSuffix(string(kind), ":interface") ||
 		strings.HasSuffix(string(kind), ":method")

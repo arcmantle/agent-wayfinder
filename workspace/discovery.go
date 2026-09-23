@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 
+	"agent-wayfinder/configuration"
+
+	"github.com/bmatcuk/doublestar/v4"
 	gitignore "github.com/sabhiram/go-gitignore"
 )
 
@@ -32,11 +35,6 @@ type Discovery struct {
 	Sources  []Source
 }
 
-type ignoreRule struct {
-	pattern string
-	include bool
-}
-
 type gitIgnoreRule struct {
 	root     string
 	patterns []gitIgnorePattern
@@ -47,8 +45,9 @@ type gitIgnorePattern struct {
 	negated bool
 }
 
-type ignoreRules struct {
-	agraph     []ignoreRule
+type sourceRules struct {
+	include    []string
+	exclude    []string
 	gitIgnores []gitIgnoreRule
 }
 
@@ -69,7 +68,7 @@ func DiscoverStream(ctx context.Context, root string, options DiscoverOptions, e
 	if err != nil {
 		return nil, 0, fmt.Errorf("resolve workspace root: %w", err)
 	}
-	ignoreRules, err := loadIgnoreRules(workspaceRoot)
+	sourceRules, err := loadSourceRules(workspaceRoot)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -98,7 +97,7 @@ func DiscoverStream(ctx context.Context, root string, options DiscoverOptions, e
 			return fmt.Errorf("make path relative: %w", err)
 		}
 		relativePath = filepath.ToSlash(relativePath)
-		if sourceExcluded(relativePath, ignoreRules) {
+		if nonSourcePathExcluded(relativePath, sourceRules) {
 			return nil
 		}
 		if projectManifest(filepath.Base(path)) {
@@ -131,7 +130,7 @@ func DiscoverStream(ctx context.Context, root string, options DiscoverOptions, e
 			return fmt.Errorf("make path relative: %w", err)
 		}
 		relativePath = filepath.ToSlash(relativePath)
-		if sourceExcluded(relativePath, ignoreRules) || !supportedSource(relativePath) {
+		if sourceExcluded(relativePath, sourceRules) || !supportedSource(relativePath) {
 			return nil
 		}
 		ownerRoot, found := mostSpecificRoot(relativePath, projectRoots)
@@ -149,39 +148,23 @@ func DiscoverStream(ctx context.Context, root string, options DiscoverOptions, e
 	return projects, sourceCount, nil
 }
 
-func loadIgnoreRules(workspaceRoot string) (ignoreRules, error) {
+func loadSourceRules(workspaceRoot string) (sourceRules, error) {
 	gitIgnores, err := loadGitIgnoreRules(workspaceRoot)
 	if err != nil {
-		return ignoreRules{}, err
+		return sourceRules{}, err
 	}
-
-	contents, err := os.ReadFile(filepath.Join(workspaceRoot, ".wayfinderignore"))
-	if os.IsNotExist(err) {
-		return ignoreRules{gitIgnores: gitIgnores}, nil
-	}
+	selection, err := configuration.ReadSourceSelection(workspaceRoot)
 	if err != nil {
-		return ignoreRules{}, fmt.Errorf("read root .wayfinderignore: %w", err)
+		return sourceRules{}, err
 	}
-
-	lines := strings.Split(string(contents), "\n")
-	rules := make([]ignoreRule, 0, len(lines))
-	for _, line := range lines {
-		pattern := strings.TrimSpace(line)
-		if pattern == "" || strings.HasPrefix(pattern, "#") {
-			continue
-		}
-		include := strings.HasPrefix(pattern, "!")
-		if include {
-			pattern = strings.TrimPrefix(pattern, "!")
-		}
-		if pattern != "" {
-			rules = append(rules, ignoreRule{pattern: pattern, include: include})
-		}
-	}
-	return ignoreRules{agraph: rules, gitIgnores: gitIgnores}, nil
+	return sourceRules{include: selection.Include, exclude: selection.Exclude, gitIgnores: gitIgnores}, nil
 }
 
-func sourceExcluded(sourcePath string, rules ignoreRules) bool {
+func nonSourcePathExcluded(path string, rules sourceRules) bool {
+	return internalDirectory(path) || gitIgnored(path, rules.gitIgnores)
+}
+
+func sourceExcluded(sourcePath string, rules sourceRules) bool {
 	if internalDirectory(sourcePath) {
 		return true
 	}
@@ -189,13 +172,20 @@ func sourceExcluded(sourcePath string, rules ignoreRules) bool {
 		return true
 	}
 
-	excluded := false
-	for _, rule := range rules.agraph {
-		if ignorePatternMatches(sourcePath, rule.pattern) {
-			excluded = !rule.include
+	if rules.include != nil && !matchesAny(sourcePath, rules.include) {
+		return true
+	}
+	return matchesAny(sourcePath, rules.exclude)
+}
+
+func matchesAny(sourcePath string, patterns []string) bool {
+	for _, pattern := range patterns {
+		matched, _ := doublestar.Match(pattern, sourcePath)
+		if matched {
+			return true
 		}
 	}
-	return excluded
+	return false
 }
 
 func loadGitIgnoreRules(workspaceRoot string) ([]gitIgnoreRule, error) {
@@ -299,57 +289,6 @@ func internalDirectory(sourcePath string) bool {
 	for _, component := range strings.Split(sourcePath, "/") {
 		switch component {
 		case ".agent-wayfinder", ".git", "node_modules":
-			return true
-		}
-	}
-	return false
-}
-
-func ignorePatternMatches(sourcePath, pattern string) bool {
-	anchored := strings.HasPrefix(pattern, "/")
-	pattern = strings.TrimPrefix(pattern, "/")
-	directory := strings.HasSuffix(pattern, "/")
-	pattern = strings.TrimSuffix(pattern, "/")
-	if pattern == "" {
-		return false
-	}
-
-	if directory {
-		return directoryPatternMatches(sourcePath, pattern, anchored)
-	}
-	if !strings.Contains(pattern, "/") {
-		matched, _ := path.Match(pattern, path.Base(sourcePath))
-		return matched
-	}
-	if anchored {
-		matched, _ := path.Match(pattern, sourcePath)
-		return matched
-	}
-	for candidate := sourcePath; candidate != "."; candidate = path.Dir(candidate) {
-		matched, _ := path.Match(pattern, candidate)
-		if matched {
-			return true
-		}
-	}
-	return false
-}
-
-func directoryPatternMatches(sourcePath, pattern string, anchored bool) bool {
-	components := strings.Split(sourcePath, "/")
-	for index := range components[:len(components)-1] {
-		candidate := strings.Join(components[:index+1], "/")
-		if anchored && candidate != pattern {
-			continue
-		}
-		if !anchored && !strings.Contains(pattern, "/") {
-			matched, _ := path.Match(pattern, components[index])
-			if matched {
-				return true
-			}
-			continue
-		}
-		matched, _ := path.Match(pattern, candidate)
-		if matched {
 			return true
 		}
 	}

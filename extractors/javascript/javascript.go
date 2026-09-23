@@ -11,7 +11,7 @@ import (
 	"agent-wayfinder/graph"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	javascriptgrammar "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
+	js_grammar "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
 )
 
 const Version = "v0"
@@ -28,10 +28,14 @@ func New() extractor.Extractor {
 }
 
 func Language() *sitter.Language {
-	return sitter.NewLanguage(javascriptgrammar.Language())
+	return sitter.NewLanguage(js_grammar.Language())
 }
 
 type extractorDefinition struct{}
+
+type Worker struct {
+	parser *sitter.Parser
+}
 
 type declaration struct {
 	id            string
@@ -60,20 +64,46 @@ func (extractorDefinition) Vocabulary() (graph.Vocabulary, error) {
 }
 
 func Extract(source extractor.Source) (extractor.Contribution, error) {
+	worker, err := NewWorker()
+	if err != nil {
+		return extractor.Contribution{}, err
+	}
+	defer worker.Close()
+	return worker.Extract(source)
+}
+
+func NewWorker() (*Worker, error) {
+	parser := sitter.NewParser()
+	if err := parser.SetLanguage(Language()); err != nil {
+		parser.Close()
+		return nil, fmt.Errorf("set JavaScript language: %w", err)
+	}
+	return &Worker{parser: parser}, nil
+}
+
+func (worker *Worker) Close() error {
+	if worker == nil {
+		return nil
+	}
+	if worker.parser != nil {
+		worker.parser.Close()
+		worker.parser = nil
+	}
+	return nil
+}
+
+func (worker *Worker) Extract(source extractor.Source) (extractor.Contribution, error) {
 	if source.ProjectID == "" {
 		return extractor.Contribution{}, fmt.Errorf("JavaScript source project ID is empty")
 	}
 	if source.SourcePath == "" {
 		return extractor.Contribution{}, fmt.Errorf("JavaScript source path is empty")
 	}
-
-	parser := sitter.NewParser()
-	defer parser.Close()
-	if err := parser.SetLanguage(Language()); err != nil {
-		return extractor.Contribution{}, fmt.Errorf("set JavaScript language: %w", err)
+	if worker == nil || worker.parser == nil {
+		return extractor.Contribution{}, fmt.Errorf("JavaScript worker is closed")
 	}
 
-	tree := parser.Parse(source.Contents, nil)
+	tree := worker.parser.Parse(source.Contents, nil)
 	defer tree.Close()
 	root := tree.RootNode()
 	if root.HasError() {

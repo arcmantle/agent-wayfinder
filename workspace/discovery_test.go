@@ -14,7 +14,7 @@ import (
 func TestDiscoverStreamMatchesMaterializedProjectOwnershipIgnoreRulesAndOrder(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
 		"package.json":                        `{"name":"root"}`,
-		".wayfinderignore":                       "generated/\n!generated/keep.ts\n",
+		".wayfinderignore":                    "generated/\n!generated/keep.ts\n",
 		"src/root.ts":                         "export const root = 1;\n",
 		"generated/drop.ts":                   "export const drop = 1;\n",
 		"generated/keep.ts":                   "export const keep = 1;\n",
@@ -175,20 +175,20 @@ func TestDiscoverUsesTypeScriptAndJavaScriptManifestsWithOneIdentityPerRoot(t *t
 	}
 }
 
-func TestDiscoverAppliesRootAgraphignorePatterns(t *testing.T) {
+func TestDiscoverAppliesSourcesIncludeAndExcludeConfiguration(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
-		"package.json":                  `{"name":"root"}`,
-		".wayfinderignore":                 "# generated files\ngenerated/\n*.test.ts\n/root-only.ts\n!generated/keep.ts\n",
-		"root-only.ts":                  "export const rootOnly = 1;\n",
-		"src/main.ts":                   "export const main = 1;\n",
-		"src/main.test.ts":              "export const test = 1;\n",
-		"generated/build.ts":            "export const build = 1;\n",
-		"generated/keep.ts":             "export const keep = 1;\n",
-		"nested/.wayfinderignore":          "*.ts\n",
-		"nested/still-included.ts":      "export const nested = 1;\n",
-		"node_modules/package/index.js": "module.exports = {};\n",
-		".agent-wayfinder/cache/index.ts":   "export const cache = 1;\n",
-		".git/hooks/ignored.ts":         "export const hook = 1;\n",
+		"package.json":                    `{"name":"root"}`,
+		".agent-wayfinder/config.json":    `{"sources":{"include":["src/**/*.ts","packages/*/src/**/*.ts"],"exclude":["**/*.test.ts","**/generated/**"]}}`,
+		"root-only.ts":                    "export const rootOnly = 1;\n",
+		"src/main.ts":                     "export const main = 1;\n",
+		"src/main.test.ts":                "export const test = 1;\n",
+		"generated/build.ts":              "export const build = 1;\n",
+		"packages/app/package.json":       `{"name":"app"}`,
+		"packages/app/src/main.ts":        "export const main = 1;\n",
+		"packages/app/generated/build.ts": "export const build = 1;\n",
+		"node_modules/package/index.js":   "module.exports = {};\n",
+		".agent-wayfinder/cache/index.ts": "export const cache = 1;\n",
+		".git/hooks/ignored.ts":           "export const hook = 1;\n",
 	})
 
 	discovery, err := workspace.Discover(fixture.Root, workspace.DiscoverOptions{})
@@ -197,10 +197,9 @@ func TestDiscoverAppliesRootAgraphignorePatterns(t *testing.T) {
 	}
 
 	want := workspace.Discovery{
-		Projects: []workspace.Project{{ID: "project:.", Root: "."}},
+		Projects: []workspace.Project{{ID: "project:.", Root: "."}, {ID: "project:packages/app", Root: "packages/app"}},
 		Sources: []workspace.Source{
-			{Path: "generated/keep.ts", ProjectID: "project:."},
-			{Path: "nested/still-included.ts", ProjectID: "project:."},
+			{Path: "packages/app/src/main.ts", ProjectID: "project:packages/app"},
 			{Path: "src/main.ts", ProjectID: "project:."},
 		},
 	}
@@ -209,15 +208,19 @@ func TestDiscoverAppliesRootAgraphignorePatterns(t *testing.T) {
 	}
 }
 
-func TestDiscoverAppliesRootRelativeDirectoryPatterns(t *testing.T) {
+func TestDiscoverWorkspaceSourceSelectionReplacesUserDefaultsAndIgnoresWayfinderignore(t *testing.T) {
+	user := testkit.NewWorkspace(t, map[string]string{})
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"sources":{"include":["src/**/*.ts"],"exclude":["**/client.ts"]}}`)
+	t.Setenv("HOME", user.Root)
+	t.Setenv("USERPROFILE", user.Root)
 	fixture := testkit.NewWorkspace(t, map[string]string{
-		"package.json":                       `{"name":"root"}`,
-		".wayfinderignore":                      "/generated/\n*.generated.ts\n!src/keep.generated.ts\n",
-		"generated/root.ts":                  "export const generated = 1;\n",
-		"packages/app/generated/retained.ts": "export const retained = 1;\n",
-		"src/drop.generated.ts":              "export const drop = 1;\n",
-		"src/keep.generated.ts":              "export const keep = 1;\n",
-		"src/main.ts":                        "export const main = 1;\n",
+		"package.json":                    `{"name":"root"}`,
+		".agent-wayfinder/config.json":    `{"sources":{"include":["packages/**/*.ts"],"exclude":[]}}`,
+		".wayfinderignore":                "packages/\n",
+		"src/main.ts":                     "export const main = 1;\n",
+		"packages/app/package.json":       `{"name":"app"}`,
+		"packages/app/src/client.ts":      "export const client = 1;\n",
+		"packages/app/src/client.test.ts": "export const test = 1;\n",
 	})
 
 	discovery, err := workspace.Discover(fixture.Root, workspace.DiscoverOptions{})
@@ -226,9 +229,8 @@ func TestDiscoverAppliesRootRelativeDirectoryPatterns(t *testing.T) {
 	}
 
 	want := []workspace.Source{
-		{Path: "packages/app/generated/retained.ts", ProjectID: "project:."},
-		{Path: "src/keep.generated.ts", ProjectID: "project:."},
-		{Path: "src/main.ts", ProjectID: "project:."},
+		{Path: "packages/app/src/client.test.ts", ProjectID: "project:packages/app"},
+		{Path: "packages/app/src/client.ts", ProjectID: "project:packages/app"},
 	}
 	if !reflect.DeepEqual(discovery.Sources, want) {
 		t.Errorf("sources = %#v, want %#v", discovery.Sources, want)
@@ -237,8 +239,8 @@ func TestDiscoverAppliesRootRelativeDirectoryPatterns(t *testing.T) {
 
 func TestDiscoverExcludesSourcesIgnoredByGit(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
-		"package.json":  `{"name":"root"}`,
-		".gitignore":    "dist/\n",
+		"package.json":     `{"name":"root"}`,
+		".gitignore":       "dist/\n",
 		".wayfinderignore": "!core/dist/src/app/experimental/is-overflowing.d.ts\n",
 		"core/dist/src/app/experimental/is-overflowing.d.ts": "export declare const isOverflowing: boolean;\n",
 		"core/src/app/experimental/is-overflowing.ts":        "export const isOverflowing = false;\n",

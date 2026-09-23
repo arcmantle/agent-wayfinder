@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 
 	"agent-wayfinder/extractor"
@@ -28,6 +29,94 @@ func TestLanguageParsesJavaScript(t *testing.T) {
 	defer tree.Close()
 	if tree.RootNode().HasError() {
 		t.Fatal("JavaScript source has a syntax error")
+	}
+}
+
+func TestWorkerExtractsSource(t *testing.T) {
+	worker, err := NewWorker()
+	if err != nil {
+		t.Fatalf("create JavaScript worker: %v", err)
+	}
+	t.Cleanup(func() { _ = worker.Close() })
+
+	contribution, err := worker.Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/greet.js",
+		Contents:   []byte("export function greet(name) { return name; }"),
+	})
+	if err != nil {
+		t.Fatalf("extract JavaScript source: %v", err)
+	}
+	if len(contribution.Facts().Nodes) == 0 {
+		t.Error("extracted contribution has no nodes")
+	}
+}
+
+func TestWorkerCloseDoesNotAffectOtherWorkers(t *testing.T) {
+	closedWorker, err := NewWorker()
+	if err != nil {
+		t.Fatalf("create closed JavaScript worker: %v", err)
+	}
+	activeWorker, err := NewWorker()
+	if err != nil {
+		t.Fatalf("create active JavaScript worker: %v", err)
+	}
+	t.Cleanup(func() { _ = activeWorker.Close() })
+
+	if err := closedWorker.Close(); err != nil {
+		t.Fatalf("close JavaScript worker: %v", err)
+	}
+	source := extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/greet.js",
+		Contents:   []byte("export function greet(name) { return name; }"),
+	}
+	if _, err := closedWorker.Extract(source); err == nil || err.Error() != "JavaScript worker is closed" {
+		t.Errorf("closed worker extract error = %v, want JavaScript worker is closed", err)
+	}
+	if _, err := activeWorker.Extract(source); err != nil {
+		t.Errorf("extract with independent JavaScript worker: %v", err)
+	}
+}
+
+func TestWorkersExtractConcurrently(t *testing.T) {
+	workers := make([]*Worker, 2)
+	for workerIndex := range workers {
+		worker, err := NewWorker()
+		if err != nil {
+			t.Fatalf("create JavaScript worker %d: %v", workerIndex, err)
+		}
+		workers[workerIndex] = worker
+		t.Cleanup(func() { _ = worker.Close() })
+	}
+
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	var complete sync.WaitGroup
+	errs := make(chan error, len(workers))
+	for workerIndex, worker := range workers {
+		ready.Add(1)
+		complete.Add(1)
+		go func(worker *Worker, workerIndex int) {
+			defer complete.Done()
+			ready.Done()
+			<-start
+			_, err := worker.Extract(extractor.Source{
+				ProjectID:  "project:fixture",
+				SourcePath: "src/greet-" + string(rune('a'+workerIndex)) + ".js",
+				Contents:   []byte("export function greet(name) { return name; }"),
+			})
+			errs <- err
+		}(worker, workerIndex)
+	}
+	ready.Wait()
+	close(start)
+	complete.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("extract concurrently: %v", err)
+		}
 	}
 }
 
@@ -429,6 +518,119 @@ func TestResolvePageUsesResolverIndexForCrossPageImport(t *testing.T) {
 	}
 }
 
+func TestResolvePageUsesWorkspacePackageImport(t *testing.T) {
+	entry, err := Extract(extractor.Source{ProjectID: "project:packages/core", SourcePath: "packages/core/src/index.js", Contents: []byte("export const helper = 1;")})
+	if err != nil {
+		t.Fatalf("extract package entry facts: %v", err)
+	}
+	main, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/main.js", Contents: []byte("import { helper } from '@scope/core';")})
+	if err != nil {
+		t.Fatalf("extract main facts: %v", err)
+	}
+
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{
+		packageTargets: map[string][]extractor.ResolverTarget{
+			"packages/core/src": {pageResolverTarget(entry)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolve JavaScript package page: %v", err)
+	}
+
+	mainFileID := main.Facts().Nodes[1].ID
+	entryFileID := entry.Facts().Nodes[1].ID
+	entrySurfaceID := entry.ExportedSurfaces()[0].NodeID
+	if !hasPageResolvedEdge(resolution.Facts().Edges, mainFileID, entryFileID, ImportsFromRelation) {
+		t.Errorf("resolved facts = %+v, want package import edge from %q to %q", resolution.Facts(), mainFileID, entryFileID)
+	}
+	if !hasPageResolvedEdge(resolution.Facts().Edges, mainFileID, entrySurfaceID, ImportsFromRelation) {
+		t.Errorf("resolved facts = %+v, want package export edge from %q to %q", resolution.Facts(), mainFileID, entrySurfaceID)
+	}
+}
+
+func TestResolvePageResolvesImportAndCallThroughReExport(t *testing.T) {
+	support, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/support.js", Contents: []byte("export function left() {} export function right() {}")})
+	if err != nil {
+		t.Fatalf("extract support facts: %v", err)
+	}
+	barrel, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/index.js", Contents: []byte("export { left as first } from './support'; export { right as second } from './support';")})
+	if err != nil {
+		t.Fatalf("extract barrel facts: %v", err)
+	}
+	main, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/main.js", Contents: []byte("import { first, second } from './index'; export function main() { first(); second(); }")})
+	if err != nil {
+		t.Fatalf("extract main facts: %v", err)
+	}
+
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{targets: map[string]extractor.ResolverTarget{
+		"src/index.js":   pageResolverTarget(barrel),
+		"src/support.js": pageResolverTarget(support),
+	}})
+	if err != nil {
+		t.Fatalf("resolve JavaScript re-export page: %v", err)
+	}
+
+	mainFileID := main.Facts().Nodes[1].ID
+	mainFunctionID := main.Facts().Nodes[2].ID
+	for _, surface := range support.ExportedSurfaces() {
+		if !hasPageResolvedEdge(resolution.Facts().Edges, mainFileID, surface.NodeID, ImportsFromRelation) {
+			t.Errorf("resolved facts = %+v, want re-export import edge from %q to %q", resolution.Facts(), mainFileID, surface.NodeID)
+		}
+		if !hasPageResolvedEdge(resolution.Facts().Edges, mainFunctionID, surface.NodeID, CallsRelation) {
+			t.Errorf("resolved facts = %+v, want re-export call edge from %q to %q", resolution.Facts(), mainFunctionID, surface.NodeID)
+		}
+	}
+}
+
+func TestResolvePageReportsMissingNamedExport(t *testing.T) {
+	support, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/support.js", Contents: []byte("export const helper = 1;")})
+	if err != nil {
+		t.Fatalf("extract support facts: %v", err)
+	}
+	main, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/main.js", Contents: []byte("import { missing } from './support';")})
+	if err != nil {
+		t.Fatalf("extract main facts: %v", err)
+	}
+
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{targets: map[string]extractor.ResolverTarget{
+		"src/support.js": pageResolverTarget(support),
+	}})
+	if err != nil {
+		t.Fatalf("resolve JavaScript page: %v", err)
+	}
+
+	for _, diagnostic := range resolution.Diagnostics() {
+		if diagnostic.Message == "JavaScript export \"missing\" from \"./support\" is not indexed" {
+			return
+		}
+	}
+	t.Errorf("diagnostics = %+v, want missing export diagnostic", resolution.Diagnostics())
+}
+
+func TestResolvePageKeepsCommonJSRequireResolution(t *testing.T) {
+	support, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/support.js", Contents: []byte("module.exports = { helper: 1 };")})
+	if err != nil {
+		t.Fatalf("extract support facts: %v", err)
+	}
+	main, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/main.cjs", Contents: []byte("const support = require('./support');")})
+	if err != nil {
+		t.Fatalf("extract main facts: %v", err)
+	}
+
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{targets: map[string]extractor.ResolverTarget{
+		"src/support.js": pageResolverTarget(support),
+	}})
+	if err != nil {
+		t.Fatalf("resolve JavaScript CommonJS page: %v", err)
+	}
+
+	mainFileID := main.Facts().Nodes[1].ID
+	supportFileID := support.Facts().Nodes[1].ID
+	if !hasPageResolvedEdge(resolution.Facts().Edges, mainFileID, supportFileID, ImportsFromRelation) {
+		t.Errorf("resolved facts = %+v, want CommonJS require edge from %q to %q", resolution.Facts(), mainFileID, supportFileID)
+	}
+}
+
 func TestResolvePageUsesResolverIndexForCrossPageCall(t *testing.T) {
 	helper, err := Extract(extractor.Source{ProjectID: "project:fixture", SourcePath: "src/helper.js", Contents: []byte("export function helper() {}")})
 	if err != nil {
@@ -457,8 +659,9 @@ func TestResolvePageUsesResolverIndexForCrossPageCall(t *testing.T) {
 }
 
 type pageResolverIndex struct {
-	targets     map[string]extractor.ResolverTarget
-	targetReads *int
+	targets        map[string]extractor.ResolverTarget
+	packageTargets map[string][]extractor.ResolverTarget
+	targetReads    *int
 }
 
 func (index pageResolverIndex) ResolverTarget(_ context.Context, request extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
@@ -469,17 +672,19 @@ func (index pageResolverIndex) ResolverTarget(_ context.Context, request extract
 	return target, found, nil
 }
 
-func (pageResolverIndex) ResolverPackagePage(context.Context, extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
-	return nil, nil
+func (index pageResolverIndex) ResolverPackagePage(_ context.Context, request extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
+	return append([]extractor.ResolverTarget(nil), index.packageTargets[request.PackagePath]...), nil
 }
 
 func pageResolverTarget(contribution extractor.Contribution) extractor.ResolverTarget {
 	return extractor.ResolverTarget{
-		ProjectID:        "project:fixture",
-		SourcePath:       contribution.SourcePath(),
-		Metadata:         contribution.Metadata(),
-		Nodes:            contribution.Facts().Nodes,
-		ExportedSurfaces: contribution.ExportedSurfaces(),
+		ProjectID:            "project:fixture",
+		SourcePath:           contribution.SourcePath(),
+		Metadata:             contribution.Metadata(),
+		Nodes:                contribution.Facts().Nodes,
+		UnresolvedReferences: contribution.UnresolvedReferences(),
+		SymbolReferences:     contribution.SymbolReferences(),
+		ExportedSurfaces:     contribution.ExportedSurfaces(),
 	}
 }
 

@@ -46,6 +46,33 @@ func TestReadConfigurationUsesWorkspaceValuesAndDisabledDefaults(t *testing.T) {
 	}
 }
 
+func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
+	user := testkit.NewWorkspace(t, map[string]string{})
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"claude":{"enabled":true,"path":"user-claude","model":"user-model","fallbackModel":"user-fallback","maxBudgetUsd":0.5,"effort":"medium","timeout":"7s"}}}`)
+	t.Setenv("HOME", user.Root)
+	t.Setenv("USERPROFILE", user.Root)
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agent-wayfinder/config.json": `{"planning":{"claude":{"model":"workspace-model","timeout":"8s"}}}`,
+	})
+
+	configuration, err := ReadConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read layered Claude configuration: %v", err)
+	}
+	if !configuration.Enabled || configuration.Path != "user-claude" || configuration.Model != "workspace-model" || configuration.FallbackModel != "user-fallback" || configuration.MaxBudgetUSD != 0.5 || configuration.Effort != "medium" || configuration.Timeout != 8*time.Second {
+		t.Errorf("Claude configuration = %+v, want workspace values to override user values", configuration)
+	}
+
+	report, err := ResolveConfigurationReport(newConfigurationCommand(), workspace.Root)
+	if err != nil {
+		t.Fatalf("resolve layered Claude configuration: %v", err)
+	}
+	wantSources := ConfigurationSources{Enabled: "user", Path: "user", Model: "workspace", FallbackModel: "user", MaxBudgetUSD: "user", Effort: "user", Timeout: "workspace"}
+	if !reflect.DeepEqual(report.Sources, wantSources) {
+		t.Errorf("Claude configuration sources = %+v, want %+v", report.Sources, wantSources)
+	}
+}
+
 func TestResolveConfigurationUsesFlagPrecedence(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{".agent-wayfinder/config.json": `{"planning":{"claude":{"enabled":false,"path":"workspace-claude","model":"workspace-model","fallbackModel":"workspace-fallback","maxBudgetUsd":0.25,"effort":"low","timeout":"5s"}}}`})
 	t.Setenv("WAYFINDER_CLAUDE_ENABLED", "false")

@@ -274,6 +274,33 @@ func TestReadConfigurationReadsWorkspaceAndEnvironment(t *testing.T) {
 	}
 }
 
+func TestReadConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
+	user := testkit.NewWorkspace(t, map[string]string{})
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"planning":{"copilot":{"enabled":true,"model":"user-model","maxAiCredits":31,"tokenBudget":2048,"timeout":"7s"}}}`)
+	t.Setenv("HOME", user.Root)
+	t.Setenv("USERPROFILE", user.Root)
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agent-wayfinder/config.json": `{"planning":{"copilot":{"model":"workspace-model","timeout":"8s"}}}`,
+	})
+
+	configuration, err := ReadConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read layered Copilot configuration: %v", err)
+	}
+	if !configuration.Enabled || configuration.Model != "workspace-model" || configuration.MaxAICredits != 31 || configuration.TokenBudget != 2048 || configuration.Timeout != 8*time.Second {
+		t.Errorf("Copilot configuration = %+v, want workspace values to override user values", configuration)
+	}
+
+	report, err := ResolveConfiguration(newConfigurationCommand(), workspace.Root)
+	if err != nil {
+		t.Fatalf("resolve layered Copilot configuration: %v", err)
+	}
+	wantSources := ConfigurationSources{Enabled: "user", Model: "workspace", MaxAICredits: "user", TokenBudget: "user", Timeout: "workspace"}
+	if !reflect.DeepEqual(report.Sources, wantSources) {
+		t.Errorf("Copilot configuration sources = %+v, want %+v", report.Sources, wantSources)
+	}
+}
+
 func TestReadConfigurationUsesDisabledDefaultsAndIgnoresLegacyKey(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{"package.json": `{"name":"fixture"}`})
 	configuration, err := ReadConfiguration(workspace.Root)

@@ -121,6 +121,10 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 					nodes[node.ID] = node
 				}
 			}
+			exportedSurfaces, err := resolverPageExportedSurfaces(ctx, target, index, make(map[string]struct{}), nodes)
+			if err != nil {
+				return Resolution{}, err
+			}
 			relation, err := relationFor(reference.Kind)
 			if err != nil {
 				return Resolution{}, err
@@ -131,13 +135,17 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 			}
 			resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{SourceID: reference.SourceID, TargetID: targetFile.ID, Relation: relation, Evidence: evidence})
 			for _, binding := range reference.Bindings {
-				for _, surface := range matchingBindingSurfaces(target.ExportedSurfaces, reference.Kind, binding) {
+				matches := matchingBindingSurfaces(exportedSurfaces, reference.Kind, binding)
+				if len(matches) == 0 && binding.ImportedName != "*" {
+					resolution.diagnostics = append(resolution.diagnostics, extractor.Diagnostic{Severity: extractor.DiagnosticWarning, Message: fmt.Sprintf("JavaScript export %q from %q is not indexed", binding.ImportedName, reference.Target)})
+				}
+				for _, surface := range matches {
 					resolution.facts.Edges = append(resolution.facts.Edges, graph.Edge{SourceID: reference.SourceID, TargetID: surface.NodeID, Relation: relation, Evidence: evidence})
 				}
 			}
 		}
 		for _, reference := range byPath[sourcePath].SymbolReferences() {
-			targets, err := resolverPageSymbolTargets(ctx, sourcePath, reference.Target, projectID, index, byPath[sourcePath].UnresolvedReferences())
+			targets, err := resolverPageSymbolTargets(ctx, sourcePath, reference.Target, projectID, index, byPath[sourcePath].UnresolvedReferences(), nodes)
 			if err != nil {
 				return Resolution{}, err
 			}
@@ -169,7 +177,7 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 	return resolution, nil
 }
 
-func resolverPageSymbolTargets(ctx context.Context, sourcePath, name, projectID string, index extractor.ResolverIndex, references []extractor.UnresolvedReference) ([]string, error) {
+func resolverPageSymbolTargets(ctx context.Context, sourcePath, name, projectID string, index extractor.ResolverIndex, references []extractor.UnresolvedReference, nodes map[string]graph.Node) ([]string, error) {
 	targets := make([]string, 0)
 	for _, reference := range references {
 		if reference.Kind != extractor.ModuleReferenceImport {
@@ -182,6 +190,10 @@ func resolverPageSymbolTargets(ctx context.Context, sourcePath, name, projectID 
 		if !found {
 			continue
 		}
+		exportedSurfaces, err := resolverPageExportedSurfaces(ctx, target, index, make(map[string]struct{}), nodes)
+		if err != nil {
+			return nil, err
+		}
 		for _, binding := range reference.Bindings {
 			localName := binding.ImportedName
 			if binding.LocalName != "" {
@@ -190,7 +202,7 @@ func resolverPageSymbolTargets(ctx context.Context, sourcePath, name, projectID 
 			if localName != name {
 				continue
 			}
-			for _, surface := range matchingBindingSurfaces(target.ExportedSurfaces, reference.Kind, binding) {
+			for _, surface := range matchingBindingSurfaces(exportedSurfaces, reference.Kind, binding) {
 				targets = append(targets, surface.NodeID)
 			}
 		}
@@ -198,9 +210,50 @@ func resolverPageSymbolTargets(ctx context.Context, sourcePath, name, projectID 
 	return targets, nil
 }
 
+func resolverPageExportedSurfaces(ctx context.Context, target extractor.ResolverTarget, index extractor.ResolverIndex, visited map[string]struct{}, nodes map[string]graph.Node) ([]extractor.ExportedSurface, error) {
+	key := target.ProjectID + "\x00" + target.SourcePath
+	if _, found := visited[key]; found {
+		return nil, nil
+	}
+	visited[key] = struct{}{}
+	defer delete(visited, key)
+	for _, node := range target.Nodes {
+		if isResolverNodeKind(node.Kind) {
+			nodes[node.ID] = node
+		}
+	}
+	surfaces := append([]extractor.ExportedSurface(nil), target.ExportedSurfaces...)
+	for _, reference := range target.UnresolvedReferences {
+		if reference.Kind != extractor.ModuleReferenceReExport {
+			continue
+		}
+		reexport, found, err := resolverPageTarget(ctx, target.SourcePath, reference.Target, target.ProjectID, index)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		reexported, err := resolverPageExportedSurfaces(ctx, reexport, index, visited, nodes)
+		if err != nil {
+			return nil, err
+		}
+		for _, binding := range reference.Bindings {
+			for _, surface := range matchingBindingSurfaces(reexported, reference.Kind, binding) {
+				name := surface.Name
+				if binding.ExportedName != "" && binding.ExportedName != "*" {
+					name = binding.ExportedName
+				}
+				surfaces = append(surfaces, extractor.ExportedSurface{NodeID: surface.NodeID, Name: name})
+			}
+		}
+	}
+	return surfaces, nil
+}
+
 func resolverPageTarget(ctx context.Context, sourcePath, specifier, projectID string, index extractor.ResolverIndex) (extractor.ResolverTarget, bool, error) {
 	if !strings.HasPrefix(specifier, ".") {
-		return extractor.ResolverTarget{}, false, nil
+		return resolverPagePackageTarget(ctx, specifier, index)
 	}
 	base := path.Clean(path.Join(path.Dir(sourcePath), specifier))
 	for _, candidate := range resolverPathCandidates(base) {
@@ -213,6 +266,48 @@ func resolverPageTarget(ctx context.Context, sourcePath, specifier, projectID st
 		}
 	}
 	return extractor.ResolverTarget{}, false, nil
+}
+
+func resolverPagePackageTarget(ctx context.Context, specifier string, index extractor.ResolverIndex) (extractor.ResolverTarget, bool, error) {
+	packageName, subpath, found := splitPackageSpecifier(specifier)
+	if !found {
+		return extractor.ResolverTarget{}, false, nil
+	}
+	packageBase := path.Base(packageName)
+	projectID := "project:packages/" + packageBase
+	packagePath := path.Join("packages", packageBase, "src")
+	if subpath != "" {
+		packagePath = path.Join(packagePath, subpath)
+	}
+	for after := ""; ; {
+		targets, err := index.ResolverPackagePage(ctx, extractor.ResolverPackagePageRequest{
+			ProjectID:       projectID,
+			Language:        "javascript",
+			PackagePath:     packagePath,
+			AfterSourcePath: after,
+			Limit:           128,
+		})
+		if err != nil {
+			return extractor.ResolverTarget{}, false, fmt.Errorf("read JavaScript package %q: %w", specifier, err)
+		}
+		if len(targets) == 0 {
+			return extractor.ResolverTarget{}, false, nil
+		}
+		for _, target := range targets {
+			if packageTargetMatches(target.SourcePath, subpath) {
+				return target, true, nil
+			}
+			after = target.SourcePath
+		}
+	}
+}
+
+func packageTargetMatches(sourcePath, subpath string) bool {
+	base := strings.TrimSuffix(path.Base(sourcePath), path.Ext(sourcePath))
+	if subpath == "" {
+		return base == "index"
+	}
+	return base == strings.TrimSuffix(path.Base(subpath), path.Ext(subpath))
 }
 
 func resolverPathCandidates(base string) []string {

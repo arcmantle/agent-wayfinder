@@ -167,10 +167,11 @@ type ModuleBinding struct {
 }
 
 type SymbolReference struct {
-	SourceID string
-	Target   string
-	Relation graph.RelationKind
-	Evidence graph.FactEvidence
+	SourceID     string
+	Target       string
+	ReceiverType string
+	Relation     graph.RelationKind
+	Evidence     graph.FactEvidence
 }
 
 type ExportedSurface struct {

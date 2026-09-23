@@ -39,6 +39,24 @@ func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *te
 	}
 }
 
+func TestReadCatalogConfigurationMergesUserAndWorkspaceValues(t *testing.T) {
+	user := testkit.NewWorkspace(t, map[string]string{})
+	user.WriteFile(t, ".agent-wayfinder/config.json", `{"synopsis":{"provider":"copilot","sourceLimit":512},"copilot":{"enabled":true,"maxAiCredits":42,"processLimit":3,"path":"user-copilot"},"ollama":{"model":"user-model","endpoint":"http://localhost:11435"},"embeddingEnabled":true,"embeddingModel":"user-embedding","embeddingProcessLimit":1}`)
+	t.Setenv("HOME", user.Root)
+	t.Setenv("USERPROFILE", user.Root)
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agent-wayfinder/config.json": `{"synopsis":{"sourceLimit":1024},"copilot":{"path":"workspace-copilot"},"ollama":{"model":"workspace-model"},"embeddingModel":"workspace-embedding"}`,
+	})
+
+	configuration, err := readCatalogConfiguration(workspace.Root)
+	if err != nil {
+		t.Fatalf("read layered catalog configuration: %v", err)
+	}
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 1024 || !configuration.Copilot.Enabled || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "workspace-copilot" || configuration.Ollama.Model != "workspace-model" || configuration.Ollama.Endpoint != "http://localhost:11435" || !configuration.EmbeddingEnabled || configuration.EmbeddingModel != "workspace-embedding" || configuration.EmbeddingProcessLimit != 1 {
+		t.Errorf("catalog configuration = %+v, want workspace values to override user values", configuration)
+	}
+}
+
 func TestCatalogFlagsOverrideWorkspaceConfiguration(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
 		".agent-wayfinder/config.json": `{"synopsis":{"provider":"copilot","sourceLimit":512},"copilot":{"enabled":true,"maxAiCredits":42,"processLimit":2,"path":"workspace-copilot"}}`,

@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
 
 	"github.com/spf13/cobra"
 )
@@ -22,7 +23,6 @@ const (
 	DefaultTokenBudget = 4096
 	DefaultTimeout     = 30 * time.Second
 	maximumTimeout     = 30 * time.Second
-	configurationPath  = ".agent-wayfinder/config.json"
 )
 
 var modelPattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
@@ -126,26 +126,14 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 		TokenBudget:  DefaultTokenBudget,
 		Timeout:      DefaultTimeout,
 	}
-	fileConfiguration, err := readConfigurationFile(filepath.Join(workspaceRoot, configurationPath))
-	if err != nil {
-		return Configuration{}, err
-	}
-	if fileConfiguration.Enabled != nil {
-		configuration.Enabled = *fileConfiguration.Enabled
-	}
-	if fileConfiguration.Model != nil {
-		configuration.Model = *fileConfiguration.Model
-	}
-	if fileConfiguration.MaxAICredits != nil {
-		configuration.MaxAICredits = *fileConfiguration.MaxAICredits
-	}
-	if fileConfiguration.TokenBudget != nil {
-		configuration.TokenBudget = *fileConfiguration.TokenBudget
-	}
-	if len(fileConfiguration.Timeout) != 0 {
-		configuration.Timeout, err = parseJSONTimeout(fileConfiguration.Timeout)
+	paths := configpath.Paths(workspaceRoot)
+	for _, path := range paths {
+		fileConfiguration, err := readConfigurationFile(path)
 		if err != nil {
-			return Configuration{}, fmt.Errorf("invalid planning.copilot.timeout: %w", err)
+			return Configuration{}, err
+		}
+		if err := applyFileConfiguration(&configuration, fileConfiguration); err != nil {
+			return Configuration{}, err
 		}
 	}
 	if err := applyEnvironment(&configuration); err != nil {
@@ -159,24 +147,31 @@ func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 
 func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 	sources := ConfigurationSources{Enabled: "default", Model: "default", MaxAICredits: "default", TokenBudget: "default", Timeout: "default"}
-	configuration, err := readConfigurationFile(filepath.Join(workspaceRoot, configurationPath))
-	if err != nil {
-		return ConfigurationSources{}, err
-	}
-	if configuration.Enabled != nil {
-		sources.Enabled = "workspace"
-	}
-	if configuration.Model != nil {
-		sources.Model = "workspace"
-	}
-	if configuration.MaxAICredits != nil {
-		sources.MaxAICredits = "workspace"
-	}
-	if configuration.TokenBudget != nil {
-		sources.TokenBudget = "workspace"
-	}
-	if len(configuration.Timeout) > 0 {
-		sources.Timeout = "workspace"
+	paths := configpath.Paths(workspaceRoot)
+	for index, path := range paths {
+		configuration, err := readConfigurationFile(path)
+		if err != nil {
+			return ConfigurationSources{}, err
+		}
+		source := "user"
+		if index == len(paths)-1 {
+			source = "workspace"
+		}
+		if configuration.Enabled != nil {
+			sources.Enabled = source
+		}
+		if configuration.Model != nil {
+			sources.Model = source
+		}
+		if configuration.MaxAICredits != nil {
+			sources.MaxAICredits = source
+		}
+		if configuration.TokenBudget != nil {
+			sources.TokenBudget = source
+		}
+		if len(configuration.Timeout) > 0 {
+			sources.Timeout = source
+		}
 	}
 	for variable, apply := range map[string]func(){
 		"WAYFINDER_COPILOT_ENABLED":        func() { sources.Enabled = "environment" },
@@ -190,6 +185,29 @@ func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 		}
 	}
 	return sources, nil
+}
+
+func applyFileConfiguration(configuration *Configuration, file configurationFile) error {
+	if file.Enabled != nil {
+		configuration.Enabled = *file.Enabled
+	}
+	if file.Model != nil {
+		configuration.Model = *file.Model
+	}
+	if file.MaxAICredits != nil {
+		configuration.MaxAICredits = *file.MaxAICredits
+	}
+	if file.TokenBudget != nil {
+		configuration.TokenBudget = *file.TokenBudget
+	}
+	if len(file.Timeout) != 0 {
+		timeout, err := parseJSONTimeout(file.Timeout)
+		if err != nil {
+			return fmt.Errorf("invalid planning.copilot.timeout: %w", err)
+		}
+		configuration.Timeout = timeout
+	}
+	return nil
 }
 
 func readConfigurationFile(path string) (configurationFile, error) {

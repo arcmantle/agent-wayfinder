@@ -14,7 +14,6 @@ import (
 
 	"agent-wayfinder/extractor"
 	"agent-wayfinder/extractors/registry"
-	"agent-wayfinder/extractors/typescript"
 	"agent-wayfinder/graph"
 	"agent-wayfinder/storage"
 	"agent-wayfinder/storage/sqlite"
@@ -40,7 +39,7 @@ func TestIndexReturnsDeterministicConcurrentExtractionError(t *testing.T) {
 		".",
 		[]workspace.Source{{Path: "src/first.ts"}, {Path: "src/second.ts"}},
 		registered,
-		func(_ string, source workspace.Source, _ registry.Registry, _ *typescript.Worker) (extractedSource, error) {
+		func(_ string, source workspace.Source, _ registry.Registry, _ *extractionWorkers) (extractedSource, error) {
 			switch source.Path {
 			case "src/first.ts":
 				<-secondFinished
@@ -84,7 +83,7 @@ func TestIndexCallerCancellationTakesPrecedenceOverExtractionFailure(t *testing.
 		".",
 		[]workspace.Source{{Path: "src/first.ts"}, {Path: "src/second.ts"}},
 		registered,
-		func(_ string, source workspace.Source, _ registry.Registry, _ *typescript.Worker) (extractedSource, error) {
+		func(_ string, source workspace.Source, _ registry.Registry, _ *extractionWorkers) (extractedSource, error) {
 			startOnce.Do(func() {
 				close(started)
 				cancel()
@@ -117,7 +116,7 @@ func TestIndexExtractionFailureTakesPrecedenceOverContributionWriteFailure(t *te
 		".",
 		[]workspace.Source{{Path: "src/first.ts"}, {Path: "src/second.ts"}},
 		registered,
-		func(_ string, source workspace.Source, registered registry.Registry, _ *typescript.Worker) (extractedSource, error) {
+		func(_ string, source workspace.Source, registered registry.Registry, _ *extractionWorkers) (extractedSource, error) {
 			if source.Path == "src/first.ts" {
 				<-writeReady
 				return extractedSource{}, fmt.Errorf("extract source %q: %w", source.Path, extractionFailure)
@@ -250,18 +249,18 @@ func TestIndexWorkerInitializationFailureTakesPrecedenceOverExtractionFailure(t 
 		".",
 		[]workspace.Source{{Path: "src/first.ts"}, {Path: "src/second.ts"}},
 		registered,
-		func(_ string, source workspace.Source, _ registry.Registry, _ *typescript.Worker) (extractedSource, error) {
+		func(_ string, source workspace.Source, _ registry.Registry, _ *extractionWorkers) (extractedSource, error) {
 			close(extractionStarted)
 			<-workerInitializationFailed
 			return extractedSource{}, fmt.Errorf("extract source %q: %w", source.Path, extractionFailure)
 		},
-		func() (*typescript.Worker, error) {
+		func() (*extractionWorkers, error) {
 			factoryMutex.Lock()
 			factoryCalls++
 			call := factoryCalls
 			factoryMutex.Unlock()
 			if call == 1 {
-				return typescript.NewWorker()
+				return newExtractionWorkers()
 			}
 			<-extractionStarted
 			close(workerInitializationFailed)

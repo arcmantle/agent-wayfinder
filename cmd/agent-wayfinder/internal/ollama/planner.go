@@ -8,16 +8,15 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
 )
 
 const defaultEndpoint = "http://127.0.0.1:11434"
-
-const configurationPath = ".agent-wayfinder/config.json"
 
 const (
 	PlannerContextTokens    = 512
@@ -42,49 +41,60 @@ var modelPattern = regexp.MustCompile(`^[A-Za-z0-9._:/-]+$`)
 
 func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 	configuration := Configuration{Model: "qwen3:8b", Timeout: 30 * time.Second}
-	contents, err := os.ReadFile(filepath.Join(workspaceRoot, configurationPath))
-	if os.IsNotExist(err) {
-		return configuration, nil
-	}
-	if err != nil {
-		return Configuration{}, fmt.Errorf("read Ollama planner configuration: %w", err)
-	}
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(contents, &root); err != nil {
-		return Configuration{}, fmt.Errorf("parse Ollama planner configuration: %w", err)
-	}
-	planningContents, exists := root["planning"]
-	if !exists {
-		return configuration, nil
-	}
-	var planning map[string]json.RawMessage
-	if err := json.Unmarshal(planningContents, &planning); err != nil {
-		return Configuration{}, fmt.Errorf("parse Ollama planner configuration: %w", err)
-	}
-	plannerContents, exists := planning["ollama"]
-	if !exists {
-		return configuration, nil
-	}
-	decoder := json.NewDecoder(bytes.NewReader(plannerContents))
-	decoder.DisallowUnknownFields()
-	var fileConfiguration configurationFile
-	if err := decoder.Decode(&fileConfiguration); err != nil {
-		return Configuration{}, fmt.Errorf("parse Ollama planner configuration: %w", err)
-	}
-	if fileConfiguration.Enabled != nil {
-		configuration.Enabled = *fileConfiguration.Enabled
-	}
-	if fileConfiguration.Model != nil {
-		configuration.Model = *fileConfiguration.Model
-	}
-	if len(fileConfiguration.Timeout) > 0 {
-		configuration.Timeout, err = parseJSONTimeout(fileConfiguration.Timeout)
+	paths := configpath.Paths(workspaceRoot)
+	for _, path := range paths {
+		fileConfiguration, err := readConfigurationFile(path)
 		if err != nil {
-			return Configuration{}, fmt.Errorf("invalid planning.ollama.timeout: %w", err)
+			return Configuration{}, err
+		}
+		if fileConfiguration.Enabled != nil {
+			configuration.Enabled = *fileConfiguration.Enabled
+		}
+		if fileConfiguration.Model != nil {
+			configuration.Model = *fileConfiguration.Model
+		}
+		if len(fileConfiguration.Timeout) > 0 {
+			configuration.Timeout, err = parseJSONTimeout(fileConfiguration.Timeout)
+			if err != nil {
+				return Configuration{}, fmt.Errorf("invalid planning.ollama.timeout: %w", err)
+			}
 		}
 	}
 	if err := validateConfiguration(configuration); err != nil {
 		return Configuration{}, err
+	}
+	return configuration, nil
+}
+
+func readConfigurationFile(path string) (configurationFile, error) {
+	contents, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return configurationFile{}, nil
+	}
+	if err != nil {
+		return configurationFile{}, fmt.Errorf("read Ollama planner configuration: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &root); err != nil {
+		return configurationFile{}, fmt.Errorf("parse Ollama planner configuration: %w", err)
+	}
+	planningContents, exists := root["planning"]
+	if !exists {
+		return configurationFile{}, nil
+	}
+	var planning map[string]json.RawMessage
+	if err := json.Unmarshal(planningContents, &planning); err != nil {
+		return configurationFile{}, fmt.Errorf("parse Ollama planner configuration: %w", err)
+	}
+	plannerContents, exists := planning["ollama"]
+	if !exists {
+		return configurationFile{}, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(plannerContents))
+	decoder.DisallowUnknownFields()
+	var configuration configurationFile
+	if err := decoder.Decode(&configuration); err != nil {
+		return configurationFile{}, fmt.Errorf("parse Ollama planner configuration: %w", err)
 	}
 	return configuration, nil
 }

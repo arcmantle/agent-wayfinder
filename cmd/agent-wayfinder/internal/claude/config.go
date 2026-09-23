@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
 
 	"github.com/spf13/cobra"
 )
@@ -18,7 +19,6 @@ import (
 const (
 	DefaultPlannerPath  = "claude"
 	DefaultPlannerModel = "sonnet"
-	configurationPath   = ".agent-wayfinder/config.json"
 	maximumTimeout      = 30 * time.Second
 )
 
@@ -65,15 +65,18 @@ type ConfigurationSources struct {
 
 func ReadConfiguration(workspaceRoot string) (Configuration, error) {
 	configuration := Configuration{Path: DefaultPlannerPath, Model: DefaultPlannerModel, Timeout: maximumTimeout}
-	fileConfiguration, err := readConfigurationFile(filepath.Join(workspaceRoot, configurationPath))
-	if err != nil {
-		return Configuration{}, err
-	}
-	applyFileConfiguration(&configuration, fileConfiguration)
-	if len(fileConfiguration.Timeout) != 0 {
-		configuration.Timeout, err = parseJSONTimeout(fileConfiguration.Timeout)
+	paths := configpath.Paths(workspaceRoot)
+	for _, path := range paths {
+		fileConfiguration, err := readConfigurationFile(path)
 		if err != nil {
-			return Configuration{}, fmt.Errorf("invalid planning.claude.timeout: %w", err)
+			return Configuration{}, err
+		}
+		applyFileConfiguration(&configuration, fileConfiguration)
+		if len(fileConfiguration.Timeout) != 0 {
+			configuration.Timeout, err = parseJSONTimeout(fileConfiguration.Timeout)
+			if err != nil {
+				return Configuration{}, fmt.Errorf("invalid planning.claude.timeout: %w", err)
+			}
 		}
 	}
 	if err := applyEnvironment(&configuration); err != nil {
@@ -167,30 +170,37 @@ func applyFileConfiguration(configuration *Configuration, file configurationFile
 
 func configurationSources(workspaceRoot string) (ConfigurationSources, error) {
 	sources := ConfigurationSources{Enabled: "default", Path: "default", Model: "default", FallbackModel: "default", MaxBudgetUSD: "default", Effort: "default", Timeout: "default"}
-	configuration, err := readConfigurationFile(filepath.Join(workspaceRoot, configurationPath))
-	if err != nil {
-		return ConfigurationSources{}, err
-	}
-	if configuration.Enabled != nil {
-		sources.Enabled = "workspace"
-	}
-	if configuration.Path != nil {
-		sources.Path = "workspace"
-	}
-	if configuration.Model != nil {
-		sources.Model = "workspace"
-	}
-	if configuration.FallbackModel != nil {
-		sources.FallbackModel = "workspace"
-	}
-	if configuration.MaxBudgetUSD != nil {
-		sources.MaxBudgetUSD = "workspace"
-	}
-	if configuration.Effort != nil {
-		sources.Effort = "workspace"
-	}
-	if len(configuration.Timeout) > 0 {
-		sources.Timeout = "workspace"
+	paths := configpath.Paths(workspaceRoot)
+	for index, path := range paths {
+		configuration, err := readConfigurationFile(path)
+		if err != nil {
+			return ConfigurationSources{}, err
+		}
+		source := "user"
+		if index == len(paths)-1 {
+			source = "workspace"
+		}
+		if configuration.Enabled != nil {
+			sources.Enabled = source
+		}
+		if configuration.Path != nil {
+			sources.Path = source
+		}
+		if configuration.Model != nil {
+			sources.Model = source
+		}
+		if configuration.FallbackModel != nil {
+			sources.FallbackModel = source
+		}
+		if configuration.MaxBudgetUSD != nil {
+			sources.MaxBudgetUSD = source
+		}
+		if configuration.Effort != nil {
+			sources.Effort = source
+		}
+		if len(configuration.Timeout) > 0 {
+			sources.Timeout = source
+		}
 	}
 	for variable, apply := range map[string]func(){
 		"WAYFINDER_CLAUDE_ENABLED":        func() { sources.Enabled = "environment" },

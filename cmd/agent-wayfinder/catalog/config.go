@@ -6,18 +6,16 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
+	configpath "agent-wayfinder/cmd/agent-wayfinder/internal/configuration"
 	"agent-wayfinder/cmd/agent-wayfinder/internal/copilot"
 	"agent-wayfinder/extractor"
 	"agent-wayfinder/index"
 
 	"github.com/spf13/cobra"
 )
-
-const catalogConfigurationFile = ".agent-wayfinder/config.json"
 
 type catalogConfiguration struct {
 	Copilot               catalogCopilotConfiguration
@@ -47,6 +45,7 @@ type catalogSynopsisConfiguration struct {
 
 type catalogConfigurationFileContents struct {
 	Planning              json.RawMessage                           `json:"planning"`
+	Sources               json.RawMessage                           `json:"sources"`
 	Synopsis              *catalogSynopsisConfigurationFileContents `json:"synopsis"`
 	Copilot               *catalogCopilotConfigurationFileContents  `json:"copilot"`
 	Ollama                *catalogOllamaConfigurationFileContents   `json:"ollama"`
@@ -80,20 +79,50 @@ func readCatalogConfiguration(workspaceRoot string) (catalogConfiguration, error
 		EmbeddingModel:        index.DefaultOllamaCatalogEmbeddingModel,
 		EmbeddingProcessLimit: index.MaximumEmbeddingProcessLimit,
 	}
-	contents, err := os.ReadFile(filepath.Join(workspaceRoot, catalogConfigurationFile))
+	paths := configpath.Paths(workspaceRoot)
+	for _, path := range paths {
+		fileConfiguration, err := readCatalogConfigurationFile(path)
+		if err != nil {
+			return catalogConfiguration{}, err
+		}
+		applyCatalogConfiguration(&configuration, fileConfiguration)
+	}
+	if configuration.Copilot.ProcessLimit <= 0 {
+		return catalogConfiguration{}, fmt.Errorf("invalid catalog Copilot process limit: use a positive integer")
+	}
+	if configuration.Copilot.MaxAICredits < copilot.MinimumAICredits {
+		return catalogConfiguration{}, fmt.Errorf("invalid catalog Copilot max AI credits: use an integer of at least %d", copilot.MinimumAICredits)
+	}
+	if err := validateCatalogSynopsisConfiguration(configuration.Synopsis); err != nil {
+		return catalogConfiguration{}, err
+	}
+	if err := validateCatalogOllamaConfiguration(configuration.Ollama); err != nil {
+		return catalogConfiguration{}, err
+	}
+	if configuration.EmbeddingProcessLimit <= 0 || configuration.EmbeddingProcessLimit > index.MaximumEmbeddingProcessLimit {
+		return catalogConfiguration{}, fmt.Errorf("invalid catalog embedding process limit: use an integer from 1 through %d", index.MaximumEmbeddingProcessLimit)
+	}
+	return configuration, nil
+}
+
+func readCatalogConfigurationFile(path string) (catalogConfigurationFileContents, error) {
+	contents, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return configuration, nil
+		return catalogConfigurationFileContents{}, nil
 	}
 	if err != nil {
-		return catalogConfiguration{}, fmt.Errorf("read catalog configuration: %w", err)
+		return catalogConfigurationFileContents{}, fmt.Errorf("read catalog configuration: %w", err)
 	}
-
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.DisallowUnknownFields()
-	var fileConfiguration catalogConfigurationFileContents
-	if err := decoder.Decode(&fileConfiguration); err != nil {
-		return catalogConfiguration{}, fmt.Errorf("parse catalog configuration: %w", err)
+	var configuration catalogConfigurationFileContents
+	if err := decoder.Decode(&configuration); err != nil {
+		return catalogConfigurationFileContents{}, fmt.Errorf("parse catalog configuration: %w", err)
 	}
+	return configuration, nil
+}
+
+func applyCatalogConfiguration(configuration *catalogConfiguration, fileConfiguration catalogConfigurationFileContents) {
 	if fileConfiguration.Synopsis != nil {
 		if fileConfiguration.Synopsis.Provider != nil {
 			configuration.Synopsis.Provider = index.CatalogSynopsisProvider(*fileConfiguration.Synopsis.Provider)
@@ -133,22 +162,6 @@ func readCatalogConfiguration(workspaceRoot string) (catalogConfiguration, error
 	if fileConfiguration.EmbeddingProcessLimit != nil {
 		configuration.EmbeddingProcessLimit = *fileConfiguration.EmbeddingProcessLimit
 	}
-	if configuration.Copilot.ProcessLimit <= 0 {
-		return catalogConfiguration{}, fmt.Errorf("invalid catalog Copilot process limit: use a positive integer")
-	}
-	if configuration.Copilot.MaxAICredits < copilot.MinimumAICredits {
-		return catalogConfiguration{}, fmt.Errorf("invalid catalog Copilot max AI credits: use an integer of at least %d", copilot.MinimumAICredits)
-	}
-	if err := validateCatalogSynopsisConfiguration(configuration.Synopsis); err != nil {
-		return catalogConfiguration{}, err
-	}
-	if err := validateCatalogOllamaConfiguration(configuration.Ollama); err != nil {
-		return catalogConfiguration{}, err
-	}
-	if configuration.EmbeddingProcessLimit <= 0 || configuration.EmbeddingProcessLimit > index.MaximumEmbeddingProcessLimit {
-		return catalogConfiguration{}, fmt.Errorf("invalid catalog embedding process limit: use an integer from 1 through %d", index.MaximumEmbeddingProcessLimit)
-	}
-	return configuration, nil
 }
 
 func ConfigureFlags(command *cobra.Command) {
