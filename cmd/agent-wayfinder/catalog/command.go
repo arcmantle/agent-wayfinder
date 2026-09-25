@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -22,38 +23,63 @@ import (
 
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func New(standardOutput, standardError io.Writer, exitCode *int) *cobra.Command {
-	return cmd.NewLeaf("catalog WORKSPACE", "Build the capability catalog for a published graph", configureCommand, runCatalog, standardOutput, standardError, exitCode)
+	return cmd.NewLeaf("catalog [WORKSPACE]", "Build the capability catalog for a published graph", configureCommand, runCatalog, standardOutput, standardError, exitCode)
 }
 
 func NewStatus(standardOutput, standardError io.Writer, exitCode *int) *cobra.Command {
-	return cmd.NewLeaf("catalog-status WORKSPACE", "Show later catalog pass status", cmd.DatabaseAndFormatFlags, runCatalogStatus, standardOutput, standardError, exitCode)
+	return cmd.NewLeaf("catalog-status [WORKSPACE]", "Show latest catalog pass status", cmd.DatabaseAndFormatFlags, runCatalogStatus, standardOutput, standardError, exitCode)
+}
+
+func NewStop(standardOutput, standardError io.Writer, exitCode *int) *cobra.Command {
+	return cmd.NewLeaf("catalog-stop [WORKSPACE]", "Stop a running catalog pass", cmd.DatabaseAndFormatFlags, runCatalogStop, standardOutput, standardError, exitCode)
 }
 
 func configureCommand(command *cobra.Command) {
 	cmd.DatabaseAndFormatFlags(command)
 	ConfigureFlags(command)
+	command.Flags().Bool("foreground", false, "run cataloging in this terminal")
+	command.Flags().Bool("catalog-worker", false, "run the detached catalog worker")
+	_ = command.Flags().MarkHidden("catalog-worker")
 }
 
 type ProcessRequest struct {
 	Executable string
 	Database   string
 	Workspace  string
+	Arguments  []string
 }
 
 func StartProcess(request ProcessRequest) error {
 	if strings.HasSuffix(filepath.Base(request.Executable), ".test") {
 		return nil
 	}
-	command := exec.Command(request.Executable, "catalog", "--database", request.Database, request.Workspace)
+	errorLog, err := os.OpenFile(catalogErrorLogPath(request.Database), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open catalog process error log: %w", err)
+	}
+	defer errorLog.Close()
+	arguments := []string{"catalog", "--foreground", "--catalog-worker", "--database", request.Database}
+	arguments = append(arguments, request.Arguments...)
+	arguments = append(arguments, request.Workspace)
+	command := exec.Command(request.Executable, arguments...)
 	command.Stdout = io.Discard
-	command.Stderr = io.Discard
+	command.Stderr = errorLog
+	configureBackgroundProcess(command)
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start catalog process: %w", err)
 	}
+	if err := command.Process.Release(); err != nil {
+		return fmt.Errorf("release catalog process: %w", err)
+	}
 	return nil
+}
+
+func catalogErrorLogPath(database string) string {
+	return database + ".catalog.err"
 }
 
 type RefreshRequest struct {
@@ -70,6 +96,10 @@ const (
 )
 
 var runCatalogRefresh = refreshCatalog
+
+var startDetachedCatalogProcess = StartProcess
+
+var terminateDetachedCatalogProcess = terminateCatalogProcess
 
 var catalogRefreshes = refreshCoordinator{tails: make(map[string]*refreshEntry)}
 
@@ -129,6 +159,7 @@ func refreshCatalog(ctx context.Context, request RefreshRequest) error {
 		Workspace:    request.Workspace,
 		GraphVersion: snapshot.Version,
 		State:        storage.CatalogTaskRunning,
+		ProcessID:    os.Getpid(),
 		StartedAt:    time.Now().UTC(),
 		ChangedPaths: append([]string(nil), request.ChangedPaths...),
 	}
@@ -163,6 +194,7 @@ func refreshCatalog(ctx context.Context, request RefreshRequest) error {
 		Progress: func(progress index.CatalogProgress) {
 			task.CompletedUnits = progress.CompletedUnits
 			task.TotalUnits = progress.TotalUnits
+			task.Stage = progress.Stage
 			_ = store.WriteCatalogTask(ctx, task)
 		},
 	})
@@ -180,14 +212,15 @@ func refreshCatalog(ctx context.Context, request RefreshRequest) error {
 }
 
 func runCatalog(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
-	if len(arguments) != 1 {
-		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("catalog requires one workspace path"))
+	workspace, err := catalogWorkspaceArgument("catalog", arguments)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
 	}
 	format, err := cmd.Format(command)
 	if err != nil {
 		return cmd.WriteError(standardError, err)
 	}
-	workspaceRoot, err := filepath.Abs(arguments[0])
+	workspaceRoot, err := filepath.Abs(workspace)
 	if err != nil {
 		return cmd.WriteError(standardError, fmt.Errorf("resolve catalog workspace path: %w", err))
 	}
@@ -199,7 +232,12 @@ func runCatalog(command *cobra.Command, arguments []string, standardOutput, stan
 	if err != nil {
 		return cmd.WriteError(standardError, fmt.Errorf("open catalog database: %w", err))
 	}
-	defer store.Close()
+	storeClosed := false
+	defer func() {
+		if !storeClosed {
+			_ = store.Close()
+		}
+	}()
 	snapshot, err := store.OpenSnapshot(context.Background(), storage.OpenSnapshotRequest{Workspace: workspaceRoot})
 	if errors.Is(err, storage.ErrWorkspaceNotFound) {
 		return cmd.WriteError(standardError, cli.NewIndexUnavailableError(workspaceRoot))
@@ -207,7 +245,64 @@ func runCatalog(command *cobra.Command, arguments []string, standardOutput, stan
 	if err != nil {
 		return cmd.WriteError(standardError, err)
 	}
-	task := storage.CatalogTask{Workspace: workspaceRoot, GraphVersion: snapshot.Version, State: storage.CatalogTaskRunning, StartedAt: time.Now().UTC()}
+	foreground, err := command.Flags().GetBool("foreground")
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	worker, err := command.Flags().GetBool("catalog-worker")
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	if !worker {
+		existingTask, found, err := store.ReadCatalogTask(context.Background(), workspaceRoot)
+		if err != nil {
+			return cmd.WriteError(standardError, err)
+		}
+		if found && (existingTask.State == storage.CatalogTaskQueued || existingTask.State == storage.CatalogTaskRunning) {
+			return cmd.WriteError(standardError, fmt.Errorf("catalog already %s for %s: use catalog-status or catalog-stop", existingTask.State, workspaceRoot))
+		}
+	}
+	if !foreground {
+		task := storage.CatalogTask{Workspace: workspaceRoot, GraphVersion: snapshot.Version, State: storage.CatalogTaskQueued, StartedAt: time.Now().UTC()}
+		if err := store.WriteCatalogTask(context.Background(), task); err != nil {
+			return cmd.WriteError(standardError, err)
+		}
+		if err := store.Close(); err != nil {
+			return cmd.WriteError(standardError, fmt.Errorf("close catalog launcher database: %w", err))
+		}
+		storeClosed = true
+		executable, err := os.Executable()
+		if err != nil {
+			return cmd.WriteError(standardError, fmt.Errorf("resolve catalog executable: %w", err))
+		}
+		if err := startDetachedCatalogProcess(ProcessRequest{Executable: executable, Database: database, Workspace: workspaceRoot, Arguments: detachedCatalogArguments(command)}); err != nil {
+			task.State = storage.CatalogTaskFailed
+			task.FinishedAt = time.Now().UTC()
+			task.Failure = err.Error()
+			failureStore, openError := sqlite.Open(context.Background(), database)
+			if openError != nil {
+				return cmd.WriteError(standardError, fmt.Errorf("%w; record catalog startup failure: %v", err, openError))
+			}
+			writeError := failureStore.WriteCatalogTask(context.Background(), task)
+			closeError := failureStore.Close()
+			if writeError != nil {
+				return cmd.WriteError(standardError, fmt.Errorf("%w; record catalog startup failure: %v", err, writeError))
+			}
+			if closeError != nil {
+				return cmd.WriteError(standardError, fmt.Errorf("%w; close catalog startup-failure database: %v", err, closeError))
+			}
+			return cmd.WriteError(standardError, err)
+		}
+		data := struct {
+			Workspace string `json:"workspace"`
+			State     string `json:"state"`
+		}{Workspace: workspaceRoot, State: string(storage.CatalogTaskQueued)}
+		if err := cli.Render(standardOutput, cli.Result{OmitSnapshot: true, Text: fmt.Sprintf("Catalog started in background: %s", workspaceRoot), Data: data}, format); err != nil {
+			return cmd.WriteError(standardError, err)
+		}
+		return 0
+	}
+	task := storage.CatalogTask{Workspace: workspaceRoot, GraphVersion: snapshot.Version, State: storage.CatalogTaskRunning, ProcessID: os.Getpid(), StartedAt: time.Now().UTC()}
 	if err := store.WriteCatalogTask(context.Background(), task); err != nil {
 		return cmd.WriteError(standardError, err)
 	}
@@ -233,6 +328,7 @@ func runCatalog(command *cobra.Command, arguments []string, standardOutput, stan
 		Progress: func(progress index.CatalogProgress) {
 			task.CompletedUnits = progress.CompletedUnits
 			task.TotalUnits = progress.TotalUnits
+			task.Stage = progress.Stage
 			_ = store.WriteCatalogTask(context.Background(), task)
 			_, _ = fmt.Fprintf(standardError, "Catalog progress: %d/%d\n", progress.CompletedUnits, progress.TotalUnits)
 		},
@@ -278,6 +374,16 @@ func runCatalog(command *cobra.Command, arguments []string, standardOutput, stan
 	return 0
 }
 
+func detachedCatalogArguments(command *cobra.Command) []string {
+	arguments := make([]string, 0)
+	command.Flags().Visit(func(flag *pflag.Flag) {
+		if strings.HasPrefix(flag.Name, "catalog-") {
+			arguments = append(arguments, "--"+flag.Name+"="+flag.Value.String())
+		}
+	})
+	return arguments
+}
+
 func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot string, store storage.SpendReservationStore) (index.CatalogWriteOptions, error) {
 	embeddingGenerator, err := newCatalogEmbeddingGenerator(configuration, nil)
 	if err != nil {
@@ -310,6 +416,7 @@ func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot strin
 		options.SynopsisProcessLimit = configuration.Copilot.ProcessLimit
 	case index.CatalogSynopsisProviderOllama:
 		options.SynopsisGenerator = ollama.NewCatalogSynopsisGenerator(ollama.CatalogSynopsisConfiguration{Model: configuration.Ollama.Model, Timeout: configuration.Ollama.Timeout}, configuration.Ollama.Endpoint, nil)
+		options.SynopsisProcessLimit = configuration.Synopsis.OllamaProcessLimit
 	case index.CatalogSynopsisProviderClaude:
 		spendingConfiguration, err := spending.ReadConfiguration(workspaceRoot)
 		if err != nil {
@@ -321,6 +428,7 @@ func catalogWriteOptions(configuration catalogConfiguration, workspaceRoot strin
 			store:               store,
 			claudeConfiguration: configuration.Claude,
 		}
+		options.SynopsisProcessLimit = 1
 	default:
 		return index.CatalogWriteOptions{}, fmt.Errorf("invalid catalog synopsis provider %q", configuration.Synopsis.Provider)
 	}
@@ -331,6 +439,9 @@ type catalogStatusData struct {
 	Workspace      string               `json:"workspace"`
 	State          string               `json:"state"`
 	GraphVersion   storage.GraphVersion `json:"graphVersion"`
+	ProcessID      int                  `json:"processId,omitempty"`
+	Processing     string               `json:"processing,omitempty"`
+	Usage          *catalogProcessUsage `json:"usage,omitempty"`
 	StartedAt      time.Time            `json:"startedAt"`
 	Elapsed        time.Duration        `json:"elapsed"`
 	CompletedUnits int                  `json:"completedUnits"`
@@ -340,14 +451,15 @@ type catalogStatusData struct {
 }
 
 func runCatalogStatus(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
-	if len(arguments) != 1 {
-		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("catalog-status requires one workspace path"))
+	workspace, err := catalogWorkspaceArgument("catalog-status", arguments)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
 	}
 	format, err := cmd.Format(command)
 	if err != nil {
 		return cmd.WriteError(standardError, err)
 	}
-	workspaceRoot, err := filepath.Abs(arguments[0])
+	workspaceRoot, err := filepath.Abs(workspace)
 	if err != nil {
 		return cmd.WriteError(standardError, fmt.Errorf("resolve catalog status workspace path: %w", err))
 	}
@@ -371,12 +483,90 @@ func runCatalogStatus(command *cobra.Command, arguments []string, standardOutput
 		}
 		return 0
 	}
+	if task.State == storage.CatalogTaskRunning && task.ProcessID == 0 {
+		task.State = storage.CatalogTaskInterrupted
+		task.ProcessID = 0
+		task.FinishedAt = time.Now().UTC()
+		task.Failure = "catalog process was interrupted before process monitoring was available"
+		if err := store.WriteCatalogTask(context.Background(), task); err != nil {
+			return cmd.WriteError(standardError, err)
+		}
+	}
 	endedAt := time.Now().UTC()
 	if !task.FinishedAt.IsZero() {
 		endedAt = task.FinishedAt
 	}
-	data := catalogStatusData{Workspace: task.Workspace, State: string(task.State), GraphVersion: task.GraphVersion, StartedAt: task.StartedAt, Elapsed: endedAt.Sub(task.StartedAt), CompletedUnits: task.CompletedUnits, TotalUnits: task.TotalUnits, ChangedPaths: task.ChangedPaths, Failure: task.Failure}
+	failure := task.Failure
+	state := string(task.State)
+	if task.State == storage.CatalogTaskQueued && failure == "" {
+		if processFailure, err := os.ReadFile(catalogErrorLogPath(database)); err == nil && strings.TrimSpace(string(processFailure)) != "" {
+			state = string(storage.CatalogTaskFailed)
+			failure = strings.TrimSpace(string(processFailure))
+		}
+	}
+	data := catalogStatusData{Workspace: task.Workspace, State: state, GraphVersion: task.GraphVersion, ProcessID: task.ProcessID, StartedAt: task.StartedAt, Elapsed: endedAt.Sub(task.StartedAt), CompletedUnits: task.CompletedUnits, TotalUnits: task.TotalUnits, ChangedPaths: task.ChangedPaths, Failure: failure}
+	if task.State == storage.CatalogTaskRunning {
+		data.Processing = task.Stage
+		if data.Processing == "" {
+			data.Processing = formatCatalogProcessing(task.CompletedUnits, task.TotalUnits)
+		}
+		data.Usage = readCatalogProcessUsage(task.ProcessID)
+	}
 	if err := cli.Render(standardOutput, cli.Result{OmitSnapshot: true, Text: formatCatalogStatusText(data), Data: data}, format); err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	return 0
+}
+
+func runCatalogStop(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
+	workspace, err := catalogWorkspaceArgument("catalog-stop", arguments)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	format, err := cmd.Format(command)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	workspaceRoot, err := filepath.Abs(workspace)
+	if err != nil {
+		return cmd.WriteError(standardError, fmt.Errorf("resolve catalog stop workspace path: %w", err))
+	}
+	database, err := cmd.DatabasePathForCommand(command, workspaceRoot)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	store, err := sqlite.Open(context.Background(), database)
+	if err != nil {
+		return cmd.WriteError(standardError, fmt.Errorf("open catalog stop database: %w", err))
+	}
+	defer store.Close()
+	task, found, err := store.ReadCatalogTask(context.Background(), workspaceRoot)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	if !found || task.State != storage.CatalogTaskRunning {
+		return cmd.WriteError(standardError, fmt.Errorf("catalog stop: no running catalog pass for %s", workspaceRoot))
+	}
+	stopped, err := terminateDetachedCatalogProcess(task.ProcessID, workspaceRoot)
+	if err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	task.State = storage.CatalogTaskInterrupted
+	task.FinishedAt = time.Now().UTC()
+	task.ProcessID = 0
+	if stopped {
+		task.Failure = "catalog process stopped"
+	} else {
+		task.Failure = "catalog process was not running"
+	}
+	if err := store.WriteCatalogTask(context.Background(), task); err != nil {
+		return cmd.WriteError(standardError, err)
+	}
+	data := struct {
+		Workspace string `json:"workspace"`
+		State     string `json:"state"`
+	}{Workspace: workspaceRoot, State: string(storage.CatalogTaskInterrupted)}
+	if err := cli.Render(standardOutput, cli.Result{OmitSnapshot: true, Text: fmt.Sprintf("Catalog stopped: %s", workspaceRoot), Data: data}, format); err != nil {
 		return cmd.WriteError(standardError, err)
 	}
 	return 0
@@ -395,6 +585,19 @@ func formatCatalogStatusText(data catalogStatusData) string {
 	status.AppendRow(table.Row{"Started", data.StartedAt.UTC().Format(time.RFC3339)})
 	status.AppendRow(table.Row{"Elapsed", data.Elapsed.Round(time.Millisecond)})
 	status.AppendRow(table.Row{"Progress", fmt.Sprintf("%d/%d catalog units", data.CompletedUnits, data.TotalUnits)})
+	if data.ProcessID > 0 {
+		status.AppendRow(table.Row{"Process", fmt.Sprintf("PID %d", data.ProcessID)})
+	}
+	if data.Processing != "" {
+		status.AppendRow(table.Row{"Processing", data.Processing})
+	}
+	if data.Usage != nil {
+		status.AppendRow(table.Row{"Catalog client CPU", fmt.Sprintf("%.1f%%", data.Usage.CPUPercent)})
+		status.AppendRow(table.Row{"Catalog client memory", formatCatalogMemory(data.Usage.ResidentMemoryBytes)})
+	} else if data.State == string(storage.CatalogTaskRunning) && data.ProcessID > 0 {
+		status.AppendRow(table.Row{"Catalog client CPU", "unavailable"})
+		status.AppendRow(table.Row{"Catalog client memory", "unavailable"})
+	}
 	if len(data.ChangedPaths) == 0 {
 		status.AppendRow(table.Row{"Scope", "full workspace"})
 	} else {
@@ -406,6 +609,31 @@ func formatCatalogStatusText(data catalogStatusData) string {
 	return fmt.Sprintf("Capability Catalog Status\n\n%s", status.Render())
 }
 
+func formatCatalogMemory(bytes uint64) string {
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/(1024*1024))
+}
+
+func catalogWorkspaceArgument(commandName string, arguments []string) (string, error) {
+	switch len(arguments) {
+	case 0:
+		return ".", nil
+	case 1:
+		return arguments[0], nil
+	default:
+		return "", cli.NewInvalidArgumentError(fmt.Sprintf("%s accepts at most one workspace path", commandName))
+	}
+}
+
+func formatCatalogProcessing(completedUnits, totalUnits int) string {
+	if totalUnits == 0 {
+		return "preparing catalog units"
+	}
+	if completedUnits >= totalUnits {
+		return "catalog units complete"
+	}
+	return fmt.Sprintf("catalog unit %d of %d", completedUnits+1, totalUnits)
+}
+
 func displayCatalogTaskState(state string) string {
 	switch state {
 	case "not_started":
@@ -414,6 +642,8 @@ func displayCatalogTaskState(state string) string {
 		return "Queued"
 	case string(storage.CatalogTaskRunning):
 		return "Running"
+	case string(storage.CatalogTaskInterrupted):
+		return "Interrupted"
 	case string(storage.CatalogTaskComplete):
 		return "Complete"
 	case string(storage.CatalogTaskFailed):

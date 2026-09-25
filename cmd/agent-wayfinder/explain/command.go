@@ -21,12 +21,12 @@ import (
 )
 
 func New(standardOutput, standardError io.Writer, exitCode *int) *cobra.Command {
-	return cmd.NewLeaf("explain WORKSPACE NODE", "Explain a graph node", cmd.DatabaseAndFormatFlags, run, standardOutput, standardError, exitCode)
+	return cmd.NewLeaf("inspect WORKSPACE NODE", "Inspect a graph node", cmd.DatabaseAndFormatFlags, run, standardOutput, standardError, exitCode)
 }
 
 func run(command *cobra.Command, arguments []string, standardOutput, standardError io.Writer) int {
 	if len(arguments) != 2 {
-		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("explain requires one workspace path and one node query"))
+		return cmd.WriteError(standardError, cli.NewInvalidArgumentError("inspect requires one workspace path and one node query"))
 	}
 	format, err := cmd.Format(command)
 	if err != nil {
@@ -36,15 +36,15 @@ func run(command *cobra.Command, arguments []string, standardOutput, standardErr
 	workspace, term := arguments[0], arguments[1]
 	workspaceRoot, err := filepath.Abs(workspace)
 	if err != nil {
-		return cmd.WriteError(standardError, fmt.Errorf("resolve explain workspace path: %w", err))
+		return cmd.WriteError(standardError, fmt.Errorf("resolve inspect workspace path: %w", err))
 	}
 	database, err := cmd.DatabasePathForCommand(command, workspaceRoot)
 	if err != nil {
-		return cmd.WriteError(standardError, fmt.Errorf("resolve explain database path: %w", err))
+		return cmd.WriteError(standardError, fmt.Errorf("resolve inspect database path: %w", err))
 	}
 	store, err := sqlite.Open(context.Background(), database)
 	if err != nil {
-		return cmd.WriteError(standardError, fmt.Errorf("open explain database: %w", err))
+		return cmd.WriteError(standardError, fmt.Errorf("open inspect database: %w", err))
 	}
 	defer store.Close()
 

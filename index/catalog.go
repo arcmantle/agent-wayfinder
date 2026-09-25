@@ -3,6 +3,7 @@ package index
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,10 @@ import (
 
 type CatalogSynopsisGenerator interface {
 	GenerateCatalogSynopsis(context.Context, CatalogSynopsisInput) (string, error)
+}
+
+type CatalogSynopsisModelReleaser interface {
+	ReleaseCatalogSynopsisModel(context.Context) error
 }
 
 type CatalogSynopsisInput struct {
@@ -55,7 +60,10 @@ const (
 	ollamaEmbeddingBatchSize             = 32
 	ollamaEmbeddingKeepAlive             = "5m"
 	ollamaEmbeddingMaxResponseBytes      = 4 * 1024 * 1024
+	DefaultEmbeddingProcessLimit         = 1
 	MaximumEmbeddingProcessLimit         = 2
+	DefaultSynopsisProcessLimit          = 1
+	MaximumSynopsisProcessLimit          = 4
 )
 
 type OllamaCatalogEmbeddingGenerator struct {
@@ -220,30 +228,52 @@ func WriteCatalog(ctx context.Context, writer storage.CatalogWriter, snapshot st
 	for _, contribution := range contributions {
 		units = append(units, contribution.CatalogUnits()...)
 	}
-	return writeCatalogUnits(ctx, writer, snapshot, units, options)
+	result, err := writeCatalogUnits(ctx, writer, snapshot, units, nil, nil, options)
+	recordCatalogEmbeddingRelease(&result, releaseCatalogEmbeddingModel(options.EmbeddingGenerator))
+	recordCatalogSynopsisRelease(&result, options.SynopsisProvider, releaseCatalogSynopsisModel(options.SynopsisGenerator))
+	return result, err
 }
 
-func writeCatalogUnits(ctx context.Context, writer storage.CatalogWriter, snapshot storage.Snapshot, units []extractor.CatalogUnit, options CatalogWriteOptions) (CatalogWriteResult, error) {
+func writeCatalogUnits(ctx context.Context, writer storage.CatalogWriter, snapshot storage.Snapshot, units []extractor.CatalogUnit, existingEntries []storage.CatalogEntry, existingEmbeddings []storage.CatalogEmbedding, options CatalogWriteOptions) (CatalogWriteResult, error) {
 	entries := make([]storage.CatalogEntry, 0, len(units))
 	for _, unit := range units {
+		input := boundedSynopsisInput(unit, options.SynopsisSourceLimit)
 		entries = append(entries, storage.CatalogEntry{
 			NodeID:                unit.NodeID,
 			Name:                  unit.Name,
+			InputFingerprint:      catalogInputFingerprint(input),
 			DeterministicSynopsis: unit.DeterministicSynopsis(),
 		})
 	}
 	if len(entries) == 0 {
 		return CatalogWriteResult{}, nil
 	}
+	reuseCatalogEntries(entries, existingEntries)
 	result := addSelectedSynopsis(ctx, entries, units, options)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if err := writer.WriteCatalog(ctx, snapshot, storage.CatalogWriteRequest{Entries: entries}); err != nil {
 		return CatalogWriteResult{}, fmt.Errorf("write catalog: %w", err)
 	}
-	addCatalogEmbeddings(ctx, writer, snapshot, entries, options.EmbeddingGenerator, options.EmbeddingProcessLimit, &result)
+	addCatalogEmbeddings(ctx, writer, snapshot, entries, existingEmbeddings, options.EmbeddingGenerator, options.EmbeddingProcessLimit, &result)
 	return result, nil
 }
 
-func addCatalogEmbeddings(ctx context.Context, writer storage.CatalogWriter, snapshot storage.Snapshot, entries []storage.CatalogEntry, generator CatalogEmbeddingGenerator, processLimit int, result *CatalogWriteResult) {
+func reuseCatalogEntries(entries, existing []storage.CatalogEntry) {
+	byNodeID := make(map[string]storage.CatalogEntry, len(existing))
+	for _, entry := range existing {
+		byNodeID[entry.NodeID] = entry
+	}
+	for index, entry := range entries {
+		stored, found := byNodeID[entry.NodeID]
+		if found && stored.Name == entry.Name && stored.InputFingerprint == entry.InputFingerprint && stored.DeterministicSynopsis == entry.DeterministicSynopsis {
+			entries[index] = stored
+		}
+	}
+}
+
+func addCatalogEmbeddings(ctx context.Context, writer storage.CatalogWriter, snapshot storage.Snapshot, entries []storage.CatalogEntry, existing []storage.CatalogEmbedding, generator CatalogEmbeddingGenerator, processLimit int, result *CatalogWriteResult) {
 	if generator == nil {
 		return
 	}
@@ -252,17 +282,21 @@ func addCatalogEmbeddings(ctx context.Context, writer storage.CatalogWriter, sna
 		result.EmbeddingUnavailableReason = "Catalog embedding storage is unavailable"
 		return
 	}
+	stored := make(map[string]struct{}, len(existing))
+	for _, embedding := range existing {
+		stored[string(embedding.Source)+"\x00"+embedding.NodeID+"\x00"+embedding.Text] = struct{}{}
+	}
 	embeddingRequests := make([]catalogEmbeddingRequest, 0, len(entries)*4)
 	for _, entry := range entries {
-		embeddingRequests = append(embeddingRequests, catalogEmbeddingRequest{nodeID: entry.NodeID, source: storage.CatalogEmbeddingDeterministic, text: entry.DeterministicSynopsis})
+		embeddingRequests = appendMissingCatalogEmbedding(embeddingRequests, stored, entry.NodeID, storage.CatalogEmbeddingDeterministic, entry.DeterministicSynopsis)
 		if entry.CopilotSynopsis != "" {
-			embeddingRequests = append(embeddingRequests, catalogEmbeddingRequest{nodeID: entry.NodeID, source: storage.CatalogEmbeddingCopilot, text: entry.CopilotSynopsis})
+			embeddingRequests = appendMissingCatalogEmbedding(embeddingRequests, stored, entry.NodeID, storage.CatalogEmbeddingCopilot, entry.CopilotSynopsis)
 		}
 		if entry.OllamaSynopsis != "" {
-			embeddingRequests = append(embeddingRequests, catalogEmbeddingRequest{nodeID: entry.NodeID, source: storage.CatalogEmbeddingOllama, text: entry.OllamaSynopsis})
+			embeddingRequests = appendMissingCatalogEmbedding(embeddingRequests, stored, entry.NodeID, storage.CatalogEmbeddingOllama, entry.OllamaSynopsis)
 		}
 		if entry.ClaudeSynopsis != "" {
-			embeddingRequests = append(embeddingRequests, catalogEmbeddingRequest{nodeID: entry.NodeID, source: storage.CatalogEmbeddingClaude, text: entry.ClaudeSynopsis})
+			embeddingRequests = appendMissingCatalogEmbedding(embeddingRequests, stored, entry.NodeID, storage.CatalogEmbeddingClaude, entry.ClaudeSynopsis)
 		}
 	}
 	embeddings := generateCatalogEmbeddings(ctx, generator, embeddingRequests, processLimit, result)
@@ -272,6 +306,13 @@ func addCatalogEmbeddings(ctx context.Context, writer storage.CatalogWriter, sna
 	if err := embeddingWriter.WriteCatalogEmbeddings(ctx, snapshot, storage.CatalogEmbeddingWriteRequest{Embeddings: embeddings}); err != nil {
 		result.EmbeddingUnavailableReason = "Catalog embedding storage is unavailable"
 	}
+}
+
+func appendMissingCatalogEmbedding(requests []catalogEmbeddingRequest, stored map[string]struct{}, nodeID string, source storage.CatalogEmbeddingSource, text string) []catalogEmbeddingRequest {
+	if _, found := stored[string(source)+"\x00"+nodeID+"\x00"+text]; found {
+		return requests
+	}
+	return append(requests, catalogEmbeddingRequest{nodeID: nodeID, source: source, text: text})
 }
 
 type catalogEmbeddingRequest struct {
@@ -289,11 +330,6 @@ func generateCatalogEmbeddings(ctx context.Context, generator CatalogEmbeddingGe
 		}
 		return embeddings
 	}
-	defer func() {
-		if err := batchGenerator.ReleaseCatalogEmbeddingModel(context.Background()); err != nil {
-			result.EmbeddingUnavailableReason = "Catalog embedding model release is unavailable"
-		}
-	}()
 	batchCount := (len(requests) + ollamaEmbeddingBatchSize - 1) / ollamaEmbeddingBatchSize
 	if processLimit <= 0 {
 		processLimit = 1
@@ -369,69 +405,86 @@ func addSelectedSynopsis(ctx context.Context, entries []storage.CatalogEntry, un
 	if options.SynopsisGenerator == nil {
 		return CatalogWriteResult{}
 	}
-	provider, store, unavailable := selectedSynopsisDestination(options.SynopsisProvider)
-	message := addCatalogSynopses(ctx, entries, boundedSynopsisInputs(units, options.SynopsisSourceLimit), options.SynopsisGenerator, options.SynopsisProcessLimit, provider, store)
+	provider, complete, store, unavailable := selectedSynopsisDestination(options.SynopsisProvider)
+	message := addCatalogSynopses(ctx, entries, boundedSynopsisInputs(units, options.SynopsisSourceLimit), options.SynopsisGenerator, options.SynopsisProcessLimit, provider, complete, store)
 	return unavailable(message)
 }
 
 func boundedSynopsisInputs(units []extractor.CatalogUnit, sourceLimit int) []CatalogSynopsisInput {
 	inputs := make([]CatalogSynopsisInput, len(units))
 	for index, unit := range units {
-		inputs[index] = CatalogSynopsisInput{
-			Name:              unit.Name,
-			Kind:              string(unit.Kind),
-			Owner:             unit.Owner,
-			Signature:         unit.Signature,
-			DeclarationSource: unit.DeclarationSource,
-			Comments:          append([]string(nil), unit.Comments...),
-			IdentifierTokens:  append([]string(nil), unit.IdentifierTokens...),
-		}
-		if sourceLimit <= 0 {
-			inputs[index].DeclarationSource = ""
-			continue
-		}
-		if len(inputs[index].DeclarationSource) > sourceLimit {
-			inputs[index].DeclarationSource = inputs[index].DeclarationSource[:sourceLimit]
-		}
+		inputs[index] = boundedSynopsisInput(unit, sourceLimit)
 	}
 	return inputs
 }
 
-func selectedSynopsisDestination(provider CatalogSynopsisProvider) (string, func(*storage.CatalogEntry, string), func(string) CatalogWriteResult) {
+func boundedSynopsisInput(unit extractor.CatalogUnit, sourceLimit int) CatalogSynopsisInput {
+	input := CatalogSynopsisInput{
+		Name:              unit.Name,
+		Kind:              string(unit.Kind),
+		Owner:             unit.Owner,
+		Signature:         unit.Signature,
+		DeclarationSource: unit.DeclarationSource,
+		Comments:          append([]string(nil), unit.Comments...),
+		IdentifierTokens:  append([]string(nil), unit.IdentifierTokens...),
+	}
+	if sourceLimit <= 0 {
+		input.DeclarationSource = ""
+	} else if len(input.DeclarationSource) > sourceLimit {
+		input.DeclarationSource = input.DeclarationSource[:sourceLimit]
+	}
+	return input
+}
+
+func catalogInputFingerprint(input CatalogSynopsisInput) string {
+	encoded, _ := json.Marshal(input)
+	return fmt.Sprintf("%x", sha256.Sum256(encoded))
+}
+
+func selectedSynopsisDestination(provider CatalogSynopsisProvider) (string, func(storage.CatalogEntry) bool, func(*storage.CatalogEntry, string), func(string) CatalogWriteResult) {
 	switch provider {
 	case CatalogSynopsisProviderCopilot:
-		return "Copilot", func(entry *storage.CatalogEntry, synopsis string) {
+		return "Copilot", func(entry storage.CatalogEntry) bool { return entry.CopilotSynopsis != "" }, func(entry *storage.CatalogEntry, synopsis string) {
 				entry.CopilotSynopsis = synopsis
 			}, func(message string) CatalogWriteResult {
 				return CatalogWriteResult{CopilotUnavailableReason: message}
 			}
 	case CatalogSynopsisProviderOllama:
-		return "Ollama", func(entry *storage.CatalogEntry, synopsis string) {
+		return "Ollama", func(entry storage.CatalogEntry) bool { return entry.OllamaSynopsis != "" }, func(entry *storage.CatalogEntry, synopsis string) {
 				entry.OllamaSynopsis = synopsis
 			}, func(message string) CatalogWriteResult {
 				return CatalogWriteResult{OllamaUnavailableReason: message}
 			}
 	case CatalogSynopsisProviderClaude:
-		return "Claude", func(entry *storage.CatalogEntry, synopsis string) {
+		return "Claude", func(entry storage.CatalogEntry) bool { return entry.ClaudeSynopsis != "" }, func(entry *storage.CatalogEntry, synopsis string) {
 				entry.ClaudeSynopsis = synopsis
 			}, func(message string) CatalogWriteResult {
 				return CatalogWriteResult{ClaudeUnavailableReason: message}
 			}
 	default:
-		return "Catalog", func(*storage.CatalogEntry, string) {}, func(message string) CatalogWriteResult {
+		return "Catalog", func(storage.CatalogEntry) bool { return false }, func(*storage.CatalogEntry, string) {}, func(message string) CatalogWriteResult {
 			return CatalogWriteResult{CopilotUnavailableReason: message}
 		}
 	}
 }
 
-func addCatalogSynopses(ctx context.Context, entries []storage.CatalogEntry, inputs []CatalogSynopsisInput, generator CatalogSynopsisGenerator, processLimit int, provider string, store func(*storage.CatalogEntry, string)) string {
+func addCatalogSynopses(ctx context.Context, entries []storage.CatalogEntry, inputs []CatalogSynopsisInput, generator CatalogSynopsisGenerator, processLimit int, provider string, complete func(storage.CatalogEntry) bool, store func(*storage.CatalogEntry, string)) string {
 	if generator == nil {
 		return ""
 	}
 	if processLimit <= 0 {
 		processLimit = 1
 	}
-	processLimit = min(processLimit, len(inputs))
+	pending := make([]int, 0, len(inputs))
+	for index, entry := range entries {
+		if !complete(entry) {
+			pending = append(pending, index)
+		}
+	}
+	if len(pending) == 0 {
+		return ""
+	}
+	processLimit = min(processLimit, len(pending))
 	type synopsisResult struct {
 		index    int
 		synopsis string
@@ -451,7 +504,7 @@ func addCatalogSynopses(ctx context.Context, entries []storage.CatalogEntry, inp
 		}()
 	}
 	go func() {
-		for index := range inputs {
+		for _, index := range pending {
 			jobs <- index
 		}
 		close(jobs)
@@ -468,4 +521,40 @@ func addCatalogSynopses(ctx context.Context, entries []storage.CatalogEntry, inp
 		store(&entries[generated.index], generated.synopsis)
 	}
 	return unavailable
+}
+
+func releaseCatalogEmbeddingModel(generator CatalogEmbeddingGenerator) error {
+	batchGenerator, supported := generator.(CatalogEmbeddingBatchGenerator)
+	if supported {
+		return batchGenerator.ReleaseCatalogEmbeddingModel(context.Background())
+	}
+	return nil
+}
+
+func recordCatalogEmbeddingRelease(result *CatalogWriteResult, err error) {
+	if err != nil {
+		result.EmbeddingUnavailableReason = "Catalog embedding model release is unavailable"
+	}
+}
+
+func releaseCatalogSynopsisModel(generator CatalogSynopsisGenerator) error {
+	modelReleaser, supported := generator.(CatalogSynopsisModelReleaser)
+	if supported {
+		return modelReleaser.ReleaseCatalogSynopsisModel(context.Background())
+	}
+	return nil
+}
+
+func recordCatalogSynopsisRelease(result *CatalogWriteResult, provider CatalogSynopsisProvider, err error) {
+	if err == nil {
+		return
+	}
+	switch provider {
+	case CatalogSynopsisProviderCopilot:
+		result.CopilotUnavailableReason = "Catalog synopsis model release is unavailable"
+	case CatalogSynopsisProviderClaude:
+		result.ClaudeUnavailableReason = "Catalog synopsis model release is unavailable"
+	default:
+		result.OllamaUnavailableReason = "Catalog synopsis model release is unavailable"
+	}
 }

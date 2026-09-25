@@ -271,6 +271,27 @@ func TestCatalogTaskDoesNotRegressToOlderGraphVersion(t *testing.T) {
 	}
 }
 
+func TestCatalogTaskStoresProcessID(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	workspace := t.TempDir()
+	if err := store.WriteCatalogTask(context.Background(), storage.CatalogTask{
+		Workspace: workspace, GraphVersion: 1, State: storage.CatalogTaskRunning, ProcessID: 123, StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("write catalog task: %v", err)
+	}
+	task, found, err := store.ReadCatalogTask(context.Background(), workspace)
+	if err != nil {
+		t.Fatalf("read catalog task: %v", err)
+	}
+	if !found || task.ProcessID != 123 {
+		t.Errorf("catalog task = %+v, want process ID 123", task)
+	}
+}
+
 func TestCopilotPlannerMetricsAggregateExactEventValuesByDay(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
 	if err != nil {
@@ -889,6 +910,90 @@ func TestOpenRecordsCurrentSchemaVersion(t *testing.T) {
 	}
 	if version != sqlite.CurrentSchemaVersion {
 		t.Errorf("schema version = %d, want %d", version, sqlite.CurrentSchemaVersion)
+	}
+}
+
+func TestOpenMigratesVersionTwentyOneCatalogFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "version-twenty-one.db")
+	store, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open version-twenty-one database: %v", err)
+	}
+	if _, err := database.Exec(`
+		ALTER TABLE catalog_entries DROP COLUMN input_fingerprint;
+		DELETE FROM schema_migrations;
+		INSERT INTO schema_migrations (version, applied_at) VALUES (21, '2026-09-25T00:00:00Z')`); err != nil {
+		_ = database.Close()
+		t.Fatalf("seed version-twenty-one database: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close version-twenty-one database: %v", err)
+	}
+
+	store, err = sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("migrate version-twenty-one database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	version, err := store.SchemaVersion(context.Background())
+	if err != nil {
+		t.Fatalf("read migrated schema version: %v", err)
+	}
+	if version != sqlite.CurrentSchemaVersion {
+		t.Errorf("migrated schema version = %d, want %d", version, sqlite.CurrentSchemaVersion)
+	}
+}
+
+func TestOpenMigratesVersionTwentyTwoCatalogProcessID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "version-twenty-two.db")
+	store, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open version-twenty-two database: %v", err)
+	}
+	if _, err := database.Exec(`
+		ALTER TABLE catalog_tasks DROP COLUMN process_id;
+		DELETE FROM schema_migrations;
+		INSERT INTO schema_migrations (version, applied_at) VALUES (22, '2026-09-25T00:00:00Z')`); err != nil {
+		_ = database.Close()
+		t.Fatalf("seed version-twenty-two database: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close version-twenty-two database: %v", err)
+	}
+
+	store, err = sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("migrate version-twenty-two database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	workspace := t.TempDir()
+	if err := store.WriteCatalogTask(context.Background(), storage.CatalogTask{
+		Workspace: workspace, GraphVersion: 1, State: storage.CatalogTaskRunning, ProcessID: 123, StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("write migrated catalog task: %v", err)
+	}
+	task, found, err := store.ReadCatalogTask(context.Background(), workspace)
+	if err != nil {
+		t.Fatalf("read migrated catalog task: %v", err)
+	}
+	if !found || task.ProcessID != 123 {
+		t.Errorf("migrated catalog task = %+v, want process ID 123", task)
 	}
 }
 

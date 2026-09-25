@@ -77,7 +77,7 @@ func TestMCPServerListsToolsAndRunsQuery(t *testing.T) {
 		toolNames = append(toolNames, tool.Name)
 	}
 	sort.Strings(toolNames)
-	if want := []string{"explain", "export", "path", "query"}; !reflect.DeepEqual(toolNames, want) {
+	if want := []string{"export", "inspect", "path", "query"}; !reflect.DeepEqual(toolNames, want) {
 		t.Errorf("MCP tools = %v, want %v", toolNames, want)
 	}
 
@@ -138,9 +138,9 @@ func TestMCPServerListsToolsAndRunsQuery(t *testing.T) {
 			want:      []string{"path", "--format", "json", "--max-depth", "8", "--max-nodes", "20", "--undirected", "--database", "/tmp/graph.db", "/workspace", "API", "Store"},
 		},
 		{
-			name:      "explain",
+			name:      "inspect",
 			arguments: map[string]any{"workspace": "/workspace", "node": "API"},
-			want:      []string{"explain", "--format", "json", "/workspace", "API"},
+			want:      []string{"inspect", "--format", "json", "/workspace", "API"},
 		},
 		{
 			name:      "export",
@@ -187,10 +187,10 @@ func TestMCPQueryReturnsGeneratorLabeledCatalogEvidence(t *testing.T) {
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
 	standardOutput := &bytes.Buffer{}
 	standardError := &bytes.Buffer{}
-	if exitCode := runTestCommand([]string{"index", "--database", database, workspace.Root}, standardOutput, standardError); exitCode != 0 {
+	if exitCode := runTestCommand([]string{"index", "--catalog-background=false", "--database", database, workspace.Root}, standardOutput, standardError); exitCode != 0 {
 		t.Fatalf("run index command: exit code %d, error %s", exitCode, standardError.String())
 	}
-	if exitCode := runTestCommand([]string{"catalog", "--database", database, workspace.Root}, standardOutput, standardError); exitCode != 0 {
+	if exitCode := runTestCommand([]string{"catalog", "--foreground", "--database", database, workspace.Root}, standardOutput, standardError); exitCode != 0 {
 		t.Fatalf("run catalog command: exit code %d, error %s", exitCode, standardError.String())
 	}
 

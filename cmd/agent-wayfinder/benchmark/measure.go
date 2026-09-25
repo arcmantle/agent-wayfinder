@@ -322,7 +322,7 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 	}); err != nil {
 		return benchmark.Run{}, storage.Snapshot{}, err
 	}
-	if err := measure("explain", func() error {
+	if err := measure("inspect", func() error {
 		_, err := query.ExplainSnapshot(context.Background(), store, store, snapshot, corpus.ExplainTerm)
 		return err
 	}); err != nil {

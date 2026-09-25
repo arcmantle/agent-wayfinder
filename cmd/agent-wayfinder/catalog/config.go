@@ -41,8 +41,9 @@ type catalogOllamaConfiguration struct {
 }
 
 type catalogSynopsisConfiguration struct {
-	Provider    index.CatalogSynopsisProvider
-	SourceLimit int
+	Provider           index.CatalogSynopsisProvider
+	SourceLimit        int
+	OllamaProcessLimit int
 }
 
 type catalogEmbeddingConfiguration struct {
@@ -68,9 +69,10 @@ type catalogCopilotConfigurationFileContents struct {
 }
 
 type catalogOllamaConfigurationFileContents struct {
-	Model    *string         `json:"model"`
-	Endpoint *string         `json:"endpoint"`
-	Timeout  json.RawMessage `json:"timeout"`
+	Model        *string         `json:"model"`
+	Endpoint     *string         `json:"endpoint"`
+	Timeout      json.RawMessage `json:"timeout"`
+	ProcessLimit *int            `json:"processLimit"`
 }
 
 type catalogSynopsisConfigurationFileContents struct {
@@ -101,10 +103,10 @@ func readCatalogConfiguration(workspaceRoot string) (catalogConfiguration, error
 		Copilot:  catalogCopilotConfiguration{MaxAICredits: copilot.DefaultAICredits, ProcessLimit: 1},
 		Ollama:   catalogOllamaConfiguration{Model: "qwen3:8b", Endpoint: ollama.DefaultEndpoint(), Timeout: 30 * time.Second},
 		Claude:   claude.Configuration{Path: claude.DefaultPlannerPath, Model: claude.DefaultPlannerModel, Timeout: 30 * time.Second},
-		Synopsis: catalogSynopsisConfiguration{SourceLimit: extractor.DefaultCatalogDeclarationSourceLimit},
+		Synopsis: catalogSynopsisConfiguration{SourceLimit: extractor.DefaultCatalogDeclarationSourceLimit, OllamaProcessLimit: index.DefaultSynopsisProcessLimit},
 		Embedding: catalogEmbeddingConfiguration{
 			Ollama:       catalogOllamaConfiguration{Model: index.DefaultOllamaCatalogEmbeddingModel, Endpoint: ollama.DefaultEndpoint(), Timeout: index.DefaultOllamaCatalogEmbeddingTimeout},
-			ProcessLimit: index.MaximumEmbeddingProcessLimit,
+			ProcessLimit: index.DefaultEmbeddingProcessLimit,
 		},
 	}
 	paths := configpath.Paths(workspaceRoot)
@@ -191,6 +193,9 @@ func applyCatalogConfiguration(configuration *catalogConfiguration, fileConfigur
 				}
 				configuration.Ollama.Timeout = timeout
 			}
+			if fileConfiguration.Synopsis.Ollama.ProcessLimit != nil {
+				configuration.Synopsis.OllamaProcessLimit = *fileConfiguration.Synopsis.Ollama.ProcessLimit
+			}
 		}
 		if fileConfiguration.Synopsis.Claude != nil {
 			if fileConfiguration.Synopsis.Claude.Path != nil {
@@ -265,6 +270,7 @@ func ConfigureFlags(command *cobra.Command) {
 	command.Flags().String("catalog-copilot-path", "", "Copilot command path for catalog synopses")
 	command.Flags().String("catalog-ollama-model", "", "Ollama model for catalog synopses")
 	command.Flags().String("catalog-ollama-endpoint", "", "Ollama endpoint for catalog synopses")
+	command.Flags().Int("catalog-ollama-process-limit", 0, "maximum concurrent Ollama catalog synopsis requests")
 	command.Flags().Bool("catalog-embeddings", false, "enable local Ollama catalog embeddings")
 	command.Flags().String("catalog-embedding-model", "", "Ollama model for catalog embeddings")
 	command.Flags().String("catalog-embedding-endpoint", "", "Ollama endpoint for catalog embeddings")
@@ -312,6 +318,9 @@ func resolveCatalogConfiguration(command *cobra.Command, workspaceRoot string) (
 	}
 	if err == nil && flags.Changed("catalog-ollama-endpoint") {
 		configuration.Ollama.Endpoint, err = flags.GetString("catalog-ollama-endpoint")
+	}
+	if err == nil && flags.Changed("catalog-ollama-process-limit") {
+		configuration.Synopsis.OllamaProcessLimit, err = flags.GetInt("catalog-ollama-process-limit")
 	}
 	if err == nil && flags.Changed("catalog-embeddings") {
 		var enabled bool
@@ -363,6 +372,9 @@ func validateCatalogSynopsisConfiguration(configuration catalogSynopsisConfigura
 	}
 	if configuration.SourceLimit <= 0 {
 		return fmt.Errorf("invalid catalog synopsis source limit: use a positive integer")
+	}
+	if configuration.OllamaProcessLimit <= 0 || configuration.OllamaProcessLimit > index.MaximumSynopsisProcessLimit {
+		return fmt.Errorf("invalid catalog Ollama process limit: use an integer from 1 through %d", index.MaximumSynopsisProcessLimit)
 	}
 	return nil
 }

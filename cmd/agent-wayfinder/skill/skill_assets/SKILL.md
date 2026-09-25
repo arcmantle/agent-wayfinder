@@ -1,6 +1,6 @@
 ---
 name: agent-wayfinder
-description: "Use for codebase architecture, dependency, call-flow, impact, and project-relationship questions, and for Agent Wayfinder install, index, query, path, explain, export, or indexer tasks. Query an existing local code graph before broad source search, then verify graph evidence in current source."
+description: "Use for codebase architecture, dependency, call-flow, impact, and project-relationship questions, and for Agent Wayfinder install, index, query, path, inspect, export, or indexer tasks. Query an existing local code graph before broad source search, then verify graph evidence in current source."
 argument-hint: "[question, node, path, or indexing task]"
 ---
 
@@ -15,7 +15,7 @@ Use Agent Wayfinder as a local map of code structure and relationships. The grap
 /agent-wayfinder index [WORKSPACE]
 /agent-wayfinder query [WORKSPACE] <question or terms>
 /agent-wayfinder path [WORKSPACE] <SOURCE> <TARGET>
-/agent-wayfinder explain [WORKSPACE] <NODE>
+/agent-wayfinder inspect [WORKSPACE] <NODE>
 /agent-wayfinder export [WORKSPACE]
 /agent-wayfinder indexer <serve|start|status|stop> [WORKSPACE]
 ```
@@ -30,7 +30,7 @@ If the user gives no workspace, use the repository root. If there is no reposito
 | Build or refresh the graph | `index` |
 | Find relevant nodes and nearby outgoing relationships | `query` |
 | Trace a directed relationship chain | `path` |
-| Inspect one exact or unambiguous node | `explain` |
+| Inspect one exact or unambiguous node | `inspect` |
 | Read the complete published graph | `export` |
 | Control the current indexer process | `indexer` |
 
@@ -38,7 +38,7 @@ Load [the command reference](./references/commands.md) when you need exact synta
 
 ## MCP Tools
 
-When Agent Wayfinder MCP tools are available, use `query`, `path`, `explain`,
+When Agent Wayfinder MCP tools are available, use `query`, `path`, `inspect`,
 and `export` directly instead of launching the equivalent CLI commands. Pass
 the resolved workspace path to each tool. The MCP results use the same JSON
 contract as the CLI, including `graphVersion`, `publishedAt`, evidence, scope
@@ -50,13 +50,13 @@ Use the CLI when the required MCP tool is not available. Always use the CLI for
 ## Procedure
 
 1. Resolve the workspace to an absolute repository root.
-2. For `query`, `path`, `explain`, or `export`, use the matching MCP tool when it is available. Otherwise, prefer `agent-wayfinder`. Use `a-wayfinder` if only that alias is installed. In the Agent Wayfinder source repository, use `make run ARGS='...'` when no installed command is available.
+2. For `query`, `path`, `inspect`, or `export`, use the matching MCP tool when it is available. Otherwise, prefer `agent-wayfinder`. Use `a-wayfinder` if only that alias is installed. In the Agent Wayfinder source repository, use `make run ARGS='...'` when no installed command is available.
 3. Check for `<WORKSPACE>/.agent-wayfinder/graph.db`, unless the user gave `--database`.
 4. If no published graph is available, run `index WORKSPACE --format json` before a graph query.
 5. For questions about recent edits, refresh with `index`. Do not assume that the current `indexer start` command updates the graph.
 6. For an architecture question, run one question-mode JSON query with the complete sentence before you run exact follow-up commands. Do not invent a query plan before this command runs.
 7. Read the query plan, confidence, warnings, graph version, truncation, and ranked evidence. Also read the publication time and limits.
-8. When confidence is low or evidence is weak, use the returned suggestions. Follow up with exact identifiers, separate terms, `path`, or `explain` as applicable.
+8. When confidence is low or evidence is weak, use the returned suggestions. Follow up with exact identifiers, separate terms, `path`, or `inspect` as applicable.
 9. Inspect the cited source before an edit or a final technical claim. Use language-server navigation or text search for exact symbol lookup.
 10. Run focused tests and inspect the Git diff after a change. A graph result is not validation.
 
@@ -72,7 +72,7 @@ Question mode returns a deterministic plan and answer-ready evidence. If confide
 
 Use bounded traversal. Increase `--max-depth` or `--max-nodes` only when the result reports truncation or the first traversal stops before the needed boundary.
 
-## Path And Explain
+## Path And Inspect
 
 Use `path` when both endpoints are known:
 
@@ -82,13 +82,13 @@ agent-wayfinder path "$WORKSPACE" AuthService TokenStore --format json
 
 Paths are directed by default. Use `--undirected` only as an explicit fallback, and state that the result does not prove directed flow.
 
-Use `explain` for one node:
+Use `inspect` for one node:
 
 ```bash
-agent-wayfinder explain "$WORKSPACE" AuthService --format json
+agent-wayfinder inspect "$WORKSPACE" AuthService --format json
 ```
 
-If `explain` returns several candidates, choose from those candidates and rerun with the exact node ID. Do not select an ambiguous node from memory.
+If `inspect` returns several candidates, choose from those candidates and rerun with the exact node ID. Do not select an ambiguous node from memory.
 
 ## Evidence Rules
 

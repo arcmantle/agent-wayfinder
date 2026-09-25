@@ -208,8 +208,9 @@ func TestCatalogWriteOptionsUseConfiguredOllamaSynopsisModelAndEndpoint(t *testi
 
 	options, err := catalogWriteOptions(catalogConfiguration{
 		Synopsis: catalogSynopsisConfiguration{
-			Provider:    index.CatalogSynopsisProviderOllama,
-			SourceLimit: 512,
+			Provider:           index.CatalogSynopsisProviderOllama,
+			SourceLimit:        512,
+			OllamaProcessLimit: 2,
 		},
 		Ollama: catalogOllamaConfiguration{Model: "catalog-generation:8b", Endpoint: server.URL, Timeout: time.Second},
 	}, t.TempDir(), nil)
@@ -218,6 +219,9 @@ func TestCatalogWriteOptionsUseConfiguredOllamaSynopsisModelAndEndpoint(t *testi
 	}
 	if options.SynopsisGenerator == nil {
 		t.Fatal("Ollama catalog synopsis generator = nil")
+	}
+	if options.SynopsisProcessLimit != 2 {
+		t.Errorf("Ollama catalog synopsis process limit = %d, want 2", options.SynopsisProcessLimit)
 	}
 	if _, err := options.SynopsisGenerator.GenerateCatalogSynopsis(context.Background(), index.CatalogSynopsisInput{Name: "ValidateToken"}); err != nil {
 		t.Fatalf("generate Ollama catalog synopsis: %v", err)

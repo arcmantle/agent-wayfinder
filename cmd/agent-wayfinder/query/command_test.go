@@ -712,10 +712,10 @@ func TestQueryCommandRoutesCapabilityQuestionToCatalog(t *testing.T) {
 		"src/token.ts": "export function validateAccessToken(token: string) { return token.length > 0; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := newCLICommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := newCLICommand("index", "--catalog-background=false", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
-	if output, err := newCLICommand("catalog", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := newCLICommand("catalog", "--foreground", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run catalog command: %v\n%s", err, output)
 	}
 
@@ -765,8 +765,11 @@ func TestQueryCommandReportsLowConfidenceEmptyQuestionWithoutAnAnswerClaim(t *te
 		"src/main.ts":  "export function main() { return 1; }",
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
-	if output, err := newCLICommand("index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := newCLICommand("index", "--catalog-background=false", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+	if output, err := newCLICommand("catalog", "--foreground", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run catalog command: %v\n%s", err, output)
 	}
 
 	question := "Why do lunar widgets shimmer?"

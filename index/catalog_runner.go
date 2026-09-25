@@ -22,6 +22,7 @@ type CatalogRequest struct {
 type CatalogProgress struct {
 	CompletedUnits int
 	TotalUnits     int
+	Stage          string
 }
 
 type CatalogResult struct {
@@ -36,9 +37,13 @@ type catalogStore interface {
 	storage.CatalogUnitCoverageReader
 	storage.CatalogWriter
 	storage.CatalogCopier
+	storage.CatalogEntryReader
+	storage.CatalogEmbeddingReader
 }
 
-func Catalog(ctx context.Context, store catalogStore, request CatalogRequest) (CatalogResult, error) {
+const catalogCheckpointUnits = 8
+
+func Catalog(ctx context.Context, store catalogStore, request CatalogRequest) (catalogResult CatalogResult, catalogErr error) {
 	if request.Root == "" {
 		return CatalogResult{}, fmt.Errorf("catalog workspace: root is required")
 	}
@@ -98,13 +103,139 @@ func Catalog(ctx context.Context, store catalogStore, request CatalogRequest) (C
 		units = append(units, contribution.CatalogUnits...)
 	}
 	unitCount := len(units)
-	reportCatalogProgress(request.Progress, CatalogProgress{TotalUnits: unitCount})
-	writeResult, err := writeCatalogUnits(ctx, store, snapshot, units, request.CatalogWriteOptions)
-	if err != nil {
-		return CatalogResult{}, fmt.Errorf("catalog workspace: %w", err)
+	reportCatalogProgress(request.Progress, CatalogProgress{TotalUnits: unitCount, Stage: "Preparing catalog units"})
+	writeOptions := request.CatalogWriteOptions
+	writeResult := CatalogWriteResult{}
+	embeddingModelReleased := false
+	synopsisModelReleased := false
+	defer func() {
+		if !embeddingModelReleased {
+			if releaseErr := releaseCatalogEmbeddingModel(writeOptions.EmbeddingGenerator); releaseErr != nil {
+				catalogErr = appendCatalogCleanupError(catalogErr, "release catalog embedding model", releaseErr)
+			}
+		}
+		if !synopsisModelReleased {
+			if releaseErr := releaseCatalogSynopsisModel(writeOptions.SynopsisGenerator); releaseErr != nil {
+				catalogErr = appendCatalogCleanupError(catalogErr, "release catalog synopsis model", releaseErr)
+			}
+		}
+	}()
+	if writeOptions.SynopsisGenerator != nil && writeOptions.EmbeddingGenerator != nil {
+		synopsisOptions := writeOptions
+		synopsisOptions.EmbeddingGenerator = nil
+		for start := 0; start < unitCount; start += catalogCheckpointUnits {
+			end := min(start+catalogCheckpointUnits, unitCount)
+			batch := units[start:end]
+			nodeIDs := make([]string, len(batch))
+			for index, unit := range batch {
+				nodeIDs[index] = unit.NodeID
+			}
+			existingEntries, err := store.ReadCatalogEntries(ctx, snapshot, storage.CatalogEntryReadRequest{NodeIDs: nodeIDs})
+			if err != nil {
+				return CatalogResult{}, fmt.Errorf("catalog workspace: read catalog checkpoint: %w", err)
+			}
+			batchResult, err := writeCatalogUnits(ctx, store, snapshot, batch, existingEntries, nil, synopsisOptions)
+			if err != nil {
+				return CatalogResult{}, fmt.Errorf("catalog workspace: write synopsis checkpoint: %w", err)
+			}
+			mergeCatalogWriteResult(&writeResult, batchResult)
+			reportCatalogProgress(request.Progress, CatalogProgress{CompletedUnits: end, TotalUnits: unitCount, Stage: "Generating catalog synopses"})
+			if end < unitCount {
+				if releaseErr := releaseCatalogSynopsisModel(writeOptions.SynopsisGenerator); releaseErr != nil {
+					synopsisModelReleased = true
+					return CatalogResult{}, fmt.Errorf("catalog workspace: release synopsis checkpoint: %w", releaseErr)
+				}
+			}
+		}
+		releaseErr := releaseCatalogSynopsisModel(writeOptions.SynopsisGenerator)
+		synopsisModelReleased = true
+		if releaseErr != nil {
+			return CatalogResult{}, fmt.Errorf("catalog workspace: release synopsis model: %w", releaseErr)
+		}
+
+		embeddingOptions := writeOptions
+		embeddingOptions.SynopsisGenerator = nil
+		for start := 0; start < unitCount; start += catalogCheckpointUnits {
+			end := min(start+catalogCheckpointUnits, unitCount)
+			batch := units[start:end]
+			nodeIDs := make([]string, len(batch))
+			for index, unit := range batch {
+				nodeIDs[index] = unit.NodeID
+			}
+			existingEntries, err := store.ReadCatalogEntries(ctx, snapshot, storage.CatalogEntryReadRequest{NodeIDs: nodeIDs})
+			if err != nil {
+				return CatalogResult{}, fmt.Errorf("catalog workspace: read catalog checkpoint: %w", err)
+			}
+			existingEmbeddings, err := store.ReadCatalogEmbeddings(ctx, snapshot, storage.CatalogEmbeddingReadRequest{NodeIDs: nodeIDs})
+			if err != nil {
+				return CatalogResult{}, fmt.Errorf("catalog workspace: read embedding checkpoint: %w", err)
+			}
+			batchResult, err := writeCatalogUnits(ctx, store, snapshot, batch, existingEntries, existingEmbeddings, embeddingOptions)
+			if err != nil {
+				return CatalogResult{}, fmt.Errorf("catalog workspace: write embedding checkpoint: %w", err)
+			}
+			mergeCatalogWriteResult(&writeResult, batchResult)
+			reportCatalogProgress(request.Progress, CatalogProgress{CompletedUnits: end, TotalUnits: unitCount, Stage: "Generating catalog embeddings"})
+		}
+		recordCatalogEmbeddingRelease(&writeResult, releaseCatalogEmbeddingModel(writeOptions.EmbeddingGenerator))
+		embeddingModelReleased = true
+		return CatalogResult{Snapshot: snapshot, Units: unitCount, Write: writeResult}, nil
 	}
-	reportCatalogProgress(request.Progress, CatalogProgress{CompletedUnits: unitCount, TotalUnits: unitCount})
+	for start := 0; start < unitCount; start += catalogCheckpointUnits {
+		end := min(start+catalogCheckpointUnits, unitCount)
+		batch := units[start:end]
+		nodeIDs := make([]string, len(batch))
+		for index, unit := range batch {
+			nodeIDs[index] = unit.NodeID
+		}
+		existingEntries, err := store.ReadCatalogEntries(ctx, snapshot, storage.CatalogEntryReadRequest{NodeIDs: nodeIDs})
+		if err != nil {
+			return CatalogResult{}, fmt.Errorf("catalog workspace: read catalog checkpoint: %w", err)
+		}
+		existingEmbeddings, err := store.ReadCatalogEmbeddings(ctx, snapshot, storage.CatalogEmbeddingReadRequest{NodeIDs: nodeIDs})
+		if err != nil {
+			return CatalogResult{}, fmt.Errorf("catalog workspace: read embedding checkpoint: %w", err)
+		}
+		batchResult, err := writeCatalogUnits(ctx, store, snapshot, batch, existingEntries, existingEmbeddings, writeOptions)
+		if err != nil {
+			return CatalogResult{}, fmt.Errorf("catalog workspace: %w", err)
+		}
+		mergeCatalogWriteResult(&writeResult, batchResult)
+		reportCatalogProgress(request.Progress, CatalogProgress{CompletedUnits: end, TotalUnits: unitCount, Stage: "Writing catalog entries"})
+		if writeOptions.SynopsisGenerator != nil && end < unitCount {
+			if releaseErr := releaseCatalogSynopsisModel(writeOptions.SynopsisGenerator); releaseErr != nil {
+				synopsisModelReleased = true
+				return CatalogResult{}, fmt.Errorf("catalog workspace: release synopsis checkpoint: %w", releaseErr)
+			}
+		}
+	}
+	recordCatalogEmbeddingRelease(&writeResult, releaseCatalogEmbeddingModel(writeOptions.EmbeddingGenerator))
+	embeddingModelReleased = true
+	recordCatalogSynopsisRelease(&writeResult, writeOptions.SynopsisProvider, releaseCatalogSynopsisModel(writeOptions.SynopsisGenerator))
+	synopsisModelReleased = true
 	return CatalogResult{Snapshot: snapshot, Units: unitCount, Write: writeResult}, nil
+}
+
+func appendCatalogCleanupError(catalogErr error, action string, cleanupErr error) error {
+	if catalogErr == nil {
+		return fmt.Errorf("catalog workspace: %s: %w", action, cleanupErr)
+	}
+	return fmt.Errorf("%w; %s: %v", catalogErr, action, cleanupErr)
+}
+
+func mergeCatalogWriteResult(result *CatalogWriteResult, batch CatalogWriteResult) {
+	if batch.CopilotUnavailableReason != "" {
+		result.CopilotUnavailableReason = batch.CopilotUnavailableReason
+	}
+	if batch.OllamaUnavailableReason != "" {
+		result.OllamaUnavailableReason = batch.OllamaUnavailableReason
+	}
+	if batch.ClaudeUnavailableReason != "" {
+		result.ClaudeUnavailableReason = batch.ClaudeUnavailableReason
+	}
+	if batch.EmbeddingUnavailableReason != "" {
+		result.EmbeddingUnavailableReason = batch.EmbeddingUnavailableReason
+	}
 }
 
 func reportCatalogProgress(callback func(CatalogProgress), progress CatalogProgress) {

@@ -92,7 +92,7 @@ var defaultApprovedLimits = map[string]time.Duration{
 	"incremental_update": 2 * time.Second,
 	"query":              500 * time.Millisecond,
 	"path":               500 * time.Millisecond,
-	"explain":            500 * time.Millisecond,
+	"inspect":            500 * time.Millisecond,
 }
 
 // approvedLimitsBySourceFiles holds acceptance limits calibrated for one exact-scale
@@ -105,9 +105,9 @@ var approvedLimitsBySourceFiles = map[int]map[string]time.Duration{
 		"incremental_update": 2 * time.Second,
 		"query":              500 * time.Millisecond,
 		"path":               500 * time.Millisecond,
-		"explain":            500 * time.Millisecond,
+		"inspect":            500 * time.Millisecond,
 	},
-	// query, path, and explain scale with corpus size and have no calibrated limit here yet.
+	// query, path, and inspect scale with corpus size and have no calibrated limit here yet.
 	10000: {
 		"initial_index": 100 * time.Second,
 	},
@@ -125,7 +125,7 @@ var measurementOrder = []string{
 	"incremental_update",
 	"query",
 	"path",
-	"explain",
+	"inspect",
 }
 
 var phaseMeasurementOrder = []string{

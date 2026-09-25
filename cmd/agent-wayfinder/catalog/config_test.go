@@ -18,13 +18,13 @@ import (
 
 func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *testing.T) {
 	configured := testkit.NewWorkspace(t, map[string]string{
-		".agent-wayfinder/config.json": `{"$schema":"https://example.test/config.schema.json","synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435","timeout":"12s"},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"provider":"ollama","ollama":{"model":"qwen3-embedding:8b","endpoint":"http://localhost:11435","timeout":"12s"},"processLimit":1}}`,
+		".agent-wayfinder/config.json": `{"$schema":"https://example.test/config.schema.json","synopsis":{"provider":"copilot","sourceLimit":512,"copilot":{"model":"gpt-5.6-luna","maxAiCredits":42,"processLimit":3,"path":"/opt/bin/copilot"},"ollama":{"model":"catalog-generation:8b","endpoint":"http://localhost:11435","timeout":"12s","processLimit":1},"claude":{"path":"/opt/bin/claude","model":"sonnet","fallbackModel":"haiku","maxBudgetUsd":0.25,"effort":"high","timeout":"12s"}},"embedding":{"provider":"ollama","ollama":{"model":"qwen3-embedding:8b","endpoint":"http://localhost:11435","timeout":"12s"},"processLimit":1}}`,
 	})
 	configuration, err := readCatalogConfiguration(configured.Root)
 	if err != nil {
 		t.Fatalf("read configured catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 512 || configuration.Copilot.Model != "gpt-5.6-luna" || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "/opt/bin/copilot" || configuration.Ollama.Model != "catalog-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Ollama.Timeout != 12*time.Second || configuration.Claude.Path != "/opt/bin/claude" || configuration.Claude.Model != "sonnet" || configuration.Claude.FallbackModel != "haiku" || configuration.Claude.MaxBudgetUSD != 0.25 || configuration.Claude.Effort != "high" || configuration.Claude.Timeout != 12*time.Second || configuration.Embedding.Provider != "ollama" || configuration.Embedding.Ollama.Model != "qwen3-embedding:8b" || configuration.Embedding.Ollama.Endpoint != "http://localhost:11435" || configuration.Embedding.Ollama.Timeout != 12*time.Second || configuration.Embedding.ProcessLimit != 1 {
+	if configuration.Synopsis.Provider != index.CatalogSynopsisProviderCopilot || configuration.Synopsis.SourceLimit != 512 || configuration.Synopsis.OllamaProcessLimit != 1 || configuration.Copilot.Model != "gpt-5.6-luna" || configuration.Copilot.MaxAICredits != 42 || configuration.Copilot.ProcessLimit != 3 || configuration.Copilot.Path != "/opt/bin/copilot" || configuration.Ollama.Model != "catalog-generation:8b" || configuration.Ollama.Endpoint != "http://localhost:11435" || configuration.Ollama.Timeout != 12*time.Second || configuration.Claude.Path != "/opt/bin/claude" || configuration.Claude.Model != "sonnet" || configuration.Claude.FallbackModel != "haiku" || configuration.Claude.MaxBudgetUSD != 0.25 || configuration.Claude.Effort != "high" || configuration.Claude.Timeout != 12*time.Second || configuration.Embedding.Provider != "ollama" || configuration.Embedding.Ollama.Model != "qwen3-embedding:8b" || configuration.Embedding.Ollama.Endpoint != "http://localhost:11435" || configuration.Embedding.Ollama.Timeout != 12*time.Second || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("configured catalog configuration = %+v, want workspace values", configuration)
 	}
 
@@ -35,7 +35,7 @@ func TestReadCatalogConfigurationReadsWorkspaceAndUsesConservativeDefaults(t *te
 	if err != nil {
 		t.Fatalf("read default catalog configuration: %v", err)
 	}
-	if configuration.Synopsis.Provider != "" || configuration.Synopsis.SourceLimit != extractor.DefaultCatalogDeclarationSourceLimit || configuration.Copilot.Model != "" || configuration.Copilot.MaxAICredits != 30 || configuration.Copilot.ProcessLimit != 1 || configuration.Copilot.Path != "" || configuration.Ollama.Model != "qwen3:8b" || configuration.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Ollama.Timeout != 30*time.Second || configuration.Embedding.Provider != "" || configuration.Embedding.Ollama.Model != "qwen3-embedding:4b" || configuration.Embedding.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Embedding.Ollama.Timeout != index.DefaultOllamaCatalogEmbeddingTimeout || configuration.Embedding.ProcessLimit != index.MaximumEmbeddingProcessLimit {
+	if configuration.Synopsis.Provider != "" || configuration.Synopsis.SourceLimit != extractor.DefaultCatalogDeclarationSourceLimit || configuration.Synopsis.OllamaProcessLimit != 1 || configuration.Copilot.Model != "" || configuration.Copilot.MaxAICredits != 30 || configuration.Copilot.ProcessLimit != 1 || configuration.Copilot.Path != "" || configuration.Ollama.Model != "qwen3:8b" || configuration.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Ollama.Timeout != 30*time.Second || configuration.Embedding.Provider != "" || configuration.Embedding.Ollama.Model != "qwen3-embedding:4b" || configuration.Embedding.Ollama.Endpoint != index.DefaultOllamaHost || configuration.Embedding.Ollama.Timeout != index.DefaultOllamaCatalogEmbeddingTimeout || configuration.Embedding.ProcessLimit != 1 {
 		t.Errorf("default catalog configuration = %+v, want disabled Copilot and default embedding model", configuration)
 	}
 }
@@ -195,6 +195,22 @@ func TestCatalogFlagsRejectInvalidSynopsisValues(t *testing.T) {
 				t.Errorf("resolve catalog configuration error = %v, want %q", err, testCase.want)
 			}
 		})
+	}
+}
+
+func TestCatalogFlagsAcceptMaximumOllamaSynopsisProcessLimit(t *testing.T) {
+	command := &cobra.Command{}
+	ConfigureFlags(command)
+	if err := command.Flags().Set("catalog-ollama-process-limit", "4"); err != nil {
+		t.Fatalf("set catalog Ollama process limit: %v", err)
+	}
+
+	configuration, err := resolveCatalogConfiguration(command, t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve catalog configuration: %v", err)
+	}
+	if configuration.Synopsis.OllamaProcessLimit != 4 {
+		t.Errorf("catalog Ollama process limit = %d, want 4", configuration.Synopsis.OllamaProcessLimit)
 	}
 }
 

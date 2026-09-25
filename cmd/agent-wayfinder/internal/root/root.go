@@ -36,6 +36,7 @@ func New(standardOutput, standardError io.Writer) (*cobra.Command, *int) {
 	root.AddCommand(index.New(standardOutput, standardError, &exitCode))
 	root.AddCommand(catalog.New(standardOutput, standardError, &exitCode))
 	root.AddCommand(catalog.NewStatus(standardOutput, standardError, &exitCode))
+	root.AddCommand(catalog.NewStop(standardOutput, standardError, &exitCode))
 	root.AddCommand(mcp.New(standardOutput, standardError, &exitCode))
 	root.AddCommand(planner_metrics.NewCopilot(standardOutput, standardError, &exitCode))
 	root.AddCommand(planner_metrics.NewClaude(standardOutput, standardError, &exitCode))

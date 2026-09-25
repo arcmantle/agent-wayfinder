@@ -419,6 +419,73 @@ func TestRankSeedRequestsSnapshotUsesExactMatchWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestRankSeedRequestsSnapshotRestrictsSourceQualifiedEntity(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	target := graph.Node{ID: "function:catalog-start", Kind: "go:function", Label: "StartProcess", QualifiedName: "cmd/agent-wayfinder/catalog/command.go::catalog.StartProcess", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "cmd/agent-wayfinder/catalog/command.go"}}}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(context.Context, storage.Snapshot, storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			return nil, nil
+		}),
+		exact: func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error) { return nil, nil },
+	}
+	searcher := lexicalSearcherFunc(func(_ context.Context, _ storage.Snapshot, request storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+		if request.SourcePath != "cmd/agent-wayfinder/catalog/command.go" {
+			t.Errorf("source path = %q, want catalog command path", request.SourcePath)
+		}
+		return []storage.LexicalMatch{
+			{Node: graph.Node{ID: "function:index-start", Kind: "go:function", Label: "StartProcess", QualifiedName: "cmd/agent-wayfinder/index/command.go::index.StartProcess", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "cmd/agent-wayfinder/index/command.go"}}}, Score: 10},
+			{Node: target, Score: 1},
+			{Node: graph.Node{ID: "variable:catalog-command", Kind: "go:variable", Label: "command", QualifiedName: "cmd/agent-wayfinder/catalog/command.go::catalog.StartProcess.command", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "cmd/agent-wayfinder/catalog/command.go"}}}, Score: 9},
+		}, nil
+	})
+
+	seeds, err := query.RankSeedRequestsSnapshot(context.Background(), lookup, searcher, snapshot, []query.SeedRequest{{
+		Role: "entity",
+		Retrieval: storage.LexicalSearchRequest{
+			Text:        "StartProcess",
+			TokenGroups: [][]string{{"start", "process"}},
+			SourcePath:  "cmd/agent-wayfinder/catalog/command.go",
+			Limit:       3,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("rank source-qualified entity: %v", err)
+	}
+	if got, want := nodeIDs(seeds[0].Nodes), []string{target.ID}; !reflect.DeepEqual(got, want) {
+		t.Errorf("source-qualified seed IDs = %v, want %v", got, want)
+	}
+}
+
+func TestRankSeedRequestsSnapshotDoesNotRestrictUnqualifiedEntity(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(context.Context, storage.Snapshot, storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			return nil, nil
+		}),
+		exact: func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error) { return nil, nil },
+	}
+	searcher := lexicalSearcherFunc(func(_ context.Context, _ storage.Snapshot, request storage.LexicalSearchRequest) ([]storage.LexicalMatch, error) {
+		if request.SourcePath != "" {
+			t.Errorf("source path = %q, want no source-path constraint", request.SourcePath)
+		}
+		return []storage.LexicalMatch{
+			{Node: graph.Node{ID: "function:index-start", Kind: "go:function", Label: "StartProcess", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "cmd/agent-wayfinder/index/command.go"}}}, Score: 10},
+			{Node: graph.Node{ID: "function:catalog-start", Kind: "go:function", Label: "StartProcess", Evidence: graph.FactEvidence{Span: graph.SourceSpan{Path: "cmd/agent-wayfinder/catalog/command.go"}}}, Score: 9},
+		}, nil
+	})
+
+	seeds, err := query.RankSeedRequestsSnapshot(context.Background(), lookup, searcher, snapshot, []query.SeedRequest{{
+		Role:      "entity",
+		Retrieval: storage.LexicalSearchRequest{Text: "StartProcess", TokenGroups: [][]string{{"start", "process"}}, Limit: 3},
+	}})
+	if err != nil {
+		t.Fatalf("rank unqualified entity: %v", err)
+	}
+	if got, want := nodeIDs(seeds[0].Nodes), []string{"function:index-start", "function:catalog-start"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("unqualified seed IDs = %v, want %v", got, want)
+	}
+}
+
 type exporterFunc func(context.Context, storage.Snapshot, storage.ExportRequest, storage.ExportSink) error
 
 func (export exporterFunc) Export(ctx context.Context, snapshot storage.Snapshot, request storage.ExportRequest, sink storage.ExportSink) error {

@@ -31,7 +31,7 @@ Use one launcher consistently in a command sequence.
 ## MCP
 
 When an Agent Wayfinder MCP server is available, use its `query`, `path`,
-`explain`, and `export` tools instead of the matching CLI commands. Tool input
+`inspect`, and `export` tools instead of the matching CLI commands. Tool input
 uses the same workspace, database, traversal limit, project, and relation
 values described below. Tool results use the same JSON result envelope.
 
@@ -80,7 +80,7 @@ agent-wayfinder query WORKSPACE QUESTION \
 
 Quote a question so that the shell passes it as one argument. One argument with sentence signals enters question mode automatically. Use `--question` to require question mode. Question-mode JSON includes `schemaVersion`, `interpretation`, `evidence`, `limits`, `warnings`, and `suggestions` in the result envelope. Use `--show-plan` to include the interpreted plan in text output.
 
-When confidence is low or retrieval is weak, inspect the ranked candidates and follow the returned suggestions. Use exact identifiers, separate terms, `path`, or `explain` for the next check. Do not treat weak evidence as an answer claim.
+When confidence is low or retrieval is weak, inspect the ranked candidates and follow the returned suggestions. Use exact identifiers, separate terms, `path`, or `inspect` for the next check. Do not treat weak evidence as an answer claim.
 
 Explicit TERM mode keeps literal lookup behavior:
 
@@ -116,12 +116,12 @@ agent-wayfinder path WORKSPACE SOURCE TARGET \
 
 The source and target are each one argument. Quote names that contain spaces. Use `--undirected` only after the directed path is absent and an undirected structural connection is useful.
 
-## Explain
+## Inspect
 
-Explain one exact or unambiguous node and its relationships:
+Inspect one exact or unambiguous node and its relationships:
 
 ```bash
-agent-wayfinder explain WORKSPACE NODE [--database PATH] [--format text|json]
+agent-wayfinder inspect WORKSPACE NODE [--database PATH] [--format text|json]
 ```
 
 When lookup is ambiguous, the result contains up to three candidates and a remaining-candidate count. Rerun with an exact candidate ID.

@@ -256,6 +256,8 @@ var folderLookupPattern = regexp.MustCompile(`(?i)^where is (?:the )?(.+?) folde
 
 var packageExplainPattern = regexp.MustCompile(`(?i)^describe the (.+?) package$`)
 
+var sourceQualifiedExplainPattern = regexp.MustCompile(`(?i)^explain (?:the )?(.+?) in ((?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.[a-z0-9_.-]+)$`)
+
 var fileLookupPattern = regexp.MustCompile(`(?i)^where is (?:the )?(.+?) file$`)
 
 var classExplainPattern = regexp.MustCompile(`(?i)^explain (?:the )?(.+?) class$`)
@@ -317,6 +319,13 @@ func AnalyzeQuestion(question string) QueryPlan {
 		plan.Confidence = 1
 		plan.Operator = OperatorExplain
 		plan.EntitySlots = []EntitySlot{entitySlotWithEntityRole("entity", "package", cleanEntityText(matches[1]))}
+		return plan
+	}
+	if matches := sourceQualifiedExplainPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
+		plan.Intent = IntentExplain
+		plan.Confidence = 1
+		plan.Operator = OperatorExplain
+		plan.EntitySlots = []EntitySlot{entitySlotWithSourcePath("entity", cleanEntityText(matches[1]), cleanEntityText(matches[2]))}
 		return plan
 	}
 	if matches := fileLookupPattern.FindStringSubmatch(normalizedQuestion); matches != nil {
@@ -419,6 +428,12 @@ func matchArchitecturalMoveComparison(question string) []string {
 
 func entitySlot(role, text string) EntitySlot {
 	return entitySlotWithEntityRole(role, "", text)
+}
+
+func entitySlotWithSourcePath(role, text, sourcePath string) EntitySlot {
+	slot := entitySlot(role, text)
+	slot.Retrieval.SourcePath = sourcePath
+	return slot
 }
 
 func entitySlotWithEntityRole(role, entityRole, text string) EntitySlot {

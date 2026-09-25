@@ -133,6 +133,15 @@ func RankSeedRequestsSnapshot(ctx context.Context, lookup storage.NodeLookup, se
 		if err != nil {
 			return nil, fmt.Errorf("rank seed requests: %w", err)
 		}
+		if request.SourcePath != "" {
+			filteredMatches := matches[:0]
+			for _, match := range matches {
+				if matchesSourcePath(match.Node, request.SourcePath) {
+					filteredMatches = append(filteredMatches, match)
+				}
+			}
+			matches = filteredMatches
+		}
 		ranked := make([]rankedSeed, 0, request.Limit)
 		if len(matches) > 0 {
 			for _, match := range matches {
@@ -150,6 +159,9 @@ func RankSeedRequestsSnapshot(ctx context.Context, lookup storage.NodeLookup, se
 				return nil, fmt.Errorf("rank seed requests: %w", err)
 			}
 			for _, match := range lexicalMatches {
+				if !matchesSourcePath(match.Node, request.SourcePath) {
+					continue
+				}
 				ranked = append(ranked, rankedSeed{
 					node: match.Node,
 					components: SeedScoreComponents{
@@ -165,6 +177,9 @@ func RankSeedRequestsSnapshot(ctx context.Context, lookup storage.NodeLookup, se
 			}
 			ranked = fuseRankedSeeds(ranked)
 		}
+		if request.SourcePath != "" {
+			ranked = preferExactSourceLabel(ranked, request.Text)
+		}
 		ranked = diversifyRankedSeeds(ranked, request.Limit)
 		seedSet := SeedSet{Role: seedRequest.Role, Term: request.Text, Nodes: make([]graph.Node, len(ranked)), Rankings: make([]SeedRanking, len(ranked))}
 		for index, candidate := range ranked {
@@ -174,6 +189,23 @@ func RankSeedRequestsSnapshot(ctx context.Context, lookup storage.NodeLookup, se
 		seeds = append(seeds, seedSet)
 	}
 	return seeds, nil
+}
+
+func matchesSourcePath(node graph.Node, sourcePath string) bool {
+	return sourcePath == "" || node.Evidence.Span.Path == sourcePath
+}
+
+func preferExactSourceLabel(candidates []rankedSeed, text string) []rankedSeed {
+	matching := make([]rankedSeed, 0, len(candidates))
+	for _, candidate := range candidates {
+		if strings.EqualFold(candidate.node.Label, text) {
+			matching = append(matching, candidate)
+		}
+	}
+	if len(matching) == 0 {
+		return candidates
+	}
+	return matching
 }
 
 type rankedSeed struct {

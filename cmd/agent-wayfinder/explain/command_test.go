@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestExplainCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
+func TestInspectCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
 		"package.json":  `{"name":"fixture"}`,
 		"src/helper.ts": "export function helper() { return 1; }",
@@ -30,18 +30,18 @@ func TestExplainCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
 	})
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
 
-	indexCommand := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root)
+	indexCommand := exec.Command("go", "run", ".", "index", "--catalog-background=false", "--database", database, workspace.Root)
 	if output, err := indexCommand.CombinedOutput(); err != nil {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
-	if output, err := exec.Command("go", "run", ".", "catalog", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+	if output, err := exec.Command("go", "run", ".", "catalog", "--foreground", "--database", database, workspace.Root).CombinedOutput(); err != nil {
 		t.Fatalf("run catalog command: %v\n%s", err, output)
 	}
 
-	textCommand := exec.Command("go", "run", ".", "explain", "--database", database, workspace.Root, "src/helper.ts::helper")
+	textCommand := exec.Command("go", "run", ".", "inspect", "--database", database, workspace.Root, "src/helper.ts::helper")
 	textOutput, err := textCommand.CombinedOutput()
 	if err != nil {
-		t.Fatalf("run explain command: %v\n%s", err, textOutput)
+		t.Fatalf("run inspect command: %v\n%s", err, textOutput)
 	}
 	for _, want := range []string{
 		"Node:",
@@ -57,7 +57,7 @@ func TestExplainCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
 		}
 	}
 
-	jsonCommand := exec.Command("go", "run", ".", "explain", "--database", database, "--format", "json", workspace.Root, "src/helper.ts::helper")
+	jsonCommand := exec.Command("go", "run", ".", "inspect", "--database", database, "--format", "json", workspace.Root, "src/helper.ts::helper")
 	jsonOutput, err := jsonCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run explain JSON command: %v\n%s", err, jsonOutput)
@@ -81,7 +81,7 @@ func TestExplainCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(jsonOutput, &output); err != nil {
-		t.Fatalf("decode explain JSON result: %v\n%s", err, jsonOutput)
+		t.Fatalf("decode inspect JSON result: %v\n%s", err, jsonOutput)
 	}
 	if !strings.HasPrefix(output.Result.Explanation.Node.Evidence.Extractor, "typescript") || output.Result.Explanation.Node.Evidence.Confidence == "" {
 		t.Errorf("node evidence = %+v, want TypeScript evidence with confidence", output.Result.Explanation.Node.Evidence)
@@ -94,7 +94,7 @@ func TestExplainCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
 	t.Errorf("supporting edges = %+v, want an evidenced import edge", output.Result.Explanation.SupportingFacts.Edges)
 }
 
-func TestExplainCommandShowsGeneratorLabeledCatalogSynopses(t *testing.T) {
+func TestInspectCommandShowsGeneratorLabeledCatalogSynopses(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
 		"package.json":     `{"name":"fixture"}`,
 		"src/validator.ts": "export function validateAccessToken(token: string) { return token.length > 0; }",
@@ -128,9 +128,9 @@ func TestExplainCommandShowsGeneratorLabeledCatalogSynopses(t *testing.T) {
 		t.Fatalf("write catalog entry: %v", err)
 	}
 
-	output, err := exec.Command("go", "run", ".", "explain", "--database", database, "--format", "json", workspace.Root, "src/validator.ts::validateAccessToken").CombinedOutput()
+	output, err := exec.Command("go", "run", ".", "inspect", "--database", database, "--format", "json", workspace.Root, "src/validator.ts::validateAccessToken").CombinedOutput()
 	if err != nil {
-		t.Fatalf("run explain command: %v\n%s", err, output)
+		t.Fatalf("run inspect command: %v\n%s", err, output)
 	}
 	var result struct {
 		Result struct {
@@ -141,7 +141,7 @@ func TestExplainCommandShowsGeneratorLabeledCatalogSynopses(t *testing.T) {
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
-		t.Fatalf("decode explain result: %v\n%s", err, output)
+		t.Fatalf("decode inspect result: %v\n%s", err, output)
 	}
 	if want := []struct {
 		Generator string `json:"generator"`
@@ -156,7 +156,7 @@ func TestExplainCommandShowsGeneratorLabeledCatalogSynopses(t *testing.T) {
 	}
 }
 
-func TestExplainCommandReportsAmbiguousCandidatesAndRemainderCount(t *testing.T) {
+func TestInspectCommandReportsAmbiguousCandidatesAndRemainderCount(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
 		"package.json": `{"name":"fixture"}`,
 		"src/a.ts":     "export function helper() { return 1; }",
@@ -169,10 +169,10 @@ func TestExplainCommandReportsAmbiguousCandidatesAndRemainderCount(t *testing.T)
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	command := exec.Command("go", "run", ".", "explain", "--database", database, "--format", "json", workspace.Root, "helper")
+	command := exec.Command("go", "run", ".", "inspect", "--database", database, "--format", "json", workspace.Root, "helper")
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("run ambiguous explain command: %v\n%s", err, output)
+		t.Fatalf("run ambiguous inspect command: %v\n%s", err, output)
 	}
 	var result struct {
 		Result struct {

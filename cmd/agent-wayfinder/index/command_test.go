@@ -233,10 +233,10 @@ func TestIndexCommandWritesConfiguredOllamaEmbeddings(t *testing.T) {
 	database := filepath.Join(t.TempDir(), "state", "graph.db")
 	output := &strings.Builder{}
 	standardError := &strings.Builder{}
-	if exitCode := runIndexCommand(t, []string{"--database", database, workspace.Root}, output, standardError); exitCode != 0 {
+	if exitCode := runIndexCommand(t, []string{"--catalog-background=false", "--database", database, workspace.Root}, output, standardError); exitCode != 0 {
 		t.Fatalf("index workspace exit code = %d, want 0; error %s", exitCode, standardError.String())
 	}
-	if exitCode := runCatalogCommand(t, []string{"--database", database, workspace.Root}, output, standardError); exitCode != 0 {
+	if exitCode := runCatalogCommand(t, []string{"--database", database, "--foreground", workspace.Root}, output, standardError); exitCode != 0 {
 		t.Fatalf("catalog workspace exit code = %d, want 0; error %s", exitCode, standardError.String())
 	}
 	if model != "qwen3-embedding:8b" {

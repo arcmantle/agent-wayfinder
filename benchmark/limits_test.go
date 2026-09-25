@@ -525,7 +525,7 @@ func measurements(initialIndex, incrementalUpdate, query, path, explain time.Dur
 		{Name: "incremental_update", Duration: incrementalUpdate},
 		{Name: "query", Duration: query},
 		{Name: "path", Duration: path},
-		{Name: "explain", Duration: explain},
+		{Name: "inspect", Duration: explain},
 	}
 }
 

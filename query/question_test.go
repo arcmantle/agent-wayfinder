@@ -116,6 +116,28 @@ func TestAnalyzeQuestionPlansServiceRoleRetrieval(t *testing.T) {
 	}
 }
 
+func TestAnalyzeQuestionPlansSourceQualifiedExplain(t *testing.T) {
+	plan := query.AnalyzeQuestion("Explain StartProcess in cmd/agent-wayfinder/catalog/command.go")
+
+	if plan.Intent != query.IntentExplain || plan.Operator != query.OperatorExplain || len(plan.EntitySlots) != 1 {
+		t.Fatalf("plan = %+v, want one explain entity slot", plan)
+	}
+	slot := plan.EntitySlots[0]
+	wantSlot := query.EntitySlot{
+		Role: "entity",
+		Text: "StartProcess",
+		Retrieval: query.RetrievalRequest{
+			Text:        "StartProcess",
+			TokenGroups: [][]string{{"start", "process"}},
+			SourcePath:  "cmd/agent-wayfinder/catalog/command.go",
+			Limit:       10,
+		},
+	}
+	if !reflect.DeepEqual(slot, wantSlot) {
+		t.Errorf("entity slot = %+v, want %+v", slot, wantSlot)
+	}
+}
+
 func TestAnalyzeQuestionPlansWorkspaceCapability(t *testing.T) {
 	plan := query.AnalyzeQuestion("Does this workspace validate access tokens?")
 

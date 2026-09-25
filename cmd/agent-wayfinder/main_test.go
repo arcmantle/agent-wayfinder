@@ -22,10 +22,13 @@ func TestCommandHelpListsPublicCommands(t *testing.T) {
 	}
 
 	output := standardOutput.String()
-	for _, command := range []string{"install", "index", "query", "path", "explain", "export", "indexer", "benchmark", "mcp"} {
+	for _, command := range []string{"install", "index", "query", "path", "inspect", "export", "indexer", "benchmark", "mcp"} {
 		if !strings.Contains(output, command) {
 			t.Errorf("help output = %q, want public command %q", output, command)
 		}
+	}
+	if strings.Contains(output, "\n  explain") {
+		t.Errorf("help output = %q, must not list obsolete explain command", output)
 	}
 }
 

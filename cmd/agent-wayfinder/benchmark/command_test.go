@@ -88,7 +88,7 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 	if len(result.Result.Measurements) != 5 {
 		t.Fatalf("measurements = %+v, want five critical-path measurements", result.Result.Measurements)
 	}
-	for index, want := range []string{"initial_index", "incremental_update", "query", "path", "explain"} {
+	for index, want := range []string{"initial_index", "incremental_update", "query", "path", "inspect"} {
 		measurement := result.Result.Measurements[index]
 		if measurement.Name != want {
 			t.Errorf("measurement %d name = %q, want %q", index, measurement.Name, want)

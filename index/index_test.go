@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +53,51 @@ type uncoveredCatalogStore struct {
 	snapshot storage.Snapshot
 }
 
+type countingCatalogSynopsisGenerator struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (generator *countingCatalogSynopsisGenerator) GenerateCatalogSynopsis(ctx context.Context, input index.CatalogSynopsisInput) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	generator.mu.Lock()
+	generator.calls++
+	generator.mu.Unlock()
+	return "Synopsis for " + input.Name, nil
+}
+
+func (generator *countingCatalogSynopsisGenerator) callCount() int {
+	generator.mu.Lock()
+	defer generator.mu.Unlock()
+	return generator.calls
+}
+
+type phaseCatalogSynopsisGenerator struct {
+	events     *[]string
+	releaseErr error
+}
+
+func (generator phaseCatalogSynopsisGenerator) GenerateCatalogSynopsis(context.Context, index.CatalogSynopsisInput) (string, error) {
+	*generator.events = append(*generator.events, "synopsis")
+	return "Generated synopsis", nil
+}
+
+func (generator phaseCatalogSynopsisGenerator) ReleaseCatalogSynopsisModel(context.Context) error {
+	*generator.events = append(*generator.events, "release synopsis")
+	return generator.releaseErr
+}
+
+type phaseCatalogEmbeddingGenerator struct {
+	events *[]string
+}
+
+func (generator phaseCatalogEmbeddingGenerator) GenerateCatalogEmbedding(context.Context, string) ([]float32, error) {
+	*generator.events = append(*generator.events, "embedding")
+	return []float32{1}, nil
+}
+
 func (store uncoveredCatalogStore) OpenSnapshot(context.Context, storage.OpenSnapshotRequest) (storage.Snapshot, error) {
 	return store.snapshot, nil
 }
@@ -66,6 +112,14 @@ func (uncoveredCatalogStore) CatalogUnitsCovered(context.Context, storage.Snapsh
 
 func (uncoveredCatalogStore) WriteCatalog(context.Context, storage.Snapshot, storage.CatalogWriteRequest) error {
 	return nil
+}
+
+func (uncoveredCatalogStore) ReadCatalogEntries(context.Context, storage.Snapshot, storage.CatalogEntryReadRequest) ([]storage.CatalogEntry, error) {
+	return nil, nil
+}
+
+func (uncoveredCatalogStore) ReadCatalogEmbeddings(context.Context, storage.Snapshot, storage.CatalogEmbeddingReadRequest) ([]storage.CatalogEmbedding, error) {
+	return nil, nil
 }
 
 func (uncoveredCatalogStore) CopyCatalog(context.Context, storage.Snapshot, storage.Snapshot) error {
@@ -281,6 +335,198 @@ func TestIndexPublishesGraphWithoutWritingCatalog(t *testing.T) {
 	}
 }
 
+func TestCatalogCheckpointsAndResumesCompletedUnits(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("package validator\n")
+	for functionIndex := range 9 {
+		_, _ = fmt.Fprintf(&source, "func Function%d() {}\n", functionIndex)
+	}
+	workspace := testkit.NewWorkspace(t, map[string]string{"go.mod": "module example.com/fixture\n", "validator/token.go": source.String()})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	snapshot, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish graph: %v", err)
+	}
+	firstGenerator := &countingCatalogSynopsisGenerator{}
+	firstEmbeddingGenerator := &catalogEmbeddingBatchGeneratorStub{}
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	_, firstError := index.Catalog(firstContext, store, index.CatalogRequest{
+		Root: workspace.Root,
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator:    firstGenerator,
+			SynopsisProvider:     index.CatalogSynopsisProviderCopilot,
+			SynopsisSourceLimit:  512,
+			SynopsisProcessLimit: 1,
+			EmbeddingGenerator:   firstEmbeddingGenerator,
+		},
+		Progress: func(update index.CatalogProgress) {
+			if update.CompletedUnits == 8 {
+				cancelFirst()
+			}
+		},
+	})
+	if !errors.Is(firstError, context.Canceled) {
+		t.Fatalf("interrupted catalog error = %v, want context cancellation", firstError)
+	}
+	contributions, err := store.SourceContributions(context.Background(), snapshot)
+	if err != nil {
+		t.Fatalf("read catalog units: %v", err)
+	}
+	nodeIDs := make([]string, 0, 9)
+	for _, contribution := range contributions {
+		for _, unit := range contribution.CatalogUnits {
+			nodeIDs = append(nodeIDs, unit.NodeID)
+		}
+	}
+	checkpoint, err := store.ReadCatalogEntries(context.Background(), snapshot, storage.CatalogEntryReadRequest{NodeIDs: nodeIDs})
+	if err != nil {
+		t.Fatalf("read catalog checkpoint: %v", err)
+	}
+	if len(checkpoint) != 8 {
+		t.Fatalf("checkpoint entries = %d, want 8", len(checkpoint))
+	}
+	checkpointEmbeddings, err := store.ReadCatalogEmbeddings(context.Background(), snapshot, storage.CatalogEmbeddingReadRequest{NodeIDs: nodeIDs})
+	if err != nil {
+		t.Fatalf("read embedding checkpoint: %v", err)
+	}
+	if len(checkpointEmbeddings) != 0 {
+		t.Fatalf("checkpoint embeddings = %d, want 0", len(checkpointEmbeddings))
+	}
+
+	secondGenerator := &countingCatalogSynopsisGenerator{}
+	secondEmbeddingGenerator := &catalogEmbeddingBatchGeneratorStub{}
+	result, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root: workspace.Root,
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator:    secondGenerator,
+			SynopsisProvider:     index.CatalogSynopsisProviderCopilot,
+			SynopsisSourceLimit:  512,
+			SynopsisProcessLimit: 1,
+			EmbeddingGenerator:   secondEmbeddingGenerator,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resume catalog: %v", err)
+	}
+	if result.Units != 9 || secondGenerator.callCount() != 1 {
+		t.Errorf("resumed catalog = %d units and %d generated synopses, want 9 units and 1 generated synopsis", result.Units, secondGenerator.callCount())
+	}
+	if len(secondEmbeddingGenerator.batches) != 2 || len(secondEmbeddingGenerator.batches[0]) != 16 || len(secondEmbeddingGenerator.batches[1]) != 2 {
+		t.Errorf("resumed embedding batches = %+v, want batches for saved and remaining synopses", secondEmbeddingGenerator.batches)
+	}
+}
+
+func TestCatalogReleasesSynopsisModelBeforeEmbeddingPhase(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/token.go": "package validator\n\nfunc ValidateToken() error { return nil }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root}); err != nil {
+		t.Fatalf("publish graph: %v", err)
+	}
+	events := make([]string, 0)
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root: workspace.Root,
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator:  phaseCatalogSynopsisGenerator{events: &events},
+			SynopsisProvider:   index.CatalogSynopsisProviderOllama,
+			EmbeddingGenerator: phaseCatalogEmbeddingGenerator{events: &events},
+		},
+	}); err != nil {
+		t.Fatalf("catalog workspace: %v", err)
+	}
+	releaseIndex := slices.Index(events, "release synopsis")
+	embeddingIndex := slices.Index(events, "embedding")
+	if releaseIndex < 0 || embeddingIndex < 0 || releaseIndex > embeddingIndex {
+		t.Errorf("catalog events = %v, want synopsis release before embedding", events)
+	}
+}
+
+func TestCatalogReleasesSynopsisModelAtEachCheckpoint(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod": "module example.com/fixture\n",
+		"validator/token.go": "package validator\n\n" +
+			"func Token01() {}\nfunc Token02() {}\nfunc Token03() {}\nfunc Token04() {}\nfunc Token05() {}\n" +
+			"func Token06() {}\nfunc Token07() {}\nfunc Token08() {}\nfunc Token09() {}\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root}); err != nil {
+		t.Fatalf("publish graph: %v", err)
+	}
+	events := make([]string, 0)
+	result, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root: workspace.Root,
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator:  phaseCatalogSynopsisGenerator{events: &events},
+			SynopsisProvider:   index.CatalogSynopsisProviderOllama,
+			EmbeddingGenerator: phaseCatalogEmbeddingGenerator{events: &events},
+		},
+	})
+	if err != nil {
+		t.Fatalf("catalog workspace: %v", err)
+	}
+	if result.Units != 9 {
+		t.Fatalf("catalog units = %d, want 9", result.Units)
+	}
+	if len(events) < 11 || !slices.Equal(events[:11], []string{
+		"synopsis", "synopsis", "synopsis", "synopsis", "synopsis", "synopsis", "synopsis", "synopsis", "release synopsis", "synopsis", "release synopsis",
+	}) {
+		t.Errorf("catalog events = %v, want release after each synopsis checkpoint", events)
+	}
+}
+
+func TestCatalogDoesNotStartEmbeddingWhenSynopsisReleaseFails(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/token.go": "package validator\n\nfunc ValidateToken() error { return nil }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root}); err != nil {
+		t.Fatalf("publish graph: %v", err)
+	}
+	events := make([]string, 0)
+	_, err = index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root: workspace.Root,
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator:  phaseCatalogSynopsisGenerator{events: &events, releaseErr: errors.New("release failed")},
+			SynopsisProvider:   index.CatalogSynopsisProviderOllama,
+			EmbeddingGenerator: phaseCatalogEmbeddingGenerator{events: &events},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "release synopsis model") {
+		t.Fatalf("catalog error = %v, want synopsis release failure", err)
+	}
+	if slices.Contains(events, "embedding") {
+		t.Errorf("catalog events = %v, want no embedding after synopsis release failure", events)
+	}
+	releaseCount := 0
+	for _, event := range events {
+		if event == "release synopsis" {
+			releaseCount++
+		}
+	}
+	if releaseCount != 1 {
+		t.Errorf("catalog events = %v, want one synopsis release attempt", events)
+	}
+}
+
 func TestCatalogRefreshCopiesUnchangedUnitsAndReplacesChangedUnits(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
 		"go.mod":             "module example.com/fixture\n",
@@ -328,6 +574,52 @@ func TestCatalogRefreshCopiesUnchangedUnitsAndReplacesChangedUnits(t *testing.T)
 		if match.Entry.Name == "ValidateToken" && !strings.Contains(match.Entry.DeterministicSynopsis, "verifies a signed token") {
 			t.Errorf("changed catalog entry = %+v, want refreshed synopsis", match.Entry)
 		}
+	}
+}
+
+func TestCatalogRefreshRegeneratesChangedSynopsisInput(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"go.mod":             "module example.com/fixture\n",
+		"validator/token.go": "package validator\n\nfunc ValidateToken() bool { return false }\n",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	first, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish initial graph: %v", err)
+	}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root: workspace.Root,
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator: &countingCatalogSynopsisGenerator{},
+			SynopsisProvider:  index.CatalogSynopsisProviderCopilot,
+		},
+	}); err != nil {
+		t.Fatalf("build initial catalog: %v", err)
+	}
+
+	workspace.WriteFile(t, "validator/token.go", "package validator\n\nfunc ValidateToken() bool { return true }\n")
+	if _, err := index.PublishBatch(context.Background(), store, index.BatchRequest{Root: workspace.Root, ChangedPaths: []string{"validator/token.go"}}); err != nil {
+		t.Fatalf("publish changed graph: %v", err)
+	}
+	secondGenerator := &countingCatalogSynopsisGenerator{}
+	if _, err := index.Catalog(context.Background(), store, index.CatalogRequest{
+		Root:             workspace.Root,
+		PreviousSnapshot: first,
+		ChangedPaths:     []string{"validator/token.go"},
+		CatalogWriteOptions: index.CatalogWriteOptions{
+			SynopsisGenerator: secondGenerator,
+			SynopsisProvider:  index.CatalogSynopsisProviderCopilot,
+		},
+	}); err != nil {
+		t.Fatalf("refresh changed catalog: %v", err)
+	}
+	if secondGenerator.callCount() != 1 {
+		t.Errorf("regenerated synopses = %d, want 1 for changed declaration source", secondGenerator.callCount())
 	}
 }
 

@@ -49,7 +49,7 @@ func runCommand(arguments []string, standardOutput, standardError io.Writer) int
 		command = query.New(standardOutput, standardError, &exitCode)
 	case "path":
 		command = path.New(standardOutput, standardError, &exitCode)
-	case "explain":
+	case "inspect":
 		command = explain.New(standardOutput, standardError, &exitCode)
 	case "export":
 		command = export.New(standardOutput, standardError, &exitCode)
@@ -69,7 +69,7 @@ func newMCPServer(runCommand mcpCommandRunner) *server.MCPServer {
 	mcpServer := server.NewMCPServer("agent-wayfinder", mcpServerVersion, server.WithToolCapabilities(false))
 	mcpServer.AddTool(queryMCPTool(), commandToolHandler(runCommand, queryMCPArguments))
 	mcpServer.AddTool(pathMCPTool(), commandToolHandler(runCommand, pathMCPArguments))
-	mcpServer.AddTool(explainMCPTool(), commandToolHandler(runCommand, explainMCPArguments))
+	mcpServer.AddTool(inspectMCPTool(), commandToolHandler(runCommand, inspectMCPArguments))
 	mcpServer.AddTool(exportMCPTool(), commandToolHandler(runCommand, exportMCPArguments))
 	return mcpServer
 }
@@ -102,9 +102,9 @@ func pathMCPTool() mcp.Tool {
 	)
 }
 
-func explainMCPTool() mcp.Tool {
-	return mcp.NewTool("explain",
-		mcp.WithDescription("Explain one exact or unambiguous code graph node."),
+func inspectMCPTool() mcp.Tool {
+	return mcp.NewTool("inspect",
+		mcp.WithDescription("Inspect one exact or unambiguous code graph node."),
 		workspaceMCPOption(),
 		mcp.WithString("node", mcp.Required(), mcp.MinLength(1)),
 		databaseMCPOption(),
@@ -191,7 +191,7 @@ func pathMCPArguments(request mcp.CallToolRequest) ([]string, error) {
 	return arguments, nil
 }
 
-func explainMCPArguments(request mcp.CallToolRequest) ([]string, error) {
+func inspectMCPArguments(request mcp.CallToolRequest) ([]string, error) {
 	workspace, err := request.RequireString("workspace")
 	if err != nil {
 		return nil, err
@@ -200,7 +200,7 @@ func explainMCPArguments(request mcp.CallToolRequest) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	arguments := appendMCPDatabase([]string{"explain", "--format", "json"}, request)
+	arguments := appendMCPDatabase([]string{"inspect", "--format", "json"}, request)
 	return append(arguments, workspace, node), nil
 }
 

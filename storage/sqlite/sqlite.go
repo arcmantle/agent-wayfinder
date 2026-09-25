@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion                         = 21
+	CurrentSchemaVersion                         = 24
 	retainedGraphVersions                        = 25
 	defaultMaxDatabaseBytes                int64 = 4 << 30
 	defaultMaxResolverProjectionCacheBytes int64 = 64 << 20
@@ -2731,15 +2731,16 @@ func (store *Store) WriteCatalog(ctx context.Context, snapshot storage.Snapshot,
 			return fmt.Errorf("write catalog: %w: node ID, name, and deterministic synopsis are required", storage.ErrInvalidRequest)
 		}
 		if _, err := transaction.ExecContext(ctx, `
-			INSERT INTO catalog_entries (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO catalog_entries (workspace, version, node_id, name, input_fingerprint, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (workspace, version, node_id) DO UPDATE SET
 				name = excluded.name,
+				input_fingerprint = excluded.input_fingerprint,
 				deterministic_synopsis = excluded.deterministic_synopsis,
 				copilot_synopsis = excluded.copilot_synopsis,
 				ollama_synopsis = excluded.ollama_synopsis,
 				claude_synopsis = excluded.claude_synopsis`,
-			snapshot.Workspace, snapshot.Version, entry.NodeID, entry.Name, entry.DeterministicSynopsis, entry.CopilotSynopsis, entry.OllamaSynopsis, entry.ClaudeSynopsis); err != nil {
+			snapshot.Workspace, snapshot.Version, entry.NodeID, entry.Name, entry.InputFingerprint, entry.DeterministicSynopsis, entry.CopilotSynopsis, entry.OllamaSynopsis, entry.ClaudeSynopsis); err != nil {
 			return fmt.Errorf("store catalog entry: %w", err)
 		}
 		if _, err := transaction.ExecContext(ctx, "DELETE FROM catalog_search WHERE workspace = ? AND version = ? AND node_id = ?", snapshot.Workspace, snapshot.Version, entry.NodeID); err != nil {
@@ -2759,7 +2760,7 @@ func (store *Store) WriteCatalog(ctx context.Context, snapshot storage.Snapshot,
 }
 
 func (store *Store) WriteCatalogTask(ctx context.Context, task storage.CatalogTask) error {
-	if task.Workspace == "" || task.GraphVersion == 0 || task.State == "" || task.StartedAt.IsZero() || task.CompletedUnits < 0 || task.TotalUnits < 0 || task.CompletedUnits > task.TotalUnits {
+	if task.Workspace == "" || task.GraphVersion == 0 || task.State == "" || task.ProcessID < 0 || task.StartedAt.IsZero() || task.CompletedUnits < 0 || task.TotalUnits < 0 || task.CompletedUnits > task.TotalUnits {
 		return fmt.Errorf("write catalog task: %w: workspace, graph version, state, start time, and valid progress are required", storage.ErrInvalidRequest)
 	}
 	changedPaths, err := json.Marshal(task.ChangedPaths)
@@ -2767,19 +2768,21 @@ func (store *Store) WriteCatalogTask(ctx context.Context, task storage.CatalogTa
 		return fmt.Errorf("write catalog task: encode changed paths: %w", err)
 	}
 	if _, err := store.database.ExecContext(ctx, `
-		INSERT INTO catalog_tasks (workspace, graph_version, state, started_at, finished_at, completed_units, total_units, changed_paths, failure)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO catalog_tasks (workspace, graph_version, state, process_id, started_at, finished_at, completed_units, total_units, stage, changed_paths, failure)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (workspace) DO UPDATE SET
 			graph_version = excluded.graph_version,
 			state = excluded.state,
+			process_id = excluded.process_id,
 			started_at = excluded.started_at,
 			finished_at = excluded.finished_at,
 			completed_units = excluded.completed_units,
 			total_units = excluded.total_units,
+			stage = excluded.stage,
 			changed_paths = excluded.changed_paths,
 			failure = excluded.failure
 		WHERE excluded.graph_version >= catalog_tasks.graph_version`,
-		task.Workspace, task.GraphVersion, task.State, task.StartedAt.UTC().Format(time.RFC3339Nano), nullableTime(task.FinishedAt), task.CompletedUnits, task.TotalUnits, string(changedPaths), task.Failure); err != nil {
+		task.Workspace, task.GraphVersion, task.State, task.ProcessID, task.StartedAt.UTC().Format(time.RFC3339Nano), nullableTime(task.FinishedAt), task.CompletedUnits, task.TotalUnits, task.Stage, string(changedPaths), task.Failure); err != nil {
 		return fmt.Errorf("write catalog task: %w", err)
 	}
 	return nil
@@ -2791,7 +2794,7 @@ func (store *Store) ReadCatalogTask(ctx context.Context, workspace string) (stor
 	}
 	var task storage.CatalogTask
 	var startedAt, finishedAt, changedPaths string
-	err := store.database.QueryRowContext(ctx, `SELECT graph_version, state, started_at, COALESCE(finished_at, ''), completed_units, total_units, changed_paths, failure FROM catalog_tasks WHERE workspace = ?`, workspace).Scan(&task.GraphVersion, &task.State, &startedAt, &finishedAt, &task.CompletedUnits, &task.TotalUnits, &changedPaths, &task.Failure)
+	err := store.database.QueryRowContext(ctx, `SELECT graph_version, state, process_id, started_at, COALESCE(finished_at, ''), completed_units, total_units, stage, changed_paths, failure FROM catalog_tasks WHERE workspace = ?`, workspace).Scan(&task.GraphVersion, &task.State, &task.ProcessID, &startedAt, &finishedAt, &task.CompletedUnits, &task.TotalUnits, &task.Stage, &changedPaths, &task.Failure)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storage.CatalogTask{}, false, nil
 	}
@@ -2841,12 +2844,13 @@ func (store *Store) CopyCatalog(ctx context.Context, source, target storage.Snap
 			UNION
 			SELECT node_id FROM workspace_nodes WHERE workspace = ? AND version = ?
 		)
-		INSERT INTO catalog_entries (workspace, version, node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
-		SELECT ?, ?, entry.node_id, entry.name, entry.deterministic_synopsis, entry.copilot_synopsis, entry.ollama_synopsis, entry.claude_synopsis
+		INSERT INTO catalog_entries (workspace, version, node_id, name, input_fingerprint, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis)
+		SELECT ?, ?, entry.node_id, entry.name, entry.input_fingerprint, entry.deterministic_synopsis, entry.copilot_synopsis, entry.ollama_synopsis, entry.claude_synopsis
 		FROM catalog_entries AS entry JOIN visible_nodes ON visible_nodes.node_id = entry.node_id
 		WHERE entry.workspace = ? AND entry.version = ?
 		ON CONFLICT (workspace, version, node_id) DO UPDATE SET
 			name = excluded.name,
+			input_fingerprint = excluded.input_fingerprint,
 			deterministic_synopsis = excluded.deterministic_synopsis,
 			copilot_synopsis = excluded.copilot_synopsis,
 			ollama_synopsis = excluded.ollama_synopsis,
@@ -2928,7 +2932,7 @@ func (store *Store) ReadCatalogEntries(ctx context.Context, snapshot storage.Sna
 		arguments = append(arguments, nodeID)
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(request.NodeIDs)), ",")
-	rows, err := store.database.QueryContext(ctx, "SELECT node_id, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis FROM catalog_entries WHERE workspace = ? AND version = ? AND node_id IN ("+placeholders+") ORDER BY node_id", arguments...)
+	rows, err := store.database.QueryContext(ctx, "SELECT node_id, name, input_fingerprint, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis FROM catalog_entries WHERE workspace = ? AND version = ? AND node_id IN ("+placeholders+") ORDER BY node_id", arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("read catalog entries: %w", err)
 	}
@@ -2936,7 +2940,7 @@ func (store *Store) ReadCatalogEntries(ctx context.Context, snapshot storage.Sna
 	entries := make([]storage.CatalogEntry, 0)
 	for rows.Next() {
 		var entry storage.CatalogEntry
-		if err := rows.Scan(&entry.NodeID, &entry.Name, &entry.DeterministicSynopsis, &entry.CopilotSynopsis, &entry.OllamaSynopsis, &entry.ClaudeSynopsis); err != nil {
+		if err := rows.Scan(&entry.NodeID, &entry.Name, &entry.InputFingerprint, &entry.DeterministicSynopsis, &entry.CopilotSynopsis, &entry.OllamaSynopsis, &entry.ClaudeSynopsis); err != nil {
 			return nil, fmt.Errorf("read catalog entry: %w", err)
 		}
 		entries = append(entries, entry)
@@ -4836,7 +4840,7 @@ func migrate(ctx context.Context, database *sql.DB) error {
 	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&version); err != nil {
 		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
-	if version != 0 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 15 && version != 16 && version != 17 && version != 18 && version != 19 && version != 20 && version != CurrentSchemaVersion {
+	if version != 0 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 15 && version != 16 && version != 17 && version != 18 && version != 19 && version != 20 && version != 21 && version != 22 && version != 23 && version != CurrentSchemaVersion {
 		return fmt.Errorf("%w: found version %d, need version %d", errSchemaMismatch, version, CurrentSchemaVersion)
 	}
 
@@ -4858,10 +4862,10 @@ func migrate(ctx context.Context, database *sql.DB) error {
 			CREATE TABLE workspace_nodes (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, qualified_name TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, PRIMARY KEY (workspace, version, node_id));
 			CREATE TABLE workspace_edges (workspace TEXT NOT NULL, version INTEGER NOT NULL, source_id TEXT NOT NULL, target_id TEXT NOT NULL, relation TEXT NOT NULL, span_path TEXT NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_line INTEGER NOT NULL, end_column INTEGER NOT NULL, file_hash TEXT NOT NULL, extractor TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, resolved_fact_owner TEXT NOT NULL, PRIMARY KEY (workspace, version, source_id, target_id, relation));
 			CREATE VIRTUAL TABLE node_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, label, qualified_name, span_path, kind, identifier_tokens, tokenize = 'unicode61 remove_diacritics 2');
-			CREATE TABLE catalog_entries (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, name TEXT NOT NULL, deterministic_synopsis TEXT NOT NULL, copilot_synopsis TEXT NOT NULL, ollama_synopsis TEXT NOT NULL, claude_synopsis TEXT NOT NULL, PRIMARY KEY (workspace, version, node_id));
+			CREATE TABLE catalog_entries (workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, name TEXT NOT NULL, input_fingerprint TEXT NOT NULL, deterministic_synopsis TEXT NOT NULL, copilot_synopsis TEXT NOT NULL, ollama_synopsis TEXT NOT NULL, claude_synopsis TEXT NOT NULL, PRIMARY KEY (workspace, version, node_id));
 			CREATE VIRTUAL TABLE catalog_search USING fts5(workspace UNINDEXED, version UNINDEXED, node_id UNINDEXED, name, deterministic_synopsis, copilot_synopsis, ollama_synopsis, claude_synopsis, tokenize = 'unicode61 remove_diacritics 2');
 			CREATE TABLE catalog_embeddings (embedding_id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, version INTEGER NOT NULL, node_id TEXT NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL, dimensions INTEGER NOT NULL, vector BLOB NOT NULL, UNIQUE (workspace, version, node_id, source));
-			CREATE TABLE catalog_tasks (workspace TEXT PRIMARY KEY, graph_version INTEGER NOT NULL, state TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, completed_units INTEGER NOT NULL, total_units INTEGER NOT NULL, changed_paths TEXT NOT NULL, failure TEXT NOT NULL);
+			CREATE TABLE catalog_tasks (workspace TEXT PRIMARY KEY, graph_version INTEGER NOT NULL, state TEXT NOT NULL, process_id INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, finished_at TEXT, completed_units INTEGER NOT NULL, total_units INTEGER NOT NULL, stage TEXT NOT NULL DEFAULT '', changed_paths TEXT NOT NULL, failure TEXT NOT NULL);
 			CREATE TABLE copilot_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, max_ai_credits INTEGER NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, output_tokens_estimate_method TEXT NOT NULL, session_total_nano_aiu INTEGER, session_total_nano_aiu_availability TEXT NOT NULL, session_total_nano_aiu_estimate_method TEXT NOT NULL, actual_model TEXT NOT NULL DEFAULT '', input_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, premium_request_credits INTEGER, user_requests INTEGER, api_duration_ms INTEGER);
 			CREATE INDEX copilot_planner_metrics_daily ON copilot_planner_metrics (day, model, max_ai_credits);
 			CREATE TABLE claude_planner_metrics (metric_id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, actual_model TEXT NOT NULL, fallback_model TEXT NOT NULL, max_budget_usd REAL NOT NULL, effort TEXT NOT NULL, outcome TEXT NOT NULL, duration_ns INTEGER NOT NULL, prompt_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL, input_tokens INTEGER, input_tokens_availability TEXT NOT NULL, output_tokens INTEGER, output_tokens_availability TEXT NOT NULL, api_duration_ms INTEGER, api_duration_ms_availability TEXT NOT NULL, cost_usd REAL, cost_usd_availability TEXT NOT NULL);
@@ -5067,6 +5071,33 @@ func migrate(ctx context.Context, database *sql.DB) error {
 		}
 		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 21, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("record spending reservation migration: %w", err)
+		}
+		version = 21
+	}
+	if version == 21 {
+		if _, err := addColumnIfMissing(ctx, transaction, "catalog_entries", "input_fingerprint", "ALTER TABLE catalog_entries ADD COLUMN input_fingerprint TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("add catalog input fingerprint column: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 22, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record catalog input fingerprint migration: %w", err)
+		}
+		version = 22
+	}
+	if version == 22 {
+		if _, err := addColumnIfMissing(ctx, transaction, "catalog_tasks", "process_id", "ALTER TABLE catalog_tasks ADD COLUMN process_id INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("add catalog process ID column: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 23, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record catalog process ID migration: %w", err)
+		}
+		version = 23
+	}
+	if version == 23 {
+		if _, err := addColumnIfMissing(ctx, transaction, "catalog_tasks", "stage", "ALTER TABLE catalog_tasks ADD COLUMN stage TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("add catalog task stage column: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", 24, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("record catalog task stage migration: %w", err)
 		}
 	}
 

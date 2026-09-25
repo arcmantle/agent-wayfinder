@@ -46,7 +46,8 @@
 				"processLimit": {
 					"type": "integer",
 					"minimum": 1,
-					"maximum": 2
+					"maximum": 2,
+					"default": 1
 				}
 			}
 		},
@@ -143,6 +144,12 @@
 				},
 				"timeout": {
 					"$ref": "#/$defs/timeout"
+				},
+				"processLimit": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 4,
+					"default": 2
 				}
 			}
 		},

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"agent-wayfinder/index"
 	"agent-wayfinder/testkit"
@@ -137,6 +138,10 @@ func TestRunRejectsOversizedResponse(t *testing.T) {
 }
 
 func TestCatalogSynopsisUsesBoundedLocalGeneration(t *testing.T) {
+	var requests []struct {
+		KeepAlive string
+		Prompt    string
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/generate" {
 			t.Errorf("Ollama catalog path = %q, want /api/generate", request.URL.Path)
@@ -147,11 +152,23 @@ func TestCatalogSynopsisUsesBoundedLocalGeneration(t *testing.T) {
 			Think     bool   `json:"think"`
 			KeepAlive string `json:"keep_alive"`
 			Prompt    string `json:"prompt"`
+			Options   struct {
+				NumCtx     int `json:"num_ctx"`
+				NumPredict int `json:"num_predict"`
+				NumThread  int `json:"num_thread"`
+			} `json:"options"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Fatalf("decode Ollama catalog request: %v", err)
 		}
-		if body.Model != "qwen3:8b" || body.Stream || body.Think || body.KeepAlive != "0" || !strings.Contains(body.Prompt, "Name: ValidateToken") || !strings.Contains(body.Prompt, "Declaration source: func ValidateToken(token string) error { return nil }") {
+		requests = append(requests, struct {
+			KeepAlive string
+			Prompt    string
+		}{KeepAlive: body.KeepAlive, Prompt: body.Prompt})
+		if body.KeepAlive == "0" {
+			return
+		}
+		if body.Model != "qwen3:8b" || body.Stream || body.Think || body.Options.NumCtx != catalogSynopsisContextTokens || body.Options.NumPredict != catalogSynopsisPredictionTokens || body.Options.NumThread != catalogSynopsisThreadLimit || body.KeepAlive != catalogSynopsisKeepAlive || !strings.Contains(body.Prompt, "Name: ValidateToken") || !strings.Contains(body.Prompt, "Declaration source: func ValidateToken(token string) error { return nil }") {
 			t.Errorf("Ollama catalog request = %+v, want bounded synopsis request", body)
 		}
 		_, _ = response.Write([]byte(`{"response":"Validates an access token."}`))
@@ -169,6 +186,12 @@ func TestCatalogSynopsisUsesBoundedLocalGeneration(t *testing.T) {
 	if synopsis != "Validates an access token." {
 		t.Errorf("Ollama catalog synopsis = %q, want generated text", synopsis)
 	}
+	if err := generator.ReleaseCatalogSynopsisModel(context.Background()); err != nil {
+		t.Fatalf("release Ollama catalog synopsis model: %v", err)
+	}
+	if len(requests) != 2 || requests[0].KeepAlive != catalogSynopsisKeepAlive || requests[1].KeepAlive != "0" || requests[1].Prompt != "" {
+		t.Errorf("Ollama catalog requests = %+v, want retained generation and release", requests)
+	}
 }
 
 func TestCatalogSynopsisRejectsOversizedResponse(t *testing.T) {
@@ -181,5 +204,19 @@ func TestCatalogSynopsisRejectsOversizedResponse(t *testing.T) {
 	_, err := generator.GenerateCatalogSynopsis(context.Background(), index.CatalogSynopsisInput{Name: "ValidateToken"})
 	if err == nil || !strings.Contains(err.Error(), "exceeds 4096 bytes") {
 		t.Errorf("Ollama catalog synopsis error = %v, want response size error", err)
+	}
+}
+
+func TestCatalogSynopsisPromptBoundsUntrustedFields(t *testing.T) {
+	prompt := catalogSynopsisPrompt(index.CatalogSynopsisInput{
+		Name:             "ValidateToken",
+		Comments:         []string{strings.Repeat("comment ", catalogSynopsisMaxPromptBytes)},
+		IdentifierTokens: []string{strings.Repeat("identifier ", catalogSynopsisMaxPromptBytes)},
+	})
+	if len(prompt) > catalogSynopsisMaxPromptBytes {
+		t.Errorf("catalog synopsis prompt length = %d, want at most %d", len(prompt), catalogSynopsisMaxPromptBytes)
+	}
+	if !utf8.ValidString(prompt) {
+		t.Errorf("catalog synopsis prompt = %q, want valid UTF-8", prompt)
 	}
 }

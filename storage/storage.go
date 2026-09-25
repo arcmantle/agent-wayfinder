@@ -190,6 +190,7 @@ type LexicalSearchRequest struct {
 	TokenGroups [][]string       `json:"tokenGroups,omitempty"`
 	Kinds       []graph.NodeKind `json:"kinds,omitempty"`
 	ProjectIDs  []string         `json:"projectIds,omitempty"`
+	SourcePath  string           `json:"sourcePath,omitempty"`
 	Limit       int              `json:"limit"`
 }
 
@@ -206,6 +207,7 @@ type LexicalSearcher interface {
 type CatalogEntry struct {
 	NodeID                string
 	Name                  string
+	InputFingerprint      string
 	DeterministicSynopsis string
 	CopilotSynopsis       string
 	OllamaSynopsis        string
@@ -223,20 +225,23 @@ type CatalogWriter interface {
 type CatalogTaskState string
 
 const (
-	CatalogTaskQueued   CatalogTaskState = "queued"
-	CatalogTaskRunning  CatalogTaskState = "running"
-	CatalogTaskComplete CatalogTaskState = "complete"
-	CatalogTaskFailed   CatalogTaskState = "failed"
+	CatalogTaskQueued      CatalogTaskState = "queued"
+	CatalogTaskRunning     CatalogTaskState = "running"
+	CatalogTaskInterrupted CatalogTaskState = "interrupted"
+	CatalogTaskComplete    CatalogTaskState = "complete"
+	CatalogTaskFailed      CatalogTaskState = "failed"
 )
 
 type CatalogTask struct {
 	Workspace      string
 	GraphVersion   GraphVersion
 	State          CatalogTaskState
+	ProcessID      int
 	StartedAt      time.Time
 	FinishedAt     time.Time
 	CompletedUnits int
 	TotalUnits     int
+	Stage          string
 	ChangedPaths   []string
 	Failure        string
 }

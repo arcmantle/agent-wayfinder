@@ -288,7 +288,7 @@ The project includes a cross-framework skill at
 Run `agent-wayfinder install --project` to install the bundled copy in another
 project instead of the user-level default.
 Use `/agent-wayfinder` to index a workspace, query code relationships, trace a
-path, or explain a graph node. The skill queries the local graph first and then
+path, or inspect a graph node. The skill queries the local graph first and then
 requires source inspection and focused validation before code changes.
 
 ## MCP Server
@@ -299,7 +299,7 @@ Start the read-only Model Context Protocol server over standard input and output
 agent-wayfinder mcp
 ```
 
-The server provides `query`, `path`, `explain`, and `export` tools. Each tool
+The server provides `query`, `path`, `inspect`, and `export` tools. Each tool
 returns the same graph version, publication time, result data, and errors as its
 JSON CLI command.
 
@@ -515,11 +515,11 @@ Use `path` when both endpoints are known. Directed traversal is the default;
 agent-wayfinder path . AuthService TokenStore --format json
 ```
 
-Use `explain` for one exact or unambiguous node. If the result is ambiguous,
+Use `inspect` for one exact or unambiguous node. If the result is ambiguous,
 rerun it with one returned node ID:
 
 ```bash
-agent-wayfinder explain . AuthService --format json
+agent-wayfinder inspect . AuthService --format json
 ```
 
 ## Relationship To AI Workflows
@@ -542,7 +542,7 @@ Use it to create golden fixtures and compare:
 - source locations and confidence metadata
 - extraction output
 - incremental replacement and deletion behavior
-- query, path, and explain results
+- query, path, and inspect results
 
 Do not port Python files one-for-one. Port externally visible behavior through small, tested vertical slices.
 
@@ -550,7 +550,7 @@ Do not port Python files one-for-one. Port externally visible behavior through s
 
 1. Define the Go module, storage interface, SQLite implementation, and schema migrations.
 2. Extract TypeScript and JavaScript fixtures into stable nodes and edges.
-3. Add indexed `query`, `path`, and `explain` commands.
+3. Add indexed `query`, `path`, and `inspect` commands.
 4. Replace changed-file graph facts and remove deleted-file graph facts transactionally.
 5. Add a workspace-level index so one update covers all configured packages.
 6. Add a file watcher with debounce, queueing, and reconciliation.
@@ -577,7 +577,7 @@ Run the supported v0 release gate with:
 make acceptance
 ```
 
-This command runs the storage conformance, extraction, indexing, query, path, explain, export, lifecycle, fixture, and Graphify comparison checks.
+This command runs the storage conformance, extraction, indexing, query, path, inspect, export, lifecycle, fixture, and Graphify comparison checks.
 
 ## ClientFlex Acceptance
 
